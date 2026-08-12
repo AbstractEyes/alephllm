@@ -363,9 +363,11 @@ class Trainer:
             self.manifest.data_state = {"dataset": self.stream.dataset,
                                         "rows_consumed": self.stream.rows_consumed,
                                         "epoch": self.stream.epoch}
+        # record BEFORE saving so the snapshot embedded in resume/latest.pt
+        # includes its own entry (the summary reads the index tail)
+        self.manifest.record_checkpoint(self.step, "resume", "resume/latest.pt")
         self.hub.save_resume(self.raw_model, self.optimizers, stream_state,
                              self.manifest, self.step)
-        self.manifest.record_checkpoint(self.step, "resume", "resume/latest.pt")
         self.hub.push_manifest(self.manifest)
         try:
             st_mb = os.path.getsize(os.path.join(self.out_dir, st_name)) / 2**20

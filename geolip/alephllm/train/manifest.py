@@ -93,9 +93,16 @@ class RunManifest:
             lines.append(f"  [{ph['status']:^8}] {ph['name']:<18} "
                          f"{ph['dataset']:<14} {done/1e9:.3f}/{plan/1e9:.2f}B")
         if self.checkpoints:
-            c = self.checkpoints[-1]
-            lines.append(f"  last checkpoint: step {c['step']:,} ({c['kind']}) "
-                         f"val_bpb={c.get('val_bpb')}")
+            w = next((c for c in reversed(self.checkpoints)
+                      if c["kind"] == "safetensors"), None)
+            r = next((c for c in reversed(self.checkpoints)
+                      if c["kind"] == "resume"), None)
+            if w is not None:
+                v = w.get("val_bpb")
+                lines.append(f"  last weights: step {w['step']:,}"
+                             + (f" · val_bpb {v:.3f}" if v else ""))
+            if r is not None:
+                lines.append(f"  resume state: step {r['step']:,}")
         return "\n".join(lines)
 
 
