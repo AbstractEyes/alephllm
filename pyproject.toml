@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geolip-alephllm"
+version = "0.1.0"
+description = "AlephLLM — signed-address (aleph) language models: anchored FFN banks, CausalSplatHUB attention, born-null dual head. Mini-Beatrix mission presets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AbstractPhil" }]
+dependencies = [
+    "torch>=2.4",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.24",
+    "datasets>=2.19",
+    "tqdm>=4.66",
+    "numpy>=1.24",
+    "tensorboard>=2.15",
+]
+
+[project.optional-dependencies]
+bpe = ["tokenizers>=0.19"]
+
+[project.urls]
+Homepage = "https://github.com/AbstractEyes/alephllm"
+
+[tool.setuptools.packages.find]
+include = ["geolip*"]
+namespaces = true

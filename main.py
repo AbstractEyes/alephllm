@@ -1,16 +1,13 @@
-# This is a sample Python script.
+"""Repo entrypoint: runs the full smoke/test array.
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+    python main.py
 
+For training, use the package API (see README / notebooks):
+    from geolip.alephllm import prepare
+    run = prepare("mini-beatrix-1", hf_token=...)
+    run.train()
+"""
+from geolip.alephllm.tests.smoke import main
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+if __name__ == "__main__":
+    main()

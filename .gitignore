@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AlephLLM runs / artifacts
+alephllm_runs/
+runs/
+*.safetensors
+*.pt
+_pull/
