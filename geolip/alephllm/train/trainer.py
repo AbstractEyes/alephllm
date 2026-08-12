@@ -169,6 +169,7 @@ class Trainer:
             total = min(total, self.step + math.ceil(left / tokens_per_step))
         bar = tqdm(unit="step", initial=self.step, total=total,
                    dynamic_ncols=True)
+        self._bar = bar
         model.train()
         save_on_exit = True
         try:
@@ -269,6 +270,7 @@ class Trainer:
             raise
         finally:
             bar.close()
+            self._bar = None
             self.manifest.wall_hours += (time.time() - t0) / 3600
             if save_on_exit and self.step > start_step:
                 if self._weights_finite():
@@ -328,23 +330,30 @@ class Trainer:
         instruments.log_census_tb(self.writer, census, ledger, self.step)
         for k, v in can.items():
             self.writer.add_scalar(f"canary/{k}", v, self.step)
-        print(instruments.readout(self.step, self.manifest.tokens_seen,
-                                  census, ledger,
-                                  extra={"canary_acc": f"{can['recall_acc']:.3f}"}))
+        self._say(instruments.readout(
+            self.step, self.manifest.tokens_seen, census, ledger,
+            extra={"canary_acc": f"{can['recall_acc']:.3f}"}))
         self._last_eval = {"census": census, "ledger": ledger, "canary": can}
         return self._last_eval
 
     # -------------------------------------------------------- checkpoints
+    def _say(self, msg: str):
+        bar = getattr(self, "_bar", None)
+        (bar.write if bar is not None else print)(msg)
+
     def _checkpoint(self, final: bool = False):
+        t0 = time.time()
         st_name = self.hub.save_safetensors(self.raw_model, self.step)
         val_bpb = getattr(self, "_last_eval", {}).get(
             "ledger", {}).get("bpb_full") if hasattr(self, "_last_eval") else None
         self.manifest.record_checkpoint(self.step, "safetensors", st_name,
                                         val_bpb)
         self._ckpt_count += 1
+        fp8_note = ""
         if self._ckpt_count % self.tc.fp8_every_ckpts == 0 or final:
             fp8_name = self.hub.save_fp8(self.raw_model, self.step)
             self.manifest.record_checkpoint(self.step, "fp8", fp8_name)
+            fp8_note = " + fp8"
         stream_state = None
         if self.stream is not None:
             ph = self.manifest.current_phase()
@@ -358,6 +367,18 @@ class Trainer:
                              self.manifest, self.step)
         self.manifest.record_checkpoint(self.step, "resume", "resume/latest.pt")
         self.hub.push_manifest(self.manifest)
+        try:
+            st_mb = os.path.getsize(os.path.join(self.out_dir, st_name)) / 2**20
+            rs_gb = os.path.getsize(os.path.join(
+                self.out_dir, "resume", "latest.pt")) / 2**30
+            size_note = f" ({st_mb:.0f}MB{fp8_note} + resume {rs_gb:.2f}GB)"
+        except OSError:
+            size_note = fp8_note
+        nxt = ("session end" if final
+               else f"next at step {self.step + self.tc.ckpt_every:,}")
+        self._say(f"[ckpt] step {self.step:,}: weights + optimizer + stream "
+                  f"state saved & uploaded{size_note} in "
+                  f"{time.time() - t0:.0f}s · {nxt}")
 
     # -------------------------------------------------------------- eval
     def evaluate(self) -> dict:
