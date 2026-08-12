@@ -320,6 +320,21 @@ def t_kv_cache():
         b = m.generate(seq[:, :8], max_new=12, temperature=0.0, use_cache=False)
     agree = (a == b).float().mean().item()
     assert agree > 0.95, f"greedy cached/uncached agreement only {agree:.2f}"
+    # context boundary: prompts at/over the context still produce all
+    # requested tokens (cached fill + sliding continuation), never 0/crash
+    ctx = TINY.context
+    with torch.no_grad():
+        for plen in (ctx - 1, ctx, ctx + 8):
+            p = torch.randint(0, 256, (1, plen))
+            g = m.generate(p, max_new=10, temperature=0.0, use_cache=True)
+            assert g.shape[1] == plen + 10, f"plen={plen}: got {g.shape[1]}"
+        # exact-fill: cached path may run all the way to the position wall
+        p = torch.randint(0, 256, (1, ctx - 4))
+        g = m.generate(p, max_new=4, temperature=0.0, use_cache=True)
+        assert g.shape[1] == ctx
+    # top_p=0 must not produce a zero-mass row (CUDA-context poison guard)
+    nxt = m._sample(torch.randn(3, 1, 256), temperature=1.0, top_p=0.0)
+    assert nxt.shape == (3, 1) and torch.isfinite(nxt.float()).all()
 
 
 @case("kv-cache decode == full forward (BPE tied-embedding craft)")

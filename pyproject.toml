@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geolip-alephllm"
-version = "0.2.0"
+version = "0.2.1"
 description = "AlephLLM — signed-address (aleph) language models: anchored FFN banks, CausalSplatHUB attention, born-null dual head. Mini-Beatrix mission presets."
 readme = "README.md"
 requires-python = ">=3.10"

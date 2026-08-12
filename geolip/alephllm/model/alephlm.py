@@ -129,24 +129,31 @@ class AlephLM(nn.Module):
         probs = F.softmax(logits / temperature, dim=-1)
         sp, si = probs.sort(dim=-1, descending=True)
         keep = (sp.cumsum(-1) - sp) < top_p
-        sp = sp * keep
-        return si.gather(-1, torch.multinomial(
+        keep[..., :1] = True   # top-1 always survives: top_p<=0 must never
+        sp = sp * keep         # yield an all-zero row (CUDA multinomial on
+        return si.gather(-1, torch.multinomial(  # zeros poisons the context)
             sp / sp.sum(-1, keepdim=True), 1))
 
     @torch.no_grad()
     def generate(self, idx, max_new: int = 128, temperature: float = 1.0,
                  top_p: float = 0.95, use_cache: bool = True):
+        """Cached decode while the sequence fits the position table; any
+        remainder (long prompts, fills past the context) continues through
+        the sliding-window parallel path — the hub's constant-size state
+        cannot evict, so sliding continuation must recompute."""
         self.eval()
-        if use_cache:
-            max_new = min(max_new, self.cfg.context - idx.shape[1] - 1)
+        ctx = self.cfg.context
+        if use_cache and idx.shape[1] < ctx and max_new > 0:
+            n_cached = min(max_new, ctx - idx.shape[1])
             logits, cache = self.prefill(idx)
-            for _ in range(max_new):
+            for i in range(n_cached):
                 nxt = self._sample(logits, temperature, top_p)
                 idx = torch.cat([idx, nxt], dim=1)
-                logits = self.decode_step(nxt, cache)
-            return idx
+                if i + 1 < n_cached:
+                    logits = self.decode_step(nxt, cache)
+            max_new -= n_cached
         for _ in range(max_new):
-            logits, _ = self(idx[:, -self.cfg.context:])
+            logits, _ = self(idx[:, -ctx:])
             nxt = self._sample(logits, temperature, top_p)
             idx = torch.cat([idx, nxt], dim=1)
         return idx
