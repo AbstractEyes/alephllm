@@ -41,6 +41,15 @@ class Block(nn.Module):
             x = x + self.attn(self.n1(x))
         return x + self.bank(self.n2(x), disable_dispatch=disable_bank)
 
+    def prefill(self, x):
+        a, cache = self.attn.prefill(self.n1(x))
+        x = x + a
+        return x + self.bank(self.n2(x)), cache
+
+    def step(self, x_t, cache):
+        x_t = x_t + self.attn.step(self.n1(x_t), cache)
+        return x_t + self.bank(self.n2(x_t))
+
 
 class AlephLM(nn.Module):
     def __init__(self, cfg: AlephLMConfig):
@@ -72,19 +81,73 @@ class AlephLM(nn.Module):
                                targets.reshape(-1), ignore_index=-100)
         return logits, loss
 
+    # ---------------------------------------------------- incremental decode
+    @torch.no_grad()
+    def prefill(self, idx):
+        """Run the prompt once, return (last-position logits, decode cache).
+        The cache carries per-layer attention state, the trigram history
+        bytes, and the absolute position cursor."""
+        self.eval()
+        from .embedding import PAD_ROW
+        caches = []
+        x = self.embed(idx)
+        for b in self.blocks:
+            x, c = b.prefill(x)
+            caches.append(c)
+        h = self.nf(x)
+        logits = self.head(h[:, -1:])
+        n = idx.shape[1]
+        prev2 = idx[:, -2] if n >= 2 else torch.full_like(idx[:, -1], PAD_ROW)
+        return logits, {"layers": caches, "t": n,
+                        "prev1": idx[:, -1], "prev2": prev2}
+
+    @torch.no_grad()
+    def decode_step(self, next_id, cache):
+        """One token through the cached path. next_id: (B,) or (B,1)."""
+        next_id = next_id.reshape(-1)
+        t = cache["t"]
+        assert t < self.cfg.context, "decode exceeded the position table"
+        if isinstance(self.embed, TrigramByteEmbedding):
+            e = (self.embed.emb0(next_id) + self.embed.emb1(cache["prev1"])
+                 + self.embed.emb2(cache["prev2"])).unsqueeze(1) \
+                + self.embed.pos[:, t:t + 1]
+            cache["prev2"] = cache["prev1"]
+            cache["prev1"] = next_id
+        else:
+            e = self.embed.emb(next_id).unsqueeze(1) + self.embed.pos[:, t:t + 1]
+        x = e
+        for b, c in zip(self.blocks, cache["layers"]):
+            x = b.step(x, c)
+        cache["t"] = t + 1
+        return self.head(self.nf(x))
+
+    @staticmethod
+    def _sample(logits, temperature, top_p):
+        logits = logits[:, -1].float()
+        if temperature <= 0.02:
+            return logits.argmax(-1, keepdim=True)
+        probs = F.softmax(logits / temperature, dim=-1)
+        sp, si = probs.sort(dim=-1, descending=True)
+        keep = (sp.cumsum(-1) - sp) < top_p
+        sp = sp * keep
+        return si.gather(-1, torch.multinomial(
+            sp / sp.sum(-1, keepdim=True), 1))
+
     @torch.no_grad()
     def generate(self, idx, max_new: int = 128, temperature: float = 1.0,
-                 top_p: float = 0.95):
+                 top_p: float = 0.95, use_cache: bool = True):
         self.eval()
+        if use_cache:
+            max_new = min(max_new, self.cfg.context - idx.shape[1] - 1)
+            logits, cache = self.prefill(idx)
+            for _ in range(max_new):
+                nxt = self._sample(logits, temperature, top_p)
+                idx = torch.cat([idx, nxt], dim=1)
+                logits = self.decode_step(nxt, cache)
+            return idx
         for _ in range(max_new):
             logits, _ = self(idx[:, -self.cfg.context:])
-            logits = logits[:, -1].float() / max(temperature, 1e-6)
-            probs = F.softmax(logits, dim=-1)
-            sp, si = probs.sort(dim=-1, descending=True)
-            keep = (sp.cumsum(-1) - sp) < top_p
-            sp = sp * keep
-            nxt = si.gather(-1, torch.multinomial(
-                sp / sp.sum(-1, keepdim=True), 1))
+            nxt = self._sample(logits, temperature, top_p)
             idx = torch.cat([idx, nxt], dim=1)
         return idx
 

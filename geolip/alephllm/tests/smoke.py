@@ -293,6 +293,55 @@ def t_train_loop():
         assert t2.step == 8, "local resume should restore the step count"
 
 
+@case("kv-cache decode == full forward (byte trigram + hub + sdpa)")
+def t_kv_cache():
+    torch.manual_seed(5)
+    m = AlephLM(TINY)
+    m.eval()
+    seq = torch.randint(0, 256, (2, 40))
+    with torch.no_grad():
+        full, _ = m(seq)                       # oracle: one parallel pass
+        logits, cache = m.prefill(seq[:, :34])
+        err0 = (logits[:, -1] - full[:, 33]).abs().max().item()
+        assert err0 < 2e-3, f"prefill logits mismatch {err0:.2e}"
+        for j in range(34, 40):                # teacher-forced cached steps
+            step_logits = m.decode_step(seq[:, j], cache)
+            err = (step_logits[:, -1] - full[:, j]).abs().max().item()
+            assert err < 2e-3, f"cached step {j} mismatch {err:.2e}"
+    assert cache["t"] == 40
+    # single-byte prompt: trigram history must fall back to the pad row
+    lg1, c1 = m.prefill(seq[:, :1])
+    with torch.no_grad():
+        f1, _ = m(seq[:, :1])
+    assert (lg1[:, -1] - f1[:, 0]).abs().max().item() < 2e-3
+    # cached vs uncached generate agree greedily
+    with torch.no_grad():
+        a = m.generate(seq[:, :8], max_new=12, temperature=0.0, use_cache=True)
+        b = m.generate(seq[:, :8], max_new=12, temperature=0.0, use_cache=False)
+    agree = (a == b).float().mean().item()
+    assert agree > 0.95, f"greedy cached/uncached agreement only {agree:.2f}"
+
+
+@case("kv-cache decode == full forward (BPE tied-embedding craft)")
+def t_kv_cache_bpe():
+    torch.manual_seed(6)
+    cfg = AlephLMConfig(name="tiny-bpe-test", d_model=64, n_layers=2,
+                        n_heads=4, context=96, vocab_size=500,
+                        tokenizer="hf:test", tie_embeddings=True,
+                        hub_layers=(1,), hub_K=32, hub_D=8,
+                        head_K=32, head_D=8, hub_chunk=16)
+    m = AlephLM(cfg)
+    m.eval()
+    seq = torch.randint(0, 500, (2, 24))
+    with torch.no_grad():
+        full, _ = m(seq)
+        logits, cache = m.prefill(seq[:, :20])
+        assert (logits[:, -1] - full[:, 19]).abs().max().item() < 2e-3
+        for j in range(20, 24):
+            sl = m.decode_step(seq[:, j], cache)
+            assert (sl[:, -1] - full[:, j]).abs().max().item() < 2e-3
+
+
 @case("crash safety: divergence NEVER overwrites the resume checkpoint")
 def t_crash_no_clobber():
     from ..train.trainer import Trainer

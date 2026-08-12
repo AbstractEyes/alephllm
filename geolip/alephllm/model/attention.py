@@ -39,6 +39,27 @@ class CausalSDPA(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).reshape(B, n, d))
 
+    # ---------------------------------------------------- incremental decode
+    def prefill(self, x):
+        """Full causal pass that also returns the decode cache (K/V)."""
+        B, n, d = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = (t.view(B, n, self.h, d // self.h).transpose(1, 2)
+                   for t in (q, k, v))
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.o(y.transpose(1, 2).reshape(B, n, d)), {"k": k, "v": v}
+
+    def step(self, x_t, cache):
+        """One new position attending over everything cached (KV cache)."""
+        B, _, d = x_t.shape
+        q, k, v = self.qkv(x_t).chunk(3, dim=-1)
+        q, k, v = (t.view(B, 1, self.h, d // self.h).transpose(1, 2)
+                   for t in (q, k, v))
+        cache["k"] = torch.cat([cache["k"], k], dim=2)
+        cache["v"] = torch.cat([cache["v"], v], dim=2)
+        y = F.scaled_dot_product_attention(q, cache["k"], cache["v"])
+        return self.o(y.transpose(1, 2).reshape(B, 1, d))
+
 
 class CausalSplatHUB(nn.Module):
     def __init__(self, d: int, K: int = 512, D: int = 32, tau: float = 0.1,
@@ -91,6 +112,33 @@ class CausalSplatHUB(nn.Module):
             self.last_den_stats = (den.min().item(), den.mean().item(),
                                    (den <= cl).float().mean().item())
         return self.o(num / den.clamp_min(cl))
+
+    # ---------------------------------------------------- incremental decode
+    def prefill(self, x):
+        """Full causal pass plus the decode cache. The hub's cache is the
+        CONSTANT-SIZE prefix state (Sp, Sn, zp, zn) — O(K·d) regardless of
+        sequence length; this is the linear-attention decode advantage."""
+        out = self.forward(x)
+        qp, qn, kp, kn, v = self._halves(x)
+        cache = {"Sp": torch.einsum("bnk,bnd->bkd", kp, v),
+                 "Sn": torch.einsum("bnk,bnd->bkd", kn, v),
+                 "zp": kp.sum(dim=1), "zn": kn.sum(dim=1)}
+        return out, cache
+
+    def step(self, x_t, cache):
+        """One new position: fold it into the prefix state, read once."""
+        qp, qn, kp, kn, v = self._halves(x_t)          # (B,1,K)/(B,1,d)
+        kp1, kn1, v1 = kp.squeeze(1), kn.squeeze(1), v.squeeze(1)
+        cache["Sp"] = cache["Sp"] + kp1.unsqueeze(-1) * v1.unsqueeze(1)
+        cache["Sn"] = cache["Sn"] + kn1.unsqueeze(-1) * v1.unsqueeze(1)
+        cache["zp"] = cache["zp"] + kp1
+        cache["zn"] = cache["zn"] + kn1
+        qp1, qn1 = qp.squeeze(1), qn.squeeze(1)
+        num = torch.einsum("bk,bkd->bd", qp1, cache["Sp"]) \
+            + torch.einsum("bk,bkd->bd", qn1, cache["Sn"])
+        den = ((qp1 * cache["zp"]).sum(-1)
+               + (qn1 * cache["zn"]).sum(-1)).unsqueeze(-1)
+        return self.o((num / den.clamp_min(dtype_floor(den))).unsqueeze(1))
 
     def forward_naive(self, x):
         """Reference cumsum form (the validated probe-bed implementation).
