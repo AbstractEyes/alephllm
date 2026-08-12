@@ -154,7 +154,21 @@ class Trainer:
             return
         print(f"[train] phase '{phase['name']}' on {phase['dataset']} · "
               f"{tokens_per_step:,} tokens/step · device {self.device}")
-        bar = tqdm(unit="step", initial=self.step, dynamic_ncols=True)
+        # bar total = whichever bound ends this session first: remaining
+        # curriculum budget, max_steps, or max_tokens (max_hours just stops
+        # the bar early) — without a total tqdm shows "n/?" and no ETA
+        remaining = sum(
+            max(0, ph["planned_tokens"] - ph.get("tokens_done", 0))
+            for ph in self.manifest.phases
+            if ph["status"] in ("planned", "active"))
+        total = self.step + max(1, math.ceil(remaining / tokens_per_step))
+        if max_steps is not None:
+            total = min(total, start_step + max_steps)
+        if max_tokens is not None:
+            left = max(0, max_tokens - self.manifest.tokens_seen)
+            total = min(total, self.step + math.ceil(left / tokens_per_step))
+        bar = tqdm(unit="step", initial=self.step, total=total,
+                   dynamic_ncols=True)
         model.train()
         save_on_exit = True
         try:
