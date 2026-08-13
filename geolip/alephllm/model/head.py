@@ -1,11 +1,16 @@
 """DualHead — the standard readout plus the L-012 aleph read, born null.
 
-    logits = W_h h + gamma * W_s s(h),        gamma == 0 at init
+    logits = W_h h + W_s s(h),        W_s == 0 at init
 
 s(h) is the signed address of a learned low-D projection of h through a
 K_h-anchor head codebook. New structure enters at zero and earns its way
-in by gradient: gamma's trajectory is the election instrument. With
-gamma=0 the head is exactly the standard linear readout.
+in by gradient — via WEIGHT-zero init, never gate-zero: mini-beatrix-1
+measured (8.4B tokens) that a gamma-gated branch DEADLOCKS (W_s grad is
+scaled by gamma=0, gamma grad through a random frozen readout is
+zero-mean noise), while the bank's E_out weight-zero self-started into
++2 bpb of function. gamma remains as a frozen scalar for checkpoint
+compatibility and as the ablation knob; the election gauge is ||W_s||
+and the head_aleph_off toggle.
 """
 from __future__ import annotations
 
@@ -32,7 +37,9 @@ class DualHead(nn.Module):
         nn.init.orthogonal_(self.proj.weight)
         self.addr = AlephAddress(K, D, tau)
         self.w_s = nn.Linear(K, vocab, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        nn.init.zeros_(self.w_s.weight)          # weight-zero: self-starting
+        self.gamma = nn.Parameter(torch.ones(1))  # frozen; ablation knob only
+        self.gamma.requires_grad_(False)
 
     def forward(self, h, disable_aleph: bool = False):
         if self.tied:

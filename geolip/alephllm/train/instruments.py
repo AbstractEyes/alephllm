@@ -103,6 +103,7 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
     head = model.head
     ph = head.proj(h_final)
     census["head"]["gamma"] = float(head.gamma.item())
+    census["head"]["w_s_norm"] = float(head.w_s.weight.float().norm().item())
     census["head"]["addr"] = head.addr.health(ph)
     w = head.addr.signed(ph.reshape(-1, ph.shape[-1]).float())
     census["head"]["consumed_erank"] = effective_rank(w)
@@ -192,6 +193,7 @@ def log_census_tb(writer, census: dict, ledger: dict | None, step: int):
         for k, g in enumerate(li.get("bank_gates", [])):
             writer.add_scalar(f"gates/L{i}_e{k}", g, step)
     writer.add_scalar("head/gamma", census["head"]["gamma"], step)
+    writer.add_scalar("head/w_s_norm", census["head"]["w_s_norm"], step)
     writer.add_scalar("head/consumed_erank",
                       census["head"]["consumed_erank"], step)
     writer.add_scalar("erank/head_codebook",
@@ -228,7 +230,8 @@ def readout(step: int, tokens: int, census: dict, ledger: dict | None,
           if li.get("bank_sign_frac_neg") is not None]
     if sf:
         lines.append(f"sign census (bank) : frac_neg mean {sum(sf)/len(sf):.3f}")
-    lines.append(f"head gamma         : {census['head']['gamma']:+.5f} · "
+    lines.append(f"head aleph         : gamma {census['head']['gamma']:+.3f} · "
+                 f"||W_s|| {census['head']['w_s_norm']:.4f} · "
                  f"consumed erank {census['head']['consumed_erank']:.1f}")
     if ledger:
         tog = " ".join(f"{k.replace('toggle_', '')}:{v:+.4f}"
