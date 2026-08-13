@@ -69,7 +69,11 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
     census = {"layers": {}, "head": {}, "flags": {}}
     hidden_eranks = []
     x = model.embed(sample_idx)
-    for i, blk in enumerate(model.blocks):
+    for i, wrap in enumerate(model.blocks):
+        # frozen-trunk adapter wrappers (amoe-lora) hold the real block at
+        # .block — census taps read the inner block, then the wrapper's
+        # patch is applied to keep the replayed stream faithful
+        blk = getattr(wrap, "block", wrap)
         li = {}
         tap_attn = blk.n1(x)
         if blk.is_hub:
@@ -84,6 +88,11 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
         tap_bank = blk.n2(x)
         li["bank_addr"] = blk.bank.addr.health(tap_bank)
         x = x + blk.bank(tap_bank)
+        if wrap is not blk:
+            if hasattr(wrap, "adapter") and getattr(wrap, "enabled", True):
+                x = wrap.adapter(x)
+            elif hasattr(wrap, "disp"):
+                x = wrap.disp(x)
         li.update({f"bank_{k}": v for k, v in bank_stats(blk.bank).items()})
         li["hidden_erank"] = effective_rank(x[:2])
         hidden_eranks.append(li["hidden_erank"])
@@ -141,7 +150,7 @@ def toggle_ledger(model, val_batches: list) -> dict:
     led = {"bpb_full": full,
            "bpb_bank_off": bpb(disable_bank=True),
            "bpb_head_aleph_off": bpb(disable_head_aleph=True)}
-    if any(b.is_hub for b in model.blocks):
+    if any(getattr(b, "block", b).is_hub for b in model.blocks):
         led["bpb_hub_off"] = bpb(disable_hub=True)
     for k in list(led):
         if k != "bpb_full":

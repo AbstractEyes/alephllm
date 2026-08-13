@@ -10,9 +10,19 @@ Toggle surface (the causal contribution ledger, run at every eval):
 """
 from __future__ import annotations
 
+from typing import NamedTuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class LMOutput(NamedTuple):
+    """Still a tuple — `logits, loss = model(x)` keeps working — but also
+    HF-duck-typed (`out.logits`, `out.loss`) so frozen-trunk tooling like
+    amoe-lora drives the model natively."""
+    logits: torch.Tensor
+    loss: Optional[torch.Tensor]
 
 from ..presets import AlephLMConfig
 from .attention import CausalSDPA, CausalSplatHUB
@@ -68,18 +78,33 @@ class AlephLM(nn.Module):
         self.head = DualHead(cfg.d_model, cfg.vocab_size, cfg.head_K,
                              cfg.head_D, cfg.tau, tied_weight=tied)
 
-    def forward(self, idx, targets=None, disable_bank=False, disable_hub=False,
-                disable_head_aleph=False):
+    def forward(self, idx=None, targets=None, disable_bank=False,
+                disable_hub=False, disable_head_aleph=False,
+                input_ids=None, labels=None, attention_mask=None):
+        """HF-style aliases are accepted so frozen-trunk tooling drives the
+        model unchanged, WITH HF semantics: `labels` are same-position and
+        shifted internally (logits[:-1] vs labels[1:]); `targets` are the
+        package's own pre-shifted convention and used as-is. attention_mask
+        is deliberately ignored: under causal attention with right-padding
+        and -100 label masking, pads can never influence a scored position."""
+        if idx is None:
+            idx = input_ids
         x = self.embed(idx)
         for b in self.blocks:
             x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
         h = self.nf(x)
         logits = self.head(h, disable_aleph=disable_head_aleph)
-        if targets is None:
-            return logits, None
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(),
-                               targets.reshape(-1), ignore_index=-100)
-        return logits, loss
+        if targets is not None:                     # pre-shifted (ours)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(),
+                targets.reshape(-1), ignore_index=-100)
+        elif labels is not None:                    # HF: shift internally
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]).float(),
+                labels[:, 1:].reshape(-1), ignore_index=-100)
+        else:
+            return LMOutput(logits, None)
+        return LMOutput(logits, loss)
 
     # ---------------------------------------------------- incremental decode
     @torch.no_grad()

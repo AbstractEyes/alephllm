@@ -357,6 +357,69 @@ def t_kv_cache_bpe():
             assert (sl[:, -1] - full[:, j]).abs().max().item() < 2e-3
 
 
+@case("forward is HF-duck-typed: input_ids/labels aliases + .logits/.loss")
+def t_hf_compat():
+    m = AlephLM(TINY)
+    x = torch.randint(0, 256, (2, 33))
+    out = m(input_ids=x, labels=x,
+            attention_mask=torch.ones_like(x))
+    assert hasattr(out, "logits") and hasattr(out, "loss")
+    assert out.loss is not None and math.isfinite(out.loss.item())
+    logits, loss = m(x[:, :-1], targets=x[:, 1:])   # tuple unpack unchanged
+    # HF labels (same-position, shifted internally) must equal our
+    # pre-shifted convention exactly
+    assert abs(loss.item() - out.loss.item()) < 1e-4, "label-shift semantics"
+    assert torch.allclose(logits, out.logits[:, :-1], atol=1e-4)
+
+
+@case("census + toggles survive frozen-trunk adapter wrappers")
+def t_census_wrapped():
+    class _Wrap(torch.nn.Module):          # mirrors amoe BlockWithAdapter
+        def __init__(self, block):
+            super().__init__()
+            self.block = block
+            self.enabled = True
+            self.adapter = torch.nn.Identity()
+
+        def forward(self, *a, **k):
+            return self.adapter(self.block(*a, **k))
+
+        def prefill(self, *a, **k):
+            out, cache = self.block.prefill(*a, **k)
+            return self.adapter(out), cache
+
+        def step(self, *a, **k):
+            return self.adapter(self.block.step(*a, **k))
+
+    m = AlephLM(TINY)
+    m.blocks = torch.nn.ModuleList(_Wrap(b) for b in m.blocks)
+    x = torch.randint(0, 256, (2, 64))
+    census = instruments.model_census(m, x)
+    assert "hub_consumed_erank" in census["layers"][1]
+    led = instruments.toggle_ledger(m, [torch.randint(0, 256, (2, 65))])
+    assert "toggle_hub_off" in led
+    with torch.no_grad():
+        a = m.generate(x[:, :8], max_new=6, temperature=0.0, use_cache=True)
+        b = m.generate(x[:, :8], max_new=6, temperature=0.0, use_cache=False)
+    assert torch.equal(a, b)
+
+
+@case("amoe bridge: chat rows byte-exact prefix, loss lands on replies")
+def t_bridge_rows():
+    from ..amoe_bridge import render_chat_rows, ASSISTANT_TAG
+    conv = [{"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "Who are you?"},
+            {"role": "assistant", "content": "I am Beatrix."}]
+    rows = render_chat_rows([conv], context=512)
+    assert len(rows) == 2, "one row per assistant turn"
+    for r, reply in zip(rows, ["Hello!", "I am Beatrix."]):
+        ids, n = r["ids"], r["n_prefix"]
+        assert bytes(ids[:n]).decode().endswith(ASSISTANT_TAG)
+        assert bytes(ids[n:]).decode() == " " + reply + "\n"
+    assert not render_chat_rows([conv], context=10), "over-budget dropped"
+
+
 @case("crash safety: divergence NEVER overwrites the resume checkpoint")
 def t_crash_no_clobber():
     from ..train.trainer import Trainer
