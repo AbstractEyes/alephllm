@@ -420,6 +420,20 @@ def t_bridge_rows():
     assert not render_chat_rows([conv], context=10), "over-budget dropped"
 
 
+@case("chat-sft plumbing: persona rows render, samples run KV-cached")
+def t_chat_sft_plumbing():
+    from ..chat_sft import persona_conversations, _samples, FIXED_PROMPTS
+    from ..amoe_bridge import render_chat_rows
+    convs = persona_conversations()
+    assert len(convs) > 100
+    rows = render_chat_rows(convs, context=TINY.context * 8)
+    assert len(rows) > 100
+    assert all(r["n_prefix"] < len(r["ids"]) for r in rows)
+    m = AlephLM(TINY)
+    s = _samples(m, "cpu", max_new=12)   # exercises prefill+decode_step
+    assert set(s) == {c[0]["content"] for c in FIXED_PROMPTS}
+
+
 @case("crash safety: divergence NEVER overwrites the resume checkpoint")
 def t_crash_no_clobber():
     from ..train.trainer import Trainer
