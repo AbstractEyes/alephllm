@@ -218,14 +218,29 @@ def run_chat_conditioning(hf_token: str | None = None,
               f"{report['control_bpb']:.4f} "
               f"(forgetting {report['control_bpb']-report['base_bpb']:+.4f})")
 
-    # ---- ship
+    # ---- ship (retry; on final failure keep the local file and say how
+    # to recover — a trained arm must never die on a network hiccup)
     if push:
-        api.upload_file(path_or_fileobj=local,
-                        path_in_repo=f"{craft}/arms/{arm_name}",
-                        repo_id=TRAINING_REPO)
-        api.upload_file(
-            path_or_fileobj=json.dumps(report, indent=1).encode(),
-            path_in_repo=f"{craft}/arms/{arm_name}.report.json",
-            repo_id=TRAINING_REPO)
-        print(f"[chat-sft] shipped {craft}/arms/{arm_name} (+report)")
+        for attempt in range(4):
+            try:
+                api.upload_file(path_or_fileobj=local,
+                                path_in_repo=f"{craft}/arms/{arm_name}",
+                                repo_id=TRAINING_REPO)
+                api.upload_file(
+                    path_or_fileobj=json.dumps(report, indent=1).encode(),
+                    path_in_repo=f"{craft}/arms/{arm_name}.report.json",
+                    repo_id=TRAINING_REPO)
+                print(f"[chat-sft] shipped {craft}/arms/{arm_name} (+report)")
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 3:
+                    print(f"[chat-sft] UPLOAD FAILED after 4 tries ({e}) — "
+                          f"the arm is safe at {local}; re-push with:
+"
+                          f"  HfApi(token=...).upload_file(path_or_fileobj="
+                          f"{local!r}, path_in_repo="
+                          f"'{craft}/arms/{arm_name}', "
+                          f"repo_id='{TRAINING_REPO}')")
+                else:
+                    time.sleep(10 * (attempt + 1))
     return report
