@@ -110,13 +110,28 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
 
     # ------------------------------------------------------ collapse flags
     flags = {}
+    detail = {}
     d = model.cfg.d_model
-    flags["hidden_erank_floor"] = any(e < 0.05 * d for e in hidden_eranks)
-    flags["anchor_merge"] = any(
-        li.get("bank_addr", {}).get("anchor_merge_pairs", 0) > 0
-        or li.get("hub_addr", {}).get("anchor_merge_pairs", 0) > 0
-        for li in census["layers"].values()) or \
-        census["head"]["addr"].get("anchor_merge_pairs", 0) > 0
+    low = [f"L{i}:{e:.0f}" for i, e in enumerate(hidden_eranks)
+           if e < 0.05 * d]
+    flags["hidden_erank_floor"] = bool(low)
+    if low:
+        detail["hidden_erank_floor"] = ",".join(low)
+    merged = []
+    for i, li in census["layers"].items():
+        bp = li.get("bank_addr", {}).get("anchor_merge_pairs", 0)
+        hp = li.get("hub_addr", {}).get("anchor_merge_pairs", 0)
+        if bp:
+            merged.append(f"bankL{i}:{bp}p")
+        if hp:
+            merged.append(f"hubL{i}:{hp}p")
+    head_p = census["head"]["addr"].get("anchor_merge_pairs", 0)
+    if head_p:
+        merged.append(f"head:{head_p}p")
+    flags["anchor_merge"] = bool(merged)
+    if merged:
+        detail["anchor_merge"] = ",".join(merged)
+    census["flag_detail"] = detail
     flags["dispatch_collapse"] = any(
         li.get("bank_dispatch_entropy_frac", 1.0) < 0.10
         for li in census["layers"].values())
@@ -237,7 +252,9 @@ def readout(step: int, tokens: int, census: dict, ledger: dict | None,
         tog = " ".join(f"{k.replace('toggle_', '')}:{v:+.4f}"
                        for k, v in ledger.items() if k.startswith("toggle_"))
         lines.append(f"toggle ledger (bpb): full {ledger['bpb_full']:.4f} · {tog}")
-    fired = [k for k, v in census["flags"].items() if v]
+    det = census.get("flag_detail", {})
+    fired = [k + ("(" + det[k] + ")" if k in det else "")
+             for k, v in census["flags"].items() if v]
     lines.append("collapse flags     : " +
                  (" !! " + ", ".join(fired) if fired else "none"))
     if extra:
