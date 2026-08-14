@@ -235,9 +235,8 @@ def run_chat_conditioning(hf_token: str | None = None,
             except Exception as e:  # noqa: BLE001
                 if attempt == 3:
                     print(f"[chat-sft] UPLOAD FAILED after 4 tries ({e}) — "
-                          f"the arm is safe at {local}; re-push with:
-"
-                          f"  HfApi(token=...).upload_file(path_or_fileobj="
+                          f"the arm is safe at {local}; re-push with:")
+                    print(f"  HfApi(token=...).upload_file(path_or_fileobj="
                           f"{local!r}, path_in_repo="
                           f"'{craft}/arms/{arm_name}', "
                           f"repo_id='{TRAINING_REPO}')")
