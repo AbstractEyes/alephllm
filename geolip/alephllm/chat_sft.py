@@ -134,6 +134,12 @@ def run_chat_conditioning(hf_token: str | None = None,
     from huggingface_hub import HfApi, hf_hub_download
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     api = HfApi(token=hf_token)
+    # ONE numeric regime for every gauge: amoe.train pins strict fp32 (its
+    # law) — pinning it before the BASELINE too, or the pre/post comparison
+    # measures the kernel mode instead of the weights (arm A's report
+    # printed toggle_bit_exact=False for exactly this reason; the shipped
+    # pair verified bit-exact on strict-fp32 hardware).
+    amoe.laws.pin_precision()
 
     # ---- locked core
     files = api.list_repo_files(TRAINING_REPO)
@@ -158,7 +164,11 @@ def run_chat_conditioning(hf_token: str | None = None,
     print(f"[chat-sft] {len(rows)} rows "
           f"(median {sorted(len(r['ids']) for r in rows)[len(rows)//2]} bytes)")
 
-    # ---- baseline gauges
+    # ---- baseline gauges (logits snapshot is the toggle-law reference)
+    nids = torch.tensor([list(NEUTRAL.encode())[:768]], device=device)
+    with torch.no_grad():
+        base_logits, _ = model(nids[:, :-1])
+    base_logits = base_logits.cpu()
     report = {"craft": craft, "core_step": core_step, "steps": steps,
               "n_rows": len(rows), "base_bpb": _bpb(model, device),
               "samples_core": _samples(model, device)}
@@ -185,12 +195,18 @@ def run_chat_conditioning(hf_token: str | None = None,
     report["samples_arm"] = _samples(model, device)
     for w in wrappers:
         w.enabled = False
-    report["toggle_bit_exact"] = abs(_bpb(model, device)
-                                     - report["base_bpb"]) < 1e-9
+    with torch.no_grad():
+        off_logits, _ = model(nids[:, :-1])
+    off_logits = off_logits.cpu()
+    report["arm_off_bpb"] = _bpb(model, device)
+    report["toggle_bit_exact"] = torch.equal(off_logits, base_logits)
+    report["toggle_max_abs_diff"] = float(
+        (off_logits - base_logits).abs().max().item())
     for w in wrappers:
         w.enabled = True
     print(f"[chat-sft] core tax {report['arm_on_bpb']-report['base_bpb']:+.4f} "
-          f"bpb · arm-off bit-exact: {report['toggle_bit_exact']}")
+          f"bpb · arm-off bit-exact: {report['toggle_bit_exact']} "
+          f"(max|diff| {report['toggle_max_abs_diff']:.2e})")
     for q in report["samples_core"]:
         print(f"  Q: {q}\n    core: {report['samples_core'][q]!r}"
               f"\n    arm : {report['samples_arm'][q]!r}")
