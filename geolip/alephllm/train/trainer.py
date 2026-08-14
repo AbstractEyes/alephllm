@@ -143,10 +143,15 @@ class Trainer:
     # -------------------------------------------------------------- train
     def train(self, max_steps: int | None = None, max_hours: float | None = None,
               max_tokens: int | None = None):
+        """All caps are SESSION-RELATIVE: max_steps/max_tokens count only
+        this call's work (max_tokens=12e9 trains 12B tokens NOW, regardless
+        of lifetime total). Cap stops announce themselves as session caps —
+        only the curriculum itself prints 'curriculum complete'."""
         model, tc = self.model, self.tc
         tokens_per_step = tc.micro_batch * tc.grad_accum * self.cfg.context
         t0 = time.time()
         start_step = self.step
+        start_tokens = self.manifest.tokens_seen
         print(self.manifest.summary())
         phase = self._open_stream()
         if phase is None:
@@ -165,8 +170,7 @@ class Trainer:
         if max_steps is not None:
             total = min(total, start_step + max_steps)
         if max_tokens is not None:
-            left = max(0, max_tokens - self.manifest.tokens_seen)
-            total = min(total, self.step + math.ceil(left / tokens_per_step))
+            total = min(total, self.step + math.ceil(max_tokens / tokens_per_step))
         bar = tqdm(unit="step", initial=self.step, total=total,
                    dynamic_ncols=True)
         self._bar = bar
@@ -175,14 +179,17 @@ class Trainer:
         try:
             while True:
                 if max_steps is not None and self.step - start_step >= max_steps:
-                    print("[train] max_steps reached")
+                    print("[train] SESSION CAP: max_steps this call — "
+                          "a pause, not completion")
                     break
                 if max_hours is not None and (time.time() - t0) / 3600 >= max_hours:
-                    print("[train] max_hours reached")
+                    print("[train] SESSION CAP: max_hours this call — "
+                          "a pause, not completion")
                     break
                 if max_tokens is not None and \
-                        self.manifest.tokens_seen >= max_tokens:
-                    print("[train] max_tokens reached")
+                        self.manifest.tokens_seen - start_tokens >= max_tokens:
+                    print(f"[train] SESSION CAP: {max_tokens/1e9:.2f}B tokens "
+                          "this call — a pause, not completion")
                     break
 
                 step_t0 = time.time()
@@ -281,6 +288,13 @@ class Trainer:
             self.writer.flush()
             self.hub.upload_tensorboard(self.tb_dir)
             print(self.manifest.summary())
+            left = sum(max(0, p["planned_tokens"] - p.get("tokens_done", 0))
+                       for p in self.manifest.phases
+                       if p["status"] in ("planned", "active"))
+            if left > 0:
+                print(f"[train] curriculum NOT complete: {left/1e9:.2f}B "
+                      "tokens remain in active/planned phases — call "
+                      "train() again to continue")
 
     @torch.no_grad()
     def _weights_finite(self) -> bool:

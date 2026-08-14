@@ -461,6 +461,29 @@ def t_chat_sft_plumbing():
     assert set(s) == {c[0]["content"] for c in FIXED_PROMPTS}
 
 
+@case("session caps are relative: max_tokens counts THIS call only")
+def t_session_caps():
+    from ..train.trainer import Trainer
+    from ..presets import Preset, TrainConfig
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        p = Preset(model=TINY,
+                   train=TrainConfig(micro_batch=4, grad_accum=1,
+                                     warmup_steps=0, log_every=100,
+                                     health_every=1000, eval_every=1000,
+                                     ckpt_every=1000, tb_upload_every=1000,
+                                     val_tokens=256, canary_episodes=8),
+                   curriculum=[dict(name="syn", dataset="synthetic",
+                                    planned_tokens=10_000_000_000,
+                                    status="planned")])
+        t = Trainer(p, hf_token=None, out_dir=td, resume=False)
+        per_step = 4 * TINY.context
+        t.train(max_tokens=3 * per_step)          # session 1: exactly 3 steps
+        assert t.step == 3, f"expected 3 steps, got {t.step}"
+        t.train(max_tokens=2 * per_step)          # session 2 must run AGAIN
+        assert t.step == 5, ("second session's cap must count only its own "
+                             f"tokens (lifetime-cap bug): step={t.step}")
+
+
 @case("crash safety: divergence NEVER overwrites the resume checkpoint")
 def t_crash_no_clobber():
     from ..train.trainer import Trainer
