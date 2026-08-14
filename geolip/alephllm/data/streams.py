@@ -34,9 +34,94 @@ REGISTRY = {
                         name="sample-10BT",
                         split="train", column="text"),
     "synthetic": dict(path=None),   # deterministic local stream (tests/smoke)
+    # ---- anneal-mix components (phase C: distribution shift toward the
+    # forms she will live in; moral-narrative texture rides TinyStories+SODA)
+    "cosmopedia": dict(path="HuggingFaceTB/smollm-corpus",
+                       name="cosmopedia-v2", split="train", column="text"),
+    "tinystories": dict(path="roneneldan/TinyStories",
+                        split="train", column="text"),
+    "soda-dialogue": dict(path="allenai/soda", split="train",
+                          column="dialogue", render="soda"),
+    "beatrix-texture": dict(path=None, generator="beatrix"),
+    "recall-synth": dict(path=None, generator="recall"),
 }
 
 RESERVED_HEAD_ROWS = 2048
+
+# anneal-mix recipe: (dataset, weight)
+ANNEAL_MIX = [("fineweb-edu", 0.45), ("cosmopedia", 0.20),
+              ("tinystories", 0.15), ("soda-dialogue", 0.12),
+              ("beatrix-texture", 0.05), ("recall-synth", 0.03)]
+
+
+def _render_soda(row) -> str:
+    """SODA row -> social narrative + name-tagged dialogue turns (teaches
+    the structural turn format without binding Beatrix's name to
+    arbitrary content)."""
+    lines = [str(row.get("narrative", "")).strip()]
+    speakers, turns = row.get("speakers") or [], row.get("dialogue") or []
+    for s, u in zip(speakers, turns):
+        lines.append(str(s) + ": " + str(u))
+    return "\n".join(x for x in lines if x)
+
+
+def _beatrix_texture_rows(seed: int):
+    """Template-exact self-descriptive exchanges at low rate: the CORE
+    learns who Beatrix is as world knowledge, and her exact chat format
+    becomes in-distribution before any arm training."""
+    import numpy as _np
+    from ..amoe_bridge import CHAT_HEADER, USER_TAG, ASSISTANT_TAG
+    qa = [("Who are you?",
+           "I am Beatrix, a small byte-level language model. I read raw "
+           "bytes instead of words, and I am still in training."),
+          ("Hello!", "Hello! How can I help you today?"),
+          ("What can you do?",
+           "I continue text and hold simple conversations. I am a small "
+           "model, so simple questions work best."),
+          ("Are you human?",
+           "No, I am a language model - a computer program that learned "
+           "from reading text."),
+          ("What is a byte-level model?",
+           "It means I read text one byte at a time instead of using a "
+           "word vocabulary. My tokens are learned inside the network."),
+          ("Can you make mistakes?",
+           "Yes, often. I am small and still learning, so please check "
+           "anything important.")]
+    rng = _np.random.default_rng(seed)
+    while True:
+        k = int(rng.integers(1, 4))
+        idx = rng.choice(len(qa), size=k, replace=False)
+        text = CHAT_HEADER
+        for i in idx:
+            q, a = qa[int(i)]
+            text += USER_TAG + q + "\n" + ASSISTANT_TAG + " " + a + "\n"
+        yield {"text": text}
+
+
+def _recall_rows(seed: int):
+    """Natural-text recall episodes (V1b-descendant, word keys): binding
+    demand for the hub armies, in-distribution unlike the byte-soup
+    canary."""
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    names = ["Mara", "Odin", "Petra", "Silas", "Nia", "Bram", "Cleo",
+             "Dane", "Elba", "Faro"]
+    things = ["a copper key", "a red kite", "an old map", "a glass bead",
+              "a silver coin", "a worn book", "a small drum", "a green pear"]
+    while True:
+        k = int(rng.integers(3, 6))
+        who = rng.choice(len(names), size=k, replace=False)
+        what = rng.choice(len(things), size=k, replace=False)
+        lines = [names[int(w)] + " carries " + things[int(x)] + "."
+                 for w, x in zip(who, what)]
+        q = int(rng.integers(0, k))
+        lines.append("What does " + names[int(who[q])] + " carry? "
+                     + names[int(who[q])] + " carries "
+                     + things[int(what[q])] + ".")
+        yield {"text": " ".join(lines)}
+
+
+_GENERATORS = {"beatrix": _beatrix_texture_rows, "recall": _recall_rows}
 
 
 def _synthetic_rows(seed: int):
@@ -95,8 +180,9 @@ class PackedStream:
     def _open(self):
         spec = REGISTRY[self.dataset]
         if spec["path"] is None:
+            gen = _GENERATORS.get(spec.get("generator"), _synthetic_rows)
             self._ds = None
-            self._it = _synthetic_rows(self.seed + self.epoch)
+            self._it = gen(self.seed + self.epoch)
             for _ in range(self._skip_rows):
                 next(self._it)
             self._skip_rows = 0
@@ -147,7 +233,8 @@ class PackedStream:
     def _next_row_text(self) -> str:
         if self._it is None:
             self._open()
-        col = REGISTRY[self.dataset].get("column", "text")
+        spec = REGISTRY[self.dataset]
+        col = spec.get("column", "text")
         while True:
             try:
                 row = next(self._it)
@@ -158,7 +245,12 @@ class PackedStream:
                 self._open()
                 continue
             self.rows_consumed += 1
-            text = row.get(col, "")
+            if spec.get("render") == "soda":
+                text = _render_soda(row)
+            else:
+                text = row.get(col, "")
+            if isinstance(text, list):
+                text = "\n".join(str(x) for x in text)
             if text and not text.isspace():
                 return text
 
@@ -178,7 +270,60 @@ class PackedStream:
             take.reshape(self.micro_batch, self.context + 1).copy())
 
 
+class MixStream:
+    """Weighted multiplex of PackedStreams (the anneal mix). Each
+    next_batch draws one component by weight from a deterministic counter
+    RNG, so the interleaving is exactly reproducible and resumable
+    (state = draw counter + every component's state)."""
+
+    def __init__(self, tokenizer, context: int, micro_batch: int,
+                 seed: int = 1337, recipe=None):
+        self.dataset = "anneal-mix"
+        self.recipe = list(recipe or ANNEAL_MIX)
+        self._names = [n for n, _ in self.recipe]
+        total = sum(w for _, w in self.recipe)
+        self._weights = [w / total for _, w in self.recipe]
+        self._streams = {n: PackedStream(n, tokenizer, context, micro_batch,
+                                         seed=seed + 101 * i)
+                         for i, (n, _) in enumerate(self.recipe)}
+        self._seed = seed
+        self._draws = 0
+
+    @property
+    def rows_consumed(self):
+        return sum(s.rows_consumed for s in self._streams.values())
+
+    @property
+    def epoch(self):
+        return max(s.epoch for s in self._streams.values())
+
+    def _pick(self) -> str:
+        import numpy as _np
+        r = _np.random.default_rng(self._seed * 1_000_003 + self._draws)
+        self._draws += 1
+        return str(r.choice(self._names, p=self._weights))
+
+    def next_batch(self):
+        return self._streams[self._pick()].next_batch()
+
+    def state_dict(self) -> dict:
+        return {"draws": self._draws,
+                "components": {n: s.state_dict()
+                               for n, s in self._streams.items()}}
+
+    def load_state_dict(self, st: dict):
+        self._draws = int(st.get("draws", 0))
+        for n, s in self._streams.items():
+            if n in st.get("components", {}):
+                s.load_state_dict(st["components"][n])
+
+
 def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
-                 seed: int = 1337, role: str = "train") -> PackedStream:
+                 seed: int = 1337, role: str = "train"):
+    if dataset == "anneal-mix":
+        if role == "val":   # gauge continuity: anneal val = fineweb holdout
+            return PackedStream("fineweb-edu", tokenizer, context,
+                                micro_batch, seed, role="val")
+        return MixStream(tokenizer, context, micro_batch, seed)
     return PackedStream(dataset, tokenizer, context, micro_batch, seed,
                         role=role)

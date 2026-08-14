@@ -420,6 +420,33 @@ def t_bridge_rows():
     assert not render_chat_rows([conv], context=10), "over-budget dropped"
 
 
+@case("anneal mix: generators well-formed, MixStream resumes batch-exact")
+def t_anneal_mix():
+    from ..data.streams import (MixStream, _beatrix_texture_rows,
+                                _recall_rows, _render_soda)
+    r = next(_beatrix_texture_rows(0))["text"]
+    assert "Beatrix:" in r and "User:" in r
+    rr = next(_recall_rows(0))["text"]
+    assert "carries" in rr and "What does" in rr
+    s = _render_soda({"narrative": "Two friends met.",
+                      "speakers": ["Ana", "Ben"],
+                      "dialogue": ["Hi Ben.", "Hi Ana."]})
+    assert "Ana: Hi Ben." in s and s.startswith("Two friends met.")
+    tok = ByteTrigramTokenizer()
+    recipe = [("beatrix-texture", 0.5), ("recall-synth", 0.3),
+              ("synthetic", 0.2)]
+    m1 = MixStream(tok, context=64, micro_batch=2, seed=9, recipe=recipe)
+    a = [m1.next_batch() for _ in range(6)]
+    st = m1.state_dict()
+    b = [m1.next_batch() for _ in range(6)]
+    m2 = MixStream(tok, context=64, micro_batch=2, seed=9, recipe=recipe)
+    m2.load_state_dict(st)
+    c = [m2.next_batch() for _ in range(6)]
+    for x, y in zip(b, c):
+        assert torch.equal(x, y), "mix resume diverged"
+    assert m1.rows_consumed > 0
+
+
 @case("chat-sft plumbing: persona rows render, samples run KV-cached")
 def t_chat_sft_plumbing():
     from ..chat_sft import persona_conversations, _samples, FIXED_PROMPTS

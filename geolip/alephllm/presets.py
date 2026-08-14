@@ -110,6 +110,10 @@ def _curriculum(warm: int, main: int, ext: int):
         # manifest, the data work happens when the phase activates.
         dict(name="fineweb_extended", dataset="fineweb-edu", planned_tokens=ext,
              status="deferred"),
+        # phase C: distribution shift toward chat format / simple register /
+        # narrative (incl. moral texture) / binding demand — see streams.ANNEAL_MIX
+        dict(name="anneal_mix", dataset="anneal-mix",
+             planned_tokens=2_000_000_000, status="deferred"),
     ]
 
 
