@@ -35,6 +35,20 @@ from .manifest import RunManifest
 from .optim import build_optimizers, apply_lr
 
 
+def _emit(bar, text: str):
+    """Print through the bar when possible, but NEVER let display kill
+    training: tqdm.write's external_write_mode clears-and-refreshes every
+    live tqdm instance INCLUDING foreign ones (hf-hub download bars from
+    mix components opening mid-train); in notebook mode a widget bar
+    whose container is gone raises AttributeError from inside that
+    classmethod — measured 2026-08-15, aborted a curriculum session at
+    step 59,000. A progress bar is not allowed to cost a session."""
+    try:
+        (bar.write if bar is not None else print)(text)
+    except Exception:
+        print(text)
+
+
 class Trainer:
     def __init__(self, preset: Preset | str, hf_token: str | None = None,
                  out_dir: str = "./alephllm_runs", device: str | None = None,
@@ -312,7 +326,7 @@ class Trainer:
         instruments.log_census_tb(self.writer, census, None, self.step)
         text = instruments.readout(self.step, self.manifest.tokens_seen,
                                    census, None)
-        (bar.write if bar is not None else print)(text)
+        _emit(bar, text)
         return census
 
     def _val(self):
@@ -352,8 +366,7 @@ class Trainer:
 
     # -------------------------------------------------------- checkpoints
     def _say(self, msg: str):
-        bar = getattr(self, "_bar", None)
-        (bar.write if bar is not None else print)(msg)
+        _emit(getattr(self, "_bar", None), msg)
 
     def _checkpoint(self, final: bool = False):
         t0 = time.time()
