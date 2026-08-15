@@ -466,16 +466,24 @@ STAGE_TOKENS = {
 
 def append_curriculum_phases(manifest) -> int:
     """Idempotently append S0..S8 as manifest phases. Returns how many
-    were added (0 on re-run)."""
+    were added (0 on re-run). Status vocabulary is the manifest's:
+    planned|active|done|deferred — current_phase() activates 'planned'
+    phases; anything else is invisible to the scheduler (a 'pending'
+    typo here once made the whole curriculum read as complete)."""
     have = {p["name"] for p in manifest.phases}
     added = 0
     for ds, toks in STAGE_TOKENS.items():
         name = ds.replace("-", "_")
         if name in have:
+            # repair pass: normalize a curriculum phase left unschedulable
+            # by the pre-fix status string
+            for p in manifest.phases:
+                if p["name"] == name and p.get("status") == "pending":
+                    p["status"] = "planned"
             continue
         manifest.phases.append(dict(name=name, dataset=ds,
                                     planned_tokens=toks, tokens_done=0,
-                                    status="pending"))
+                                    status="planned"))
         added += 1
     return added
 
