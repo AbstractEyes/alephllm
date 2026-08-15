@@ -124,6 +124,14 @@ def _recall_rows(seed: int):
 
 _GENERATORS = {"beatrix": _beatrix_texture_rows, "recall": _recall_rows}
 
+# render-fn dispatch: specs name a renderer; curriculum.py registers more.
+# A renderer returning "" REJECTS the row (row-filter); specs that filter
+# aggressively must raise max_empties above the 1000-row circuit breaker.
+_RENDERERS = {"soda": _render_soda}
+
+# stage recipes registered by curriculum.py: {"curriculum-s0": [(name, w)...]}
+CURRICULUM_MIXES: dict[str, list] = {}
+
 
 def _synthetic_rows(seed: int):
     rng = np.random.default_rng(seed)
@@ -243,12 +251,13 @@ class PackedStream:
             self._open()
         spec = REGISTRY[self.dataset]
         col = spec.get("column", "text")
+        max_empties = int(spec.get("max_empties", 1000))
         empties = 0
         while True:
-            if empties >= 1000:
+            if empties >= max_empties:
                 raise RuntimeError(
-                    f"stream '{self.dataset}': 1,000 consecutive rows "
-                    "rendered EMPTY — a schema/render mismatch would "
+                    f"stream '{self.dataset}': {max_empties:,} consecutive "
+                    "rows rendered EMPTY — a schema/render mismatch would "
                     "otherwise spin here silently forever (circuit "
                     "breaker; check REGISTRY columns vs the renderer)")
             try:
@@ -260,8 +269,9 @@ class PackedStream:
                 self._open()
                 continue
             self.rows_consumed += 1
-            if spec.get("render") == "soda":
-                text = _render_soda(row)
+            r = spec.get("render")
+            if r is not None:
+                text = _RENDERERS[r](row)
             else:
                 text = row.get(col, "")
             if isinstance(text, list):
@@ -341,5 +351,13 @@ def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
             return PackedStream("fineweb-edu", tokenizer, context,
                                 micro_batch, seed, role="val")
         return MixStream(tokenizer, context, micro_batch, seed)
+    if dataset in CURRICULUM_MIXES:
+        if role == "val":   # gauge continuity: every stage vals on the
+            return PackedStream("fineweb-edu", tokenizer, context,   # same
+                                micro_batch, seed, role="val")       # holdout
+        ms = MixStream(tokenizer, context, micro_batch, seed,
+                       recipe=CURRICULUM_MIXES[dataset])
+        ms.dataset = dataset
+        return ms
     return PackedStream(dataset, tokenizer, context, micro_batch, seed,
                         role=role)
