@@ -41,7 +41,8 @@ REGISTRY = {
     "tinystories": dict(path="roneneldan/TinyStories",
                         split="train", column="text"),
     "soda-dialogue": dict(path="allenai/soda", split="train",
-                          column="dialogue", render="soda"),
+                          column="dialogue", render="soda",
+                          columns=["narrative", "speakers", "dialogue"]),
     "beatrix-texture": dict(path=None, generator="beatrix"),
     "recall-synth": dict(path=None, generator="recall"),
 }
@@ -188,14 +189,21 @@ class PackedStream:
             self._skip_rows = 0
             return
         from datasets import load_dataset
+        print(f"[stream] opening '{self.dataset}' "
+              f"({spec['path']}) …", flush=True)
         if self.role == "val" and spec.get("val_split"):
             ds = load_dataset(spec["path"], name=spec.get("name"),
                               split=spec["val_split"], streaming=True)
         else:
             ds = load_dataset(spec["path"], name=spec.get("name"),
                               split=spec["split"], streaming=True)
+        # column-prune to what is actually consumed: render datasets need
+        # EVERY column their renderer reads — pruning to the single display
+        # column starved _render_soda into empty rows and an invisible
+        # infinite skip-loop (the anneal first-batch hang, found live)
+        keep = spec.get("columns") or [spec["column"]]
         try:
-            ds = ds.select_columns([spec["column"]])
+            ds = ds.select_columns(keep)
         except Exception:
             pass
         if not spec.get("val_split"):       # head-reservation holdout scheme
@@ -235,7 +243,14 @@ class PackedStream:
             self._open()
         spec = REGISTRY[self.dataset]
         col = spec.get("column", "text")
+        empties = 0
         while True:
+            if empties >= 1000:
+                raise RuntimeError(
+                    f"stream '{self.dataset}': 1,000 consecutive rows "
+                    "rendered EMPTY — a schema/render mismatch would "
+                    "otherwise spin here silently forever (circuit "
+                    "breaker; check REGISTRY columns vs the renderer)")
             try:
                 row = next(self._it)
             except StopIteration:
@@ -253,6 +268,7 @@ class PackedStream:
                 text = "\n".join(str(x) for x in text)
             if text and not text.isspace():
                 return text
+            empties += 1
 
     # ------------------------------------------------------------------ iterate
     def next_batch(self) -> torch.Tensor:

@@ -447,6 +447,32 @@ def t_anneal_mix():
     assert m1.rows_consumed > 0
 
 
+@case("render datasets keep their renderer's columns; breaker trips on empties")
+def t_render_columns():
+    from ..data.streams import REGISTRY, _render_soda, PackedStream
+    # every render dataset must declare the columns its renderer reads,
+    # and the renderer must produce non-empty text from EXACTLY those
+    # columns (the anneal hang: pruning to one column starved the render)
+    for name, spec in REGISTRY.items():
+        if spec.get("render"):
+            assert spec.get("columns"), f"{name}: render without columns"
+    pruned = {"narrative": "Two friends met.", "speakers": ["Ana", "Ben"],
+              "dialogue": ["Hi.", "Hello."]}
+    keep = REGISTRY["soda-dialogue"]["columns"]
+    assert set(pruned) == set(keep)
+    assert _render_soda({k: pruned[k] for k in keep}).strip()
+    # circuit breaker: a stream of empty rows must RAISE, never spin
+    s = PackedStream("synthetic", ByteTrigramTokenizer(), context=32,
+                     micro_batch=1, seed=0)
+    s._it = iter([{"text": ""}] * 5000)
+    s._ds = object()   # pretend open so _open() is not re-entered
+    try:
+        s._next_row_text()
+        raise AssertionError("empty-row loop did not trip the breaker")
+    except RuntimeError as e:
+        assert "circuit breaker" in str(e)
+
+
 @case("chat-sft plumbing: persona rows render, samples run KV-cached")
 def t_chat_sft_plumbing():
     from ..chat_sft import persona_conversations, _samples, FIXED_PROMPTS
