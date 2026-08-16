@@ -418,27 +418,75 @@ _GENERATORS.update({
     "register": _register_rows,
 })
 
+# ---------------------------------------------------------- corpus sizes
+# Usable bytes AFTER render+holdout filtering (measured 2026-08-15:
+# rows x mean rendered bytes over a 300-row sample). float('inf') =
+# procedural generator or a corpus far larger than any stage budget.
+# These exist so weights can be checked against reality — see
+# audit_epochs(). A finite corpus asked for more than ~2 epochs is a
+# memorization risk, and the guard in amoe/train phrases it exactly so:
+# "the memorization becomes the arm".
+INF = float("inf")
+CORPUS_BYTES = {
+    "babi-prose": 6.6e6,          # 18,013 rows, 10% held out (tasks 16/19)
+    "siqa-narrative": 5.1e6,      # 33,410 rows x ~152 B
+    "proofwriter-prose": 243.3e6,  # 585,552 rows x ~416 B
+    "atomic-flicker": 187.7e6,    # ~1.3M triples x ~144 B
+    "tinystories": 1911.7e6,
+    "simple-wiki": 694.6e6,
+    "aochildes": 3.2e6,           # ~11MB of very short utterances
+    "cosmo-young": INF, "fineweb-good": INF, "fineweb-edu": INF,
+}
+MAX_EPOCHS = 4.0                  # audit threshold
+
+
+def audit_epochs(warn=True) -> list:
+    """How many times each stage re-reads each finite corpus. Rows:
+    (stage, component, weight, need_bytes, corpus_bytes, epochs)."""
+    rows = []
+    for stage, recipe in CURRICULUM_MIXES.items():
+        budget = STAGE_TOKENS.get(stage, 0)
+        for name, w in recipe:
+            corpus = CORPUS_BYTES.get(name, INF)
+            if corpus == INF or name.endswith("-synth"):
+                continue
+            need = budget * w
+            rows.append((stage, name, w, need, corpus, need / corpus))
+    if warn:
+        for r in rows:
+            if r[5] > MAX_EPOCHS:
+                print(f"[curriculum] WARNING {r[0]} re-reads {r[1]} "
+                      f"{r[5]:.0f}x (weight {r[2]}) — memorization risk",
+                      flush=True)
+    return rows
+
+
 # ------------------------------------------------------------- stage mixes
+# Weights are capped so no FINITE corpus is re-read more than ~2x within
+# its stage (audit_epochs()); procedural generators carry the volume,
+# since they never repeat a row. The 2026-08-15 audit caught the
+# original weights asking bAbI for 45 epochs and SIQA for 41 — design by
+# pedagogical intent without checking corpus size against stage budget.
 CURRICULUM_MIXES.update({
-    "curriculum-s0": [("tinystories", 0.72), ("simple-wiki", 0.20),
-                      ("aochildes", 0.03), ("recall-synth", 0.03),
+    "curriculum-s0": [("tinystories", 0.74), ("simple-wiki", 0.20),
+                      ("aochildes", 0.01), ("recall-synth", 0.03),
                       ("counting-synth", 0.02)],
-    "curriculum-s1": [("perspective-synth", 0.40), ("siqa-narrative", 0.30),
+    "curriculum-s1": [("perspective-synth", 0.69), ("siqa-narrative", 0.02),
                       ("tinystories", 0.15), ("simple-wiki", 0.10),
-                      ("aochildes", 0.02), ("recall-synth", 0.03)],
+                      ("aochildes", 0.01), ("recall-synth", 0.03)],
     "curriculum-s2": [("concept-synth", 0.35), ("cosmo-young", 0.35),
                       ("simple-wiki", 0.15), ("tinystories", 0.12),
                       ("recall-synth", 0.03)],
-    "curriculum-s3": [("rulechain-synth", 0.40), ("babi-prose", 0.25),
-                      ("proofwriter-prose", 0.20), ("concept-synth", 0.06),
-                      ("tinystories", 0.06), ("recall-synth", 0.03)],
+    "curriculum-s3": [("rulechain-synth", 0.54), ("proofwriter-prose", 0.28),
+                      ("concept-synth", 0.06), ("tinystories", 0.06),
+                      ("recall-synth", 0.05), ("babi-prose", 0.01)],
     "curriculum-s4": [("arith-synth", 0.40), ("cosmo-young", 0.30),
                       ("simple-wiki", 0.10), ("rulechain-synth", 0.08),
                       ("counting-synth", 0.05), ("tinystories", 0.04),
                       ("recall-synth", 0.03)],
-    "curriculum-s5": [("atomic-flicker", 0.35), ("causal-synth", 0.35),
-                      ("tinystories", 0.12), ("siqa-narrative", 0.10),
-                      ("recall-synth", 0.05), ("babi-prose", 0.03)],
+    "curriculum-s5": [("causal-synth", 0.47), ("atomic-flicker", 0.35),
+                      ("tinystories", 0.12), ("recall-synth", 0.05),
+                      ("siqa-narrative", 0.01)],
     "curriculum-s6": [("tryfail-synth", 0.45), ("arith-synth", 0.20),
                       ("causal-synth", 0.15), ("tinystories", 0.12),
                       ("recall-synth", 0.05), ("rulechain-synth", 0.03)],
@@ -446,12 +494,12 @@ CURRICULUM_MIXES.update({
                       ("cosmo-young", 0.10), ("rulechain-synth", 0.10),
                       ("arith-synth", 0.10), ("atomic-flicker", 0.08),
                       ("causal-synth", 0.08), ("tryfail-synth", 0.08),
-                      ("proofwriter-prose", 0.08), ("babi-prose", 0.06),
-                      ("fineweb-good", 0.05), ("recall-synth", 0.05),
-                      ("perspective-synth", 0.04)],
-    "curriculum-s8": [("register-synth", 0.45), ("simple-wiki", 0.20),
+                      ("proofwriter-prose", 0.08), ("fineweb-good", 0.10),
+                      ("recall-synth", 0.05), ("perspective-synth", 0.04),
+                      ("babi-prose", 0.01)],
+    "curriculum-s8": [("register-synth", 0.51), ("simple-wiki", 0.20),
                       ("cosmo-young", 0.15), ("tinystories", 0.10),
-                      ("siqa-narrative", 0.07), ("recall-synth", 0.03)],
+                      ("recall-synth", 0.03), ("siqa-narrative", 0.01)],
 })
 
 # stage name -> planned tokens (bytes); plan-of-record budgets
@@ -470,6 +518,7 @@ def append_curriculum_phases(manifest) -> int:
     planned|active|done|deferred — current_phase() activates 'planned'
     phases; anything else is invisible to the scheduler (a 'pending'
     typo here once made the whole curriculum read as complete)."""
+    audit_epochs(warn=True)
     have = {p["name"] for p in manifest.phases}
     added = 0
     for ds, toks in STAGE_TOKENS.items():
