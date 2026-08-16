@@ -124,7 +124,12 @@ class HubSync:
 
     # ------------------------------------------------------------ resume
     def save_resume(self, model, optimizers, stream_state: dict,
-                    manifest: RunManifest, step: int) -> str:
+                    manifest: RunManifest, step: int,
+                    archive_as: str | None = None) -> str:
+        """archive_as: extra immutable copy (e.g. a stage boundary), so a
+        later rollback restores optimizer + stream state EXACTLY instead
+        of restarting the optimizer — resume/latest.pt is overwritten
+        every checkpoint and cannot serve that purpose."""
         payload = {
             "model": model.state_dict(),
             "optimizers": [o.state_dict() for o in optimizers],
@@ -138,6 +143,10 @@ class HubSync:
         path = os.path.join(self.local, "resume", "latest.pt")
         torch.save(payload, path)
         self._up(path, "resume/latest.pt")
+        if archive_as:
+            apath = os.path.join(self.local, "resume", archive_as)
+            torch.save(payload, apath)
+            self._up(apath, f"resume/{archive_as}")
         return "resume/latest.pt"
 
     def load_resume(self) -> dict | None:

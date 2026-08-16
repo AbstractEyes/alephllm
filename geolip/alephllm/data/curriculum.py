@@ -438,6 +438,37 @@ CORPUS_BYTES = {
     "cosmo-young": INF, "fineweb-good": INF, "fineweb-edu": INF,
 }
 MAX_EPOCHS = 4.0                  # audit threshold
+MAX_GENERATOR_SHARE = 0.35        # cap per procedural generator
+MIN_BALLAST = 0.30                # natural-text floor per stage
+NATURAL = {"tinystories", "simple-wiki", "cosmo-young", "fineweb-good",
+           "aochildes"}
+
+
+def audit_mix(warn=True) -> dict:
+    """Three constraints per stage, all learned by breaking them on
+    2026-08-15: epoch cap (memorization), natural-text ballast
+    (catastrophic forgetting — fineweb 1.14 -> 1.70 inside S3), and a
+    per-generator share cap. The last is why S3's 54% rulechain-synth
+    was dangerous even though it never repeats a row: her free
+    generation started emitting the TEMPLATE — "Water boils when they
+    are boiling. If someone is boiling then they are wet." A generator
+    with few frames colonizes the model's prose at high share."""
+    out = {}
+    for stage, recipe in CURRICULUM_MIXES.items():
+        ballast = sum(w for n, w in recipe if n in NATURAL)
+        top_gen = max([w for n, w in recipe if n.endswith("-synth")],
+                      default=0.0)
+        out[stage] = {"ballast": ballast, "top_generator": top_gen}
+        if warn:
+            if ballast < MIN_BALLAST:
+                print(f"[curriculum] WARNING {stage} natural-text ballast "
+                      f"{ballast:.0%} < {MIN_BALLAST:.0%} — forgetting risk",
+                      flush=True)
+            if top_gen > MAX_GENERATOR_SHARE:
+                print(f"[curriculum] WARNING {stage} single generator at "
+                      f"{top_gen:.0%} > {MAX_GENERATOR_SHARE:.0%} — template "
+                      "colonization risk", flush=True)
+    return out
 
 
 def audit_epochs(warn=True) -> list:
@@ -476,27 +507,28 @@ CURRICULUM_MIXES.update({
     "curriculum-s0": [("tinystories", 0.74), ("simple-wiki", 0.20),
                       ("aochildes", 0.01), ("recall-synth", 0.03),
                       ("counting-synth", 0.02)],
-    "curriculum-s1": [("perspective-synth", 0.69), ("siqa-narrative", 0.02),
-                      ("tinystories", 0.15), ("simple-wiki", 0.10),
-                      ("aochildes", 0.01), ("recall-synth", 0.03)],
+    "curriculum-s1": [("perspective-synth", 0.30), ("tinystories", 0.28),
+                      ("simple-wiki", 0.20), ("cosmo-young", 0.12),
+                      ("concept-synth", 0.04), ("recall-synth", 0.03),
+                      ("siqa-narrative", 0.02), ("aochildes", 0.01)],
     "curriculum-s2": [("concept-synth", 0.35), ("cosmo-young", 0.35),
                       ("simple-wiki", 0.15), ("tinystories", 0.12),
                       ("recall-synth", 0.03)],
-    "curriculum-s3": [("rulechain-synth", 0.38), ("proofwriter-prose", 0.22),
-                      ("tinystories", 0.15), ("simple-wiki", 0.10),
-                      ("concept-synth", 0.06), ("cosmo-young", 0.04),
-                      ("recall-synth", 0.04), ("babi-prose", 0.01)],
-    "curriculum-s4": [("arith-synth", 0.40), ("cosmo-young", 0.30),
-                      ("simple-wiki", 0.10), ("rulechain-synth", 0.08),
-                      ("counting-synth", 0.05), ("tinystories", 0.04),
+    "curriculum-s3": [("rulechain-synth", 0.32), ("proofwriter-prose", 0.22),
+                      ("tinystories", 0.18), ("simple-wiki", 0.12),
+                      ("cosmo-young", 0.08), ("concept-synth", 0.04),
+                      ("recall-synth", 0.03), ("babi-prose", 0.01)],
+    "curriculum-s4": [("arith-synth", 0.35), ("cosmo-young", 0.32),
+                      ("simple-wiki", 0.12), ("tinystories", 0.08),
+                      ("rulechain-synth", 0.06), ("counting-synth", 0.04),
                       ("recall-synth", 0.03)],
-    "curriculum-s5": [("causal-synth", 0.35), ("atomic-flicker", 0.25),
-                      ("tinystories", 0.20), ("simple-wiki", 0.08),
-                      ("cosmo-young", 0.06), ("recall-synth", 0.05),
+    "curriculum-s5": [("causal-synth", 0.32), ("atomic-flicker", 0.25),
+                      ("tinystories", 0.20), ("simple-wiki", 0.10),
+                      ("cosmo-young", 0.07), ("recall-synth", 0.05),
                       ("siqa-narrative", 0.01)],
-    "curriculum-s6": [("tryfail-synth", 0.35), ("tinystories", 0.20),
-                      ("arith-synth", 0.15), ("causal-synth", 0.10),
-                      ("simple-wiki", 0.08), ("cosmo-young", 0.07),
+    "curriculum-s6": [("tryfail-synth", 0.32), ("tinystories", 0.22),
+                      ("arith-synth", 0.13), ("cosmo-young", 0.10),
+                      ("simple-wiki", 0.10), ("causal-synth", 0.08),
                       ("recall-synth", 0.05)],
     "curriculum-s7": [("tinystories", 0.10), ("simple-wiki", 0.08),
                       ("cosmo-young", 0.10), ("rulechain-synth", 0.10),
@@ -505,9 +537,10 @@ CURRICULUM_MIXES.update({
                       ("proofwriter-prose", 0.08), ("fineweb-good", 0.10),
                       ("recall-synth", 0.05), ("perspective-synth", 0.04),
                       ("babi-prose", 0.01)],
-    "curriculum-s8": [("register-synth", 0.51), ("simple-wiki", 0.20),
-                      ("cosmo-young", 0.15), ("tinystories", 0.10),
-                      ("recall-synth", 0.03), ("siqa-narrative", 0.01)],
+    "curriculum-s8": [("register-synth", 0.32), ("simple-wiki", 0.25),
+                      ("cosmo-young", 0.20), ("tinystories", 0.15),
+                      ("recall-synth", 0.04), ("concept-synth", 0.03),
+                      ("siqa-narrative", 0.01)],
 })
 
 # stage name -> planned tokens (bytes); plan-of-record budgets
@@ -527,6 +560,7 @@ def append_curriculum_phases(manifest) -> int:
     phases; anything else is invisible to the scheduler (a 'pending'
     typo here once made the whole curriculum read as complete)."""
     audit_epochs(warn=True)
+    audit_mix(warn=True)
     have = {p["name"] for p in manifest.phases}
     added = 0
     for ds, toks in STAGE_TOKENS.items():
@@ -557,3 +591,73 @@ def fold_head_gate(model) -> dict:
         model.head.gamma.fill_(1.0)
     return {"gamma_before": g,
             "w_s_norm": float(model.head.w_s.weight.norm().item())}
+
+
+def rollback_to(run, step: int, first_stage: str, repo: str | None = None):
+    """Rewind a live run to a stage boundary and re-plan from there.
+
+    Prefers resume/boundary_<stage>_step<N>.pt (exact: weights +
+    optimizer + stream state). Those archives only exist from geolip
+    0.6.4 onward, so older boundaries fall back to safetensors weights
+    with a FRESH optimizer — a real law-exception that must be flagged
+    on anything trained afterwards, because Muon/Adam moment estimates
+    are discarded.
+
+    Every phase from first_stage onward is reset to planned/0 so the
+    corrected mixes run it again; earlier phases keep their history.
+    """
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    craft = run.manifest.preset
+    repo = repo or getattr(run.hub, "repo_id", None)
+    man = run.manifest
+    exact = False
+    for ph in man.phases:                      # find the archive by stage
+        if ph["name"] == first_stage:
+            break
+    prev = None
+    for ph in man.phases:
+        if ph["name"] == first_stage:
+            break
+        prev = ph["name"]
+    if prev:
+        try:
+            arch = hf_hub_download(
+                repo, f"{craft}/resume/boundary_{prev}_step{step}.pt")
+            payload = torch.load(arch, map_location=run.device,
+                                 weights_only=False)
+            run.raw_model.load_state_dict(payload["model"])
+            for opt, st in zip(run.optimizers, payload["optimizers"]):
+                opt.load_state_dict(st)
+            exact = True
+        except Exception as e:                 # noqa: BLE001
+            print(f"[rollback] no exact archive for {prev}@{step} "
+                  f"({type(e).__name__}) — weights-only rewind", flush=True)
+    if not exact:
+        sd = load_file(hf_hub_download(
+            repo, f"{craft}/checkpoints/step_{step:08d}.safetensors"))
+        run.raw_model.load_state_dict(sd)
+
+    ck = next((c for c in man.checkpoints
+               if c["step"] == step and c["kind"] == "safetensors"), None)
+    man.steps = run.step = int(step)
+    if ck and ck.get("tokens"):
+        man.tokens_seen = int(ck["tokens"])
+    hit = False
+    for ph in man.phases:
+        if ph["name"] == first_stage:
+            hit = True
+        if hit:
+            ph["status"] = "planned"
+            ph["tokens_done"] = 0
+    run.stream = None                          # force a fresh stream open
+    man.note(f"ROLLBACK to step {step:,}; re-planning from {first_stage} "
+             f"({'exact resume archive' if exact else 'weights only — '
+                 'FRESH OPTIMIZER (law exception)'})")
+    print(f"[rollback] step {step:,} · {man.tokens_seen/1e9:.3f}B · "
+          f"re-planning from {first_stage} · "
+          f"{'EXACT (optimizer+stream restored)' if exact else 'FRESH OPTIMIZER — flag any arm trained after this'}",
+          flush=True)
+    return {"step": step, "exact": exact, "first_stage": first_stage}

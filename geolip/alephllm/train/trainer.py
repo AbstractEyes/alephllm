@@ -273,11 +273,20 @@ class Trainer:
                     self.writer.flush()
                     self.hub.upload_tensorboard(self.tb_dir)
 
+                done_name = phase["name"]
                 newph = self.manifest.advance_phases()
                 if newph is None:
+                    # final boundary: archive before the curriculum ends
+                    self._checkpoint(final=True, boundary=done_name)
                     print("[train] curriculum complete")
                     break
                 if newph is not phase and newph["name"] != phase["name"]:
+                    # STAGE BOUNDARY: archive an immutable resume point
+                    # (weights + optimizer + stream state) so this exact
+                    # position can be returned to. resume/latest.pt is
+                    # overwritten constantly and cannot serve as a rewind
+                    # target — measured need, 2026-08-15.
+                    self._checkpoint(boundary=done_name)
                     phase = self._open_stream()
                     self.manifest.note(f"switched to phase '{phase['name']}'")
         except KeyboardInterrupt:
@@ -368,7 +377,7 @@ class Trainer:
     def _say(self, msg: str):
         _emit(getattr(self, "_bar", None), msg)
 
-    def _checkpoint(self, final: bool = False):
+    def _checkpoint(self, final: bool = False, boundary: str | None = None):
         t0 = time.time()
         st_name = self.hub.save_safetensors(self.raw_model, self.step)
         val_bpb = getattr(self, "_last_eval", {}).get(
@@ -394,7 +403,9 @@ class Trainer:
         # includes its own entry (the summary reads the index tail)
         self.manifest.record_checkpoint(self.step, "resume", "resume/latest.pt")
         self.hub.save_resume(self.raw_model, self.optimizers, stream_state,
-                             self.manifest, self.step)
+                             self.manifest, self.step,
+                             archive_as=(f"boundary_{boundary}_step{self.step}.pt"
+                                         if boundary else None))
         self.hub.push_manifest(self.manifest)
         try:
             st_mb = os.path.getsize(os.path.join(self.out_dir, st_name)) / 2**20
