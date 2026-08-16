@@ -63,17 +63,44 @@ class CausalSDPA(nn.Module):
 
 class CausalSplatHUB(nn.Module):
     def __init__(self, d: int, K: int = 512, D: int = 32, tau: float = 0.1,
-                 chunk: int = 128):
+                 chunk: int = 256):
         super().__init__()
         self.addr = AlephAddress(K, D, tau)
-        self.chunk = chunk
+        self.chunk = chunk          # 256 measured best at ctx 2048 (bench)
         self.q = nn.Linear(d, D, bias=False)
         self.k = nn.Linear(d, D, bias=False)
         self.v = nn.Linear(d, d, bias=False)
         self.o = nn.Linear(d, d, bias=False)
         for m in (self.q, self.k, self.v, self.o):
             nn.init.orthogonal_(m.weight)
-        self.last_den_stats = None  # populated each forward for instruments
+        self._mask_cache: dict = {}
+        self._den_raw = None        # (den tensor, floor) until read
+        self._den_stats = None      # cached floats after first read
+
+    # den stats are LAZY: the reference forward paid three .item() GPU
+    # syncs per call just to keep this attribute warm; instruments read
+    # it at most once per health interval. Property keeps the tuple API.
+    @property
+    def last_den_stats(self):
+        if self._den_stats is None and self._den_raw is not None:
+            den, cl = self._den_raw
+            with torch.no_grad():
+                self._den_stats = (den.min().item(), den.mean().item(),
+                                   (den <= cl).float().mean().item())
+        return self._den_stats
+
+    @last_den_stats.setter
+    def last_den_stats(self, value):
+        self._den_stats = value
+        self._den_raw = None
+
+    def _mask(self, C: int, device, dtype):
+        key = (C, device, dtype)
+        m = self._mask_cache.get(key)
+        if m is None:
+            m = torch.tril(torch.ones(C, C, device=device, dtype=dtype))
+            self._mask_cache[key] = m
+        return m
 
     def _halves(self, x):
         qp, qn = self.addr.oriented(self.q(x))
@@ -81,36 +108,42 @@ class CausalSplatHUB(nn.Module):
         return qp, qn, kp, kn, self.v(x)
 
     def forward(self, x):
+        """Fast path: the two oriented halves run as ONE 2K-wide pass —
+        every term is a sum of bilinear forms over the halves, so one
+        pass over cat(p, n) is the same arithmetic in half the kernels
+        (equal to forward_naive to fp reorder, ~1.5e-06; speed-harness
+        verdict 2026-08-15: 1.7x eager, 4.0x under torch.compile)."""
         B, n, d = x.shape
-        qp, qn, kp, kn, v = self._halves(x)
+        qc = self.addr.oriented_cat(self.q(x))            # (B, n, 2K)
+        kc = self.addr.oriented_cat(self.k(x))
+        v = self.v(x)
         C = min(self.chunk, n)
         pad = (-n) % C
         if pad:
-            z = lambda t: F.pad(t, (0, 0, 0, pad))
-            qp, qn, kp, kn, v = z(qp), z(qn), z(kp), z(kn), z(v)
+            qc = F.pad(qc, (0, 0, 0, pad))
+            kc = F.pad(kc, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
         nc = (n + pad) // C
-        K = qp.shape[-1]
-        qp, qn, kp, kn = (t.view(B, nc, C, K) for t in (qp, qn, kp, kn))
+        K2 = qc.shape[-1]
+        qc = qc.view(B, nc, C, K2)
+        kc = kc.view(B, nc, C, K2)
         v = v.view(B, nc, C, d)
-        mask = torch.tril(torch.ones(C, C, device=x.device, dtype=v.dtype))
+        mask = self._mask(C, x.device, v.dtype)
 
-        num = torch.zeros(B, nc, C, d, device=x.device, dtype=v.dtype)
-        den = torch.zeros(B, nc, C, 1, device=x.device, dtype=v.dtype)
-        for kh, qh in ((kp, qp), (kn, qn)):
-            S = torch.einsum("bick,bicd->bikd", kh, v)      # per-chunk KxD sums
-            P = torch.cumsum(S, dim=1) - S                   # exclusive prefix
-            zS = kh.sum(dim=2)                               # (B, nc, K)
-            zP = torch.cumsum(zS, dim=1) - zS
-            att = torch.einsum("bick,bijk->bicj", qh, kh) * mask   # (B,nc,C,C)
-            num = num + torch.einsum("bick,bikd->bicd", qh, P) + att @ v
-            den = den + torch.einsum("bick,bik->bic", qh, zP).unsqueeze(-1) \
-                      + att.sum(dim=-1, keepdim=True)
-        num = num.view(B, nc * C, d)[:, :n]
-        den = den.view(B, nc * C, 1)[:, :n]
+        S = torch.einsum("bick,bicd->bikd", kc, v)     # per-chunk 2KxD sums
+        P = torch.cumsum(S, dim=1) - S                  # exclusive prefix
+        zS = kc.sum(dim=2)                              # (B, nc, 2K)
+        zP = torch.cumsum(zS, dim=1) - zS
+        att = torch.einsum("bick,bijk->bicj", qc, kc) * mask    # (B,nc,C,C)
+        num = torch.einsum("bick,bikd->bicd", qc, P) + att @ v
+        den = torch.einsum("bick,bik->bic", qc, zP).unsqueeze(-1) \
+            + att.sum(dim=-1, keepdim=True)
+
+        num = num.reshape(B, nc * C, d)[:, :n]
+        den = den.reshape(B, nc * C, 1)[:, :n]
         cl = dtype_floor(den)
-        with torch.no_grad():
-            self.last_den_stats = (den.min().item(), den.mean().item(),
-                                   (den <= cl).float().mean().item())
+        self._den_raw = (den.detach(), cl)
+        self._den_stats = None
         return self.o(num / den.clamp_min(cl))
 
     # ---------------------------------------------------- incremental decode

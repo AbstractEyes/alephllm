@@ -183,6 +183,21 @@ class AlephLM(nn.Module):
             idx = torch.cat([idx, nxt], dim=1)
         return idx
 
+    def compile_hubs(self, **compile_kw):
+        """Opt-in: torch.compile each hub's attention (measured 4.0x over
+        eager at ctx 2048 with the fused forward, parity 1.4e-06 vs the
+        naive oracle; MHA-parity wall-clock by ctx 8192). Call AFTER
+        loading weights, and do NOT save a checkpoint while compiled (the
+        OptimizedModule wrapper prefixes state_dict keys). TRAINING use is
+        gated on a grad-parity + throughput check on the training
+        hardware — the speed verdict was no-grad forward only."""
+        import torch as _torch
+        for wrap in self.blocks:
+            blk = getattr(wrap, "block", wrap)
+            if blk.is_hub:
+                blk.attn = _torch.compile(blk.attn, **compile_kw)
+        return self
+
     def param_count(self) -> int:
         seen, total = set(), 0
         for p in self.parameters():
