@@ -95,6 +95,92 @@ def _render_proofwriter(row) -> str:
     return f"{t} {verdict} {q[0].lower() + q[1:]}."
 
 
+def _render_definition(row) -> str:
+    """WordNet-class gloss -> definitional prose in several surface forms,
+    so she learns the ANSWER SHAPE for "what does X mean?" rather than one
+    template. Synonym/antonym/hypernym fields become the follow-on
+    sentences a dictionary entry implies."""
+    w = str(row.get("word", "")).strip()
+    d = str(row.get("definition", "")).strip().rstrip(".")
+    if not (w and d) or len(w) > 40:
+        return ""
+    pos = str(row.get("part_of_speech", "")).strip()
+
+    def _lst(k, n=2):
+        v = row.get(k) or []
+        if isinstance(v, str):
+            v = [v]
+        return [str(x).strip() for x in v[:n] if str(x).strip()]
+
+    syn, ant, hyp = _lst("synonyms"), _lst("antonyms", 1), _lst("hypernyms", 1)
+    ex = _lst("examples", 1)
+    art = "An" if w[:1].lower() in "aeiou" else "A"
+    h = abs(hash(w)) % 3
+    if h == 0:
+        s = f"The word '{w}'"
+        if pos:
+            s += f", used as a {pos},"
+        s += f" means {d}."
+    elif h == 1:
+        s = f"{w.capitalize()}: {d}."
+    else:
+        s = f"What does '{w}' mean? It means {d}."
+    if ex:
+        s += " For example: " + ex[0].rstrip(".") + "."
+    if syn:
+        s += (" Words close in meaning are " + " and ".join(syn) + "."
+              if len(syn) > 1 else " A close word is " + syn[0] + ".")
+    if ant:
+        s += " The opposite is " + ant[0] + "."
+    if hyp:
+        s += f" {art} {w} is a kind of {hyp[0]}."
+    return s
+
+
+_PG_START = "*** START OF"
+_PG_END = "*** END OF"
+
+
+def _render_gutenberg(row) -> str:
+    """Public-domain book text with Project Gutenberg boilerplate cut.
+    Markers vary (THIS/THE), so cut on the first line CONTAINING the
+    marker, then drop table/index/page-number lines."""
+    txt = str(row.get("TEXT") or row.get("text") or "")
+    if not txt:
+        return ""
+    i = txt.upper().find(_PG_START)
+    if i >= 0:
+        nl = txt.find("\n", i)
+        txt = txt[nl + 1:] if nl > 0 else txt[i:]
+    j = txt.upper().find(_PG_END)
+    if j >= 0:
+        txt = txt[:j]
+    keep = []
+    for ln in txt.replace("\r\n", "\n").split("\n"):
+        s = ln.strip()
+        if not s:
+            keep.append("")
+            continue
+        alpha = sum(c.isalpha() or c.isspace() for c in s)
+        if alpha / max(len(s), 1) < 0.6 or s.isdigit():
+            continue
+        keep.append(s)
+    out = "\n".join(keep).strip()
+    return out if len(out) > 400 else ""
+
+
+def _render_wikipedia(row) -> str:
+    """Full-English Wikipedia article, trailing apparatus removed."""
+    txt = str(row.get("text", ""))
+    for cut in ("\nSee also", "\nReferences", "\nExternal links",
+                "\nFurther reading", "\nNotes"):
+        k = txt.find(cut)
+        if k > 0:
+            txt = txt[:k]
+    txt = txt.strip()
+    return txt if len(txt) > 800 else ""
+
+
 _ATOMIC_TEMPLATES = {
     "xEffect": "After {e}, {x} {t}.",
     "oEffect": "After {e}, the others {t}.",
@@ -388,6 +474,22 @@ REGISTRY.update({
     # Phil's call (plan: Vetting results / FLAGS).
     "sciq-prose": dict(path="allenai/sciq", split="train",
                        column="support"),
+    # WordNet-class glosses: the definitional ANSWER SHAPE (Phil ask,
+    # 2026-08-15) — "teach the model how to respond to definitions".
+    "definitions": dict(path="mjbommar/opengloss-v1.3-definitions",
+                        split="train", column="definition",
+                        render="definition",
+                        columns=["word", "part_of_speech", "definition",
+                                 "synonyms", "antonyms", "hypernyms",
+                                 "examples"],
+                        max_empties=20_000),
+    # large permissive ballast — the structural answer to the S3 crash
+    "gutenberg": dict(path="sedthh/gutenberg_english", split="train",
+                      column="TEXT", render="gutenberg",
+                      columns=["TEXT"], max_empties=20_000),
+    "wikipedia-en": dict(path="wikimedia/wikipedia", name="20231101.en",
+                         split="train", column="text", render="wikipedia",
+                         columns=["text"], max_empties=20_000),
     "counting-synth": dict(path=None, generator="counting"),
     "perspective-synth": dict(path=None, generator="perspective"),
     "concept-synth": dict(path=None, generator="concept"),
@@ -399,6 +501,9 @@ REGISTRY.update({
 })
 
 _RENDERERS.update({
+    "definition": _render_definition,
+    "gutenberg": _render_gutenberg,
+    "wikipedia": _render_wikipedia,
     "cosmo_young": _render_cosmo_young,
     "fineweb_good": _render_fineweb_good,
     "siqa": _render_siqa,
@@ -435,13 +540,16 @@ CORPUS_BYTES = {
     "tinystories": 1911.7e6,
     "simple-wiki": 694.6e6,
     "aochildes": 3.2e6,           # ~11MB of very short utterances
+    "definitions": 111e6,         # 565,604 glosses x ~197 B rendered
     "cosmo-young": INF, "fineweb-good": INF, "fineweb-edu": INF,
+    "gutenberg": INF,             # ~18GB raw, ~13GB after the cut
+    "wikipedia-en": INF,          # ~19GB of article prose
 }
 MAX_EPOCHS = 4.0                  # audit threshold
 MAX_GENERATOR_SHARE = 0.35        # cap per procedural generator
 MIN_BALLAST = 0.30                # natural-text floor per stage
 NATURAL = {"tinystories", "simple-wiki", "cosmo-young", "fineweb-good",
-           "aochildes"}
+           "aochildes", "gutenberg", "wikipedia-en"}
 
 
 def audit_mix(warn=True) -> dict:
@@ -511,21 +619,23 @@ CURRICULUM_MIXES.update({
                       ("simple-wiki", 0.20), ("cosmo-young", 0.12),
                       ("concept-synth", 0.04), ("recall-synth", 0.03),
                       ("siqa-narrative", 0.02), ("aochildes", 0.01)],
-    "curriculum-s2": [("concept-synth", 0.35), ("cosmo-young", 0.35),
-                      ("simple-wiki", 0.15), ("tinystories", 0.12),
+    "curriculum-s2": [("concept-synth", 0.30), ("cosmo-young", 0.30),
+                      ("simple-wiki", 0.12), ("tinystories", 0.10),
+                      ("definitions", 0.08), ("wikipedia-en", 0.07),
                       ("recall-synth", 0.03)],
     "curriculum-s3": [("rulechain-synth", 0.32), ("proofwriter-prose", 0.22),
-                      ("tinystories", 0.18), ("simple-wiki", 0.12),
-                      ("cosmo-young", 0.08), ("concept-synth", 0.04),
-                      ("recall-synth", 0.03), ("babi-prose", 0.01)],
+                      ("tinystories", 0.10), ("wikipedia-en", 0.08),
+                      ("simple-wiki", 0.12), ("cosmo-young", 0.08),
+                      ("concept-synth", 0.04), ("recall-synth", 0.03),
+                      ("babi-prose", 0.01)],
     "curriculum-s4": [("arith-synth", 0.35), ("cosmo-young", 0.32),
                       ("simple-wiki", 0.12), ("tinystories", 0.08),
                       ("rulechain-synth", 0.06), ("counting-synth", 0.04),
                       ("recall-synth", 0.03)],
     "curriculum-s5": [("causal-synth", 0.32), ("atomic-flicker", 0.25),
-                      ("tinystories", 0.20), ("simple-wiki", 0.10),
-                      ("cosmo-young", 0.07), ("recall-synth", 0.05),
-                      ("siqa-narrative", 0.01)],
+                      ("tinystories", 0.12), ("gutenberg", 0.08),
+                      ("simple-wiki", 0.10), ("cosmo-young", 0.07),
+                      ("recall-synth", 0.05), ("siqa-narrative", 0.01)],
     "curriculum-s6": [("tryfail-synth", 0.32), ("tinystories", 0.22),
                       ("arith-synth", 0.13), ("cosmo-young", 0.10),
                       ("simple-wiki", 0.10), ("causal-synth", 0.08),
@@ -537,10 +647,10 @@ CURRICULUM_MIXES.update({
                       ("proofwriter-prose", 0.08), ("fineweb-good", 0.10),
                       ("recall-synth", 0.05), ("perspective-synth", 0.04),
                       ("babi-prose", 0.01)],
-    "curriculum-s8": [("register-synth", 0.32), ("simple-wiki", 0.25),
-                      ("cosmo-young", 0.20), ("tinystories", 0.15),
-                      ("recall-synth", 0.04), ("concept-synth", 0.03),
-                      ("siqa-narrative", 0.01)],
+    "curriculum-s8": [("definitions", 0.25), ("register-synth", 0.25),
+                      ("simple-wiki", 0.15), ("cosmo-young", 0.12),
+                      ("wikipedia-en", 0.10), ("tinystories", 0.09),
+                      ("recall-synth", 0.03), ("siqa-narrative", 0.01)],
 })
 
 # stage name -> planned tokens (bytes); plan-of-record budgets
