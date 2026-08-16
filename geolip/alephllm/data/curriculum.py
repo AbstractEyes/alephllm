@@ -462,11 +462,16 @@ def audit_epochs(warn=True) -> list:
 
 
 # ------------------------------------------------------------- stage mixes
-# Weights are capped so no FINITE corpus is re-read more than ~2x within
-# its stage (audit_epochs()); procedural generators carry the volume,
-# since they never repeat a row. The 2026-08-15 audit caught the
-# original weights asking bAbI for 45 epochs and SIQA for 41 — design by
-# pedagogical intent without checking corpus size against stage budget.
+# TWO constraints, both learned the hard way on 2026-08-15:
+# (1) EPOCH CAP — no FINITE corpus re-read more than ~2x within its
+#     stage (audit_epochs()); procedural generators carry the volume.
+#     The first weights asked bAbI for 45 epochs and SIQA for 41.
+# (2) NATURAL-LANGUAGE BALLAST >= ~25% in EVERY stage. S3 shipped with
+#     6% and her fineweb holdout went 1.134 -> 2.059 bpb in ~1B tokens:
+#     a narrow synthetic diet makes her forget how to read English
+#     while she learns to follow rules. Replay is not optional in
+#     continued pretraining; the S7 spiral is consolidation, not
+#     rescue.
 CURRICULUM_MIXES.update({
     "curriculum-s0": [("tinystories", 0.74), ("simple-wiki", 0.20),
                       ("aochildes", 0.01), ("recall-synth", 0.03),
@@ -477,19 +482,22 @@ CURRICULUM_MIXES.update({
     "curriculum-s2": [("concept-synth", 0.35), ("cosmo-young", 0.35),
                       ("simple-wiki", 0.15), ("tinystories", 0.12),
                       ("recall-synth", 0.03)],
-    "curriculum-s3": [("rulechain-synth", 0.54), ("proofwriter-prose", 0.28),
-                      ("concept-synth", 0.06), ("tinystories", 0.06),
-                      ("recall-synth", 0.05), ("babi-prose", 0.01)],
+    "curriculum-s3": [("rulechain-synth", 0.38), ("proofwriter-prose", 0.22),
+                      ("tinystories", 0.15), ("simple-wiki", 0.10),
+                      ("concept-synth", 0.06), ("cosmo-young", 0.04),
+                      ("recall-synth", 0.04), ("babi-prose", 0.01)],
     "curriculum-s4": [("arith-synth", 0.40), ("cosmo-young", 0.30),
                       ("simple-wiki", 0.10), ("rulechain-synth", 0.08),
                       ("counting-synth", 0.05), ("tinystories", 0.04),
                       ("recall-synth", 0.03)],
-    "curriculum-s5": [("causal-synth", 0.47), ("atomic-flicker", 0.35),
-                      ("tinystories", 0.12), ("recall-synth", 0.05),
+    "curriculum-s5": [("causal-synth", 0.35), ("atomic-flicker", 0.25),
+                      ("tinystories", 0.20), ("simple-wiki", 0.08),
+                      ("cosmo-young", 0.06), ("recall-synth", 0.05),
                       ("siqa-narrative", 0.01)],
-    "curriculum-s6": [("tryfail-synth", 0.45), ("arith-synth", 0.20),
-                      ("causal-synth", 0.15), ("tinystories", 0.12),
-                      ("recall-synth", 0.05), ("rulechain-synth", 0.03)],
+    "curriculum-s6": [("tryfail-synth", 0.35), ("tinystories", 0.20),
+                      ("arith-synth", 0.15), ("causal-synth", 0.10),
+                      ("simple-wiki", 0.08), ("cosmo-young", 0.07),
+                      ("recall-synth", 0.05)],
     "curriculum-s7": [("tinystories", 0.10), ("simple-wiki", 0.08),
                       ("cosmo-young", 0.10), ("rulechain-synth", 0.10),
                       ("arith-synth", 0.10), ("atomic-flicker", 0.08),
