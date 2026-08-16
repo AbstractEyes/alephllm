@@ -1,0 +1,30 @@
+{"prompt": "Take 38 and add 27. 38 + 27 =", "options": [" 55.", " 65.", " 66."], "answer": 1, "family": "add2", "difficulty": 1}
+{"prompt": "Start with 56 and add 19. 56 + 19 =", "options": [" 75.", " 65.", " 74."], "answer": 0, "family": "add2", "difficulty": 1}
+{"prompt": "First add 29 and 34, then add 10 more. The total is", "options": [" 63.", " 83.", " 73."], "answer": 2, "family": "add2", "difficulty": 2}
+{"prompt": "Omar walks 48 steps, rests for 5 minutes, then walks 26 more steps. Altogether he walks", "options": [" 64 steps.", " 79 steps.", " 74 steps."], "answer": 2, "family": "add2", "difficulty": 2}
+{"prompt": "Petra saves 17 pennies on Monday, 28 pennies on Tuesday, and 36 pennies on Wednesday. By the end of Wednesday she has saved", "options": [" 81 pennies.", " 71 pennies.", " 91 pennies."], "answer": 0, "family": "add2", "difficulty": 3}
+{"prompt": "Add 245 and 138. 245 + 138 =", "options": [" 373.", " 383.", " 384."], "answer": 1, "family": "add3", "difficulty": 1}
+{"prompt": "Work out 462 plus 279. 462 + 279 =", "options": [" 741.", " 631.", " 731."], "answer": 0, "family": "add3", "difficulty": 1}
+{"prompt": "A ferry that is 48 meters long carries 356 people on its first trip and 267 people on its second trip. Over both trips it carries", "options": [" 613 people.", " 623 people.", " 523 people."], "answer": 1, "family": "add3", "difficulty": 2}
+{"prompt": "A theater sold 148 tickets on Friday, 256 tickets on Saturday, and 173 tickets on Sunday. Across the three days it sold", "options": [" 567 tickets.", " 587 tickets.", " 577 tickets."], "answer": 2, "family": "add3", "difficulty": 3}
+{"prompt": "Take 25 away from 62. 62 - 25 =", "options": [" 43.", " 36.", " 37."], "answer": 2, "family": "sub2", "difficulty": 1}
+{"prompt": "Subtract 47 from 81. 81 - 47 =", "options": [" 34.", " 46.", " 44."], "answer": 0, "family": "sub2", "difficulty": 1}
+{"prompt": "Suki had 73 stickers and 12 postcards. She gave away 38 of the stickers. She now has", "options": [" 45 stickers.", " 35 stickers.", " 34 stickers."], "answer": 1, "family": "sub2", "difficulty": 2}
+{"prompt": "Begin with 90. Take away 27, then take away 26 more. You end with", "options": [" 37.", " 47.", " 63."], "answer": 0, "family": "sub2", "difficulty": 3}
+{"prompt": "Subtract 158 from 423. 423 - 158 =", "options": [" 335.", " 275.", " 265."], "answer": 2, "family": "sub3", "difficulty": 1}
+{"prompt": "Wren built a tower of 631 blocks in 15 minutes. Then she takes 264 blocks off the tower. The tower now has", "options": [" 377 blocks.", " 367 blocks.", " 433 blocks."], "answer": 1, "family": "sub3", "difficulty": 2}
+{"prompt": "There are 500 sheets of paper for a class of 26 students. The students use 213 sheets. The number of sheets left is", "options": [" 287.", " 297.", " 313."], "answer": 0, "family": "sub3", "difficulty": 2}
+{"prompt": "A library owns 742 books. On Monday 156 books go out on loan, and on Tuesday 189 more go out. The number of books still on the shelves is", "options": [" 407.", " 397.", " 387."], "answer": 1, "family": "sub3", "difficulty": 3}
+{"prompt": "Dara's town printed 815 festival flyers. Helpers handed out 286 flyers in the morning and 158 flyers in the afternoon. At the end of the day the number left is", "options": [" 371.", " 381.", " 361."], "answer": 0, "family": "sub3", "difficulty": 3}
+{"prompt": "Multiply 7 by 8. 7 x 8 =", "options": [" 54.", " 48.", " 56."], "answer": 2, "family": "mul1", "difficulty": 1}
+{"prompt": "Work out 6 times 9. 6 x 9 =", "options": [" 56.", " 54.", " 45."], "answer": 1, "family": "mul1", "difficulty": 1}
+{"prompt": "Find 4 times 6, then double it. You get", "options": [" 24.", " 42.", " 48."], "answer": 2, "family": "mul1", "difficulty": 2}
+{"prompt": "A game gives 8 points for each win. Juno has 7 wins and 3 losses. From her wins she scores", "options": [" 56 points.", " 63 points.", " 54 points."], "answer": 0, "family": "mul1", "difficulty": 2}
+{"prompt": "Multiply 34 by 6. 34 x 6 =", "options": [" 184.", " 204.", " 194."], "answer": 1, "family": "mul2", "difficulty": 3}
+{"prompt": "A pack holds 26 cards. Yusuf buys 7 packs. In all he gets", "options": [" 172 cards.", " 142 cards.", " 182 cards."], "answer": 2, "family": "mul2", "difficulty": 3}
+{"prompt": "Each shelf in a bookcase holds 48 books, and the bookcase has 4 shelves. When it is full it holds", "options": [" 192 books.", " 162 books.", " 182 books."], "answer": 0, "family": "mul2", "difficulty": 3}
+{"prompt": "Nia picks 24 apples and her brother picks 18 more. Together they pick", "options": [" 32 apples.", " 43 apples.", " 42 apples."], "answer": 2, "family": "word", "difficulty": 1}
+{"prompt": "A bus starts with 53 riders. At the first stop 26 riders get off and nobody gets on. The bus then carries", "options": [" 33 riders.", " 27 riders.", " 37 riders."], "answer": 1, "family": "word", "difficulty": 2}
+{"prompt": "Seven friends each bring 6 balloons to a party that lasts 3 hours. The friends bring a total of", "options": [" 42 balloons.", " 36 balloons.", " 48 balloons."], "answer": 0, "family": "word", "difficulty": 2}
+{"prompt": "Callum counts 35 red kites and 27 blue kites at the beach. Then 14 kites fly away. The number of kites left is", "options": [" 62.", " 48.", " 58."], "answer": 1, "family": "word", "difficulty": 3}
+{"prompt": "During the fair, Ines sells lemonade for 5 pennies a glass. She sells 9 glasses in the morning and 8 glasses in the afternoon. Altogether she collects", "options": [" 80 pennies.", " 75 pennies.", " 85 pennies."], "answer": 2, "family": "word", "difficulty": 3}

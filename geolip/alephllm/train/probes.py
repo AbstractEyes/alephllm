@@ -170,6 +170,22 @@ SUITES: dict[str, list] = {
 
 HOLDOUT_FAMILIES = {"p3_logic": {"d5"}, "p4_arithmetic": {"sub3"}}
 
+# Exam-grade batteries: when eval/exams/*.jsonl ship with the package
+# (30 items/suite, difficulty-graded, surface-DISJOINT from every stage
+# generator per the probe-validity law), they REPLACE the inline
+# batteries above wholesale. The inline items remain as fallback so the
+# module never imports empty.
+import json as _json
+from pathlib import Path as _Path
+
+_EXAM_DIR = _Path(__file__).resolve().parent.parent / "eval" / "exams"
+if _EXAM_DIR.is_dir():
+    for _f in sorted(_EXAM_DIR.glob("*.jsonl")):
+        _items = [_json.loads(_l) for _l in
+                  _f.read_text(encoding="utf-8").splitlines() if _l.strip()]
+        if len(_items) >= 20:
+            SUITES[_f.stem] = _items
+
 
 @torch.no_grad()
 def _option_nll(model, tok, device, prompt: str, option: str) -> float:

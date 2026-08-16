@@ -26,6 +26,9 @@ bpe = ["tokenizers>=0.19"]
 [project.urls]
 Homepage = "https://github.com/AbstractEyes/alephllm"
 
+[tool.setuptools.package-data]
+"geolip.alephllm.eval" = ["exams/*.jsonl"]
+
 [tool.setuptools.packages.find]
 include = ["geolip*"]
 namespaces = true
