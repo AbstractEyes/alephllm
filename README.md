@@ -99,3 +99,6 @@ geolip/alephllm/
   eval/canaries.py  clean-protocol in-context binding probes
   tests/smoke.py    the full test array
 ```
+
+
+**Technical companion:** [TECHNICAL.md](TECHNICAL.md) — architecture, training semantics, instruments, and the Beatrix-era numbers spine.
