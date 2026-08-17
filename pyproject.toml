@@ -14,7 +14,6 @@ dependencies = [
     "torch>=2.4",
     "safetensors>=0.4",
     "huggingface_hub>=0.24",
-    "datasets>=2.19",
     "tqdm>=4.66",
     "numpy>=1.24",
     "tensorboard>=2.15",
