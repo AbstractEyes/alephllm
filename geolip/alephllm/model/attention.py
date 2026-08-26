@@ -136,36 +136,80 @@ class CausalSplatHUB(nn.Module):
             self._mask_cache[key] = m
         return m
 
+    def _prefix(self, nc: int, device, dtype):
+        """Strictly-lower-triangular ones (nc, nc): the exclusive prefix sum
+        as ONE tensor-core GEMM. The cumsum scan kernel ran ~6x off its
+        memory roofline on the (B, nc, 2K·H, d) layout (C2d, Blackwell
+        2026-08-26) and its backward is flip+cumsum+flip; matmul accumulates
+        fp32 inside the GEMM — strictly MORE precise than a bf16 cumsum."""
+        key = ("prefix", nc, device, dtype)
+        m = self._mask_cache.get(key)
+        if m is None:
+            m = torch.tril(torch.ones(nc, nc, device=device, dtype=dtype),
+                           diagonal=-1)
+            self._mask_cache[key] = m
+        return m
+
     # ------------------------------------------------ constellation access
-    def _books_cat(self, x, which: str):
-        """All books' oriented codes in one batched pass: stack the frame
-        weights (H, D, d) and codebooks (H, K, D) — a few-MB copy — then a
-        single projection einsum, one address einsum, and the per-book 2K
-        softmax batched over the H axis. Returns (B, n, H*2K)."""
-        # AUTOCAST TRAP (measured, Blackwell 2026-08-26): torch.einsum is in
-        # autocast's PROMOTE category — one fp32 operand (F.normalize output,
-        # raw fp32 params) drags every einsum here AND the whole downstream
-        # scan to fp32 (half the TC rate, double the traffic; the 4-6%-util
-        # smoking gun). Cast the operands to the autocast dtype explicitly.
+    def _code_cat_qk(self, x):
+        """BOTH oriented codes (q and k, every book) in one batched pass.
+
+        Stack all 2H frame weights, one projection einsum, one address
+        einsum, ONE fused softmax. The oriented address IS softmax over the
+        2K half-axes — exp(cat[u−m, −u−m])/Σ with m = max|u| is bit-the-same
+        quantity as F.softmax(cat[u, −u]) (softmax subtracts its own max,
+        which is exactly m). This is a KERNEL substitution, not a mechanism
+        change: no softmax over positions, no softmax across books —
+        composition stays budget. The old chain was ~8 unfused GB-scale
+        elementwise passes per call, twice per forward (C2d: 24.6 ms).
+
+        AUTOCAST TRAP (measured, Blackwell 2026-08-26): torch.einsum is in
+        autocast's PROMOTE category, and F.normalize / exp / softmax are on
+        its fp32 list — one fp32 operand drags the whole downstream scan to
+        fp32. Operands are cast to the autocast dtype explicitly; the
+        softmax accumulates fp32 inside the kernel (standard attention
+        practice) and the returned CODE is in the compute dtype so the
+        num/S/P scan and its backward run bf16. DELIBERATE exception: den's
+        reductions (kc.sum, att.sum) stay fp32 by autocast policy — the
+        agreement mass keeps v1's fp32 dtype_floor semantics at ~5% of
+        scan traffic (dtype audit 2026-08-26).
+
+        Returns (qc, kc), each (B, n, H*2K), per-book layout [K pos | K neg]
+        matching oriented()/forward_naive."""
+        units = self._units()
         dt = (torch.get_autocast_dtype("cuda")
               if torch.is_autocast_enabled() and x.is_cuda else x.dtype)
-        W = torch.stack([(c.q if which == "q" else c.k).weight
-                         for c in self.consts]).to(dt)   # (H, D, d)
-        A = torch.stack([F.normalize(c.addr.codebook, dim=-1)
-                         for c in self.consts]).to(dt)   # (H, K, D)
-        tau = self.consts[0].addr.tau
-        xh = torch.einsum("bnd,hkd->bnhk", x.to(dt), W)  # (B, n, H, D)
-        u = torch.einsum("bnhd,hkd->bnhk",
-                         F.normalize(xh, dim=-1).to(dt), A) / tau
-        m = u.abs().amax(dim=-1, keepdim=True)
-        e = torch.exp(torch.cat([u - m, -u - m], dim=-1))  # (B, n, H, 2K)
-        e = e / e.sum(dim=-1, keepdim=True)              # per-book softmax
+        W = torch.stack([q.weight for _, q, _ in units]
+                        + [k.weight for _, _, k in units]).to(dt)  # (2H, D, d)
+        tau = units[0][0].tau
+        # tau folds into the codebook (a few-MB fp32 tensor op, MORE precise
+        # than dividing bf16 u afterwards), and the query-side row
+        # normalization folds into ONE post-GEMM scale: a per-row scalar
+        # commutes through the linear map, so (xh/||xh||) @ A^T / tau ==
+        # (xh @ (A/tau)^T) * (1/||xh||) exactly (fp reorder). Kills the
+        # fp32 normalize-div + cast + separate tau-div passes (perf audit
+        # 2026-08-26). Same 1e-12 floor as F.normalize.
+        A = (F.normalize(torch.stack([a.codebook for a, _, _ in units]),
+                         dim=-1) / tau).to(dt)                     # (H, K, D)
+        A = torch.cat([A, A])                                      # (2H, K, D)
+        xh = torch.einsum("bnd,hkd->bnhk", x.to(dt), W)            # (B,n,2H,D)
+        inv = torch.linalg.vector_norm(                # fp32 by autocast
+            xh, dim=-1, keepdim=True).clamp_min(1e-12) \
+            .reciprocal().to(dt)                       # policy; cast back
+        u = torch.einsum("bnhd,hkd->bnhk", xh, A) * inv            # (B,n,2H,K)
         B, n = x.shape[:2]
-        # torch.exp is ALSO on autocast's fp32 list (bf16 in -> fp32 out), so
-        # the softmax tail runs fp32 regardless — standard attention practice
-        # (fp32 softmax, low-precision output). Cast the CODE to dt so the
-        # whole downstream scan + backward runs bf16.
-        return e.reshape(B, n, -1).to(dt)
+        H = len(units)
+        # Split-axis-first WITHOUT a copy: the permute is a view, and the
+        # cat (which must write a fresh tensor anyway) absorbs it — so the
+        # q/k split below is a pure view instead of two GB-scale reshape
+        # copies. Layout per book stays [K pos | K neg], book-major.
+        u = u.view(B, n, 2, H, -1).permute(2, 0, 1, 3, 4)
+        # softmax: the explicit dtype arg opts out of autocast's fp32
+        # override (fp32_set_opt_dtype policy) while the CUDA kernel still
+        # accumulates fp32 internally — bf16-in/bf16-out, no fp32 e pass,
+        # and the softmax BACKWARD chain halves too.
+        e = F.softmax(torch.cat([u, -u], dim=-1), dim=-1, dtype=dt)
+        return e[0].reshape(B, n, -1), e[1].reshape(B, n, -1)
 
     def _units(self):
         """Uniform view: [(addr, q, k)] whether single- or multi-book."""
@@ -188,9 +232,10 @@ class CausalSplatHUB(nn.Module):
         qc = qc.view(B, nc, C, K2)
         kc = kc.view(B, nc, C, K2)
         S = torch.einsum("bick,bicd->bikd", kc, v)     # per-chunk 2KxD sums
-        P = torch.cumsum(S, dim=1) - S                  # exclusive prefix
+        L = self._prefix(nc, qc.device, qc.dtype)
+        P = torch.matmul(L, S.reshape(B, nc, -1)).view_as(S)  # excl. prefix
         zS = kc.sum(dim=2)                              # (B, nc, 2K)
-        zP = torch.cumsum(zS, dim=1) - zS
+        zP = torch.matmul(L, zS)
         att = torch.einsum("bick,bijk->bicj", qc, kc) * mask    # (B,nc,C,C)
         num = torch.einsum("bick,bikd->bicd", qc, P) + att @ v
         den = torch.einsum("bick,bik->bic", qc, zP).unsqueeze(-1) \
@@ -215,21 +260,17 @@ class CausalSplatHUB(nn.Module):
         nc = (n + pad) // C
         vc = vp.view(B, nc, C, d)
         mask = self._mask(C, x.device, v.dtype)
-        if self.n_const == 1:
-            qc = self.addr.oriented_cat(self.q(x))      # (B, n, 2K)
-            kc = self.addr.oriented_cat(self.k(x))
-        else:
-            # BATCHED multi-book path (2026-08-26 Blackwell verdict: the
-            # per-book Python loop was 512 sequential little scans per
-            # forward — launch-bound). Budget composition is algebraically
-            # ONE scan over the concatenated code: num and den are sums of
-            # per-book bilinear forms, so scanning cat_h(qc_h) against
-            # cat_h(kc_h) equals summing 16 separate scans (fp reorder).
-            qc = self._books_cat(x, "q")                # (B, n, H*2K)
-            kc = self._books_cat(x, "k")
-        if qc.dtype != v.dtype:      # the einsum-promote trap, single-book
-            qc = qc.to(v.dtype)      # path included (oriented_cat's exp
-            kc = kc.to(v.dtype)      # chain runs fp32 under autocast)
+        # BATCHED path, both n_const cases (2026-08-26 Blackwell verdicts:
+        # the per-book Python loop was 512 sequential little scans —
+        # launch-bound; then the split q/k exp chains were ~8 unfused
+        # GB-scale passes each). Budget composition is algebraically ONE
+        # scan over the concatenated code: num and den are sums of per-book
+        # bilinear forms, so scanning cat_h(qc_h) against cat_h(kc_h)
+        # equals summing H separate scans (fp reorder).
+        qc, kc = self._code_cat_qk(x)                   # (B, n, H*2K)
+        if qc.dtype != v.dtype:      # einsum-promote guard (belt-and-braces;
+            qc = qc.to(v.dtype)      # _code_cat_qk already returns the
+            kc = kc.to(v.dtype)      # compute dtype)
         if pad:
             qc = F.pad(qc, (0, 0, 0, pad))
             kc = F.pad(kc, (0, 0, 0, pad))

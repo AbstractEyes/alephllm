@@ -48,10 +48,10 @@ class AlephAddress(nn.Module):
 
     def oriented_cat(self, x: torch.Tensor) -> torch.Tensor:
         """cat(ep, en)/Z along the last dim in ONE exp/normalize pass —
-        mathematically identical to torch.cat(self.oriented(x), -1); the
-        fused form exists because the hub's fast path runs its whole scan
-        at 2K width (speed-harness verified 1.5e-06 vs the naive oracle,
-        4.0x with torch.compile at ctx 2048)."""
+        mathematically identical to torch.cat(self.oriented(x), -1).
+        Public API; the hub's training forward no longer calls it (0.7.3:
+        CausalSplatHUB._code_cat_qk builds q+k codes for all books in one
+        batched softmax pass) — probes and external readers still may."""
         u = self._u(x)
         m = u.abs().amax(dim=-1, keepdim=True)
         e = torch.exp(torch.cat([u - m, -u - m], dim=-1))
