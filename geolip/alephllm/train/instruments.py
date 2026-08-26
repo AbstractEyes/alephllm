@@ -77,10 +77,36 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
         li = {}
         tap_attn = blk.n1(x)
         if blk.is_hub:
-            q = blk.attn.q(tap_attn)
-            li["hub_addr"] = blk.attn.addr.health(q)
-            p, n = blk.attn.addr.oriented(q.reshape(-1, q.shape[-1]).float())
-            li["hub_consumed_erank"] = effective_rank(torch.cat([p, n], -1))
+            if getattr(blk.attn, "n_const", 1) == 1:
+                q = blk.attn.q(tap_attn)
+                li["hub_addr"] = blk.attn.addr.health(q)
+                p, n = blk.attn.addr.oriented(
+                    q.reshape(-1, q.shape[-1]).float())
+                li["hub_consumed_erank"] = effective_rank(
+                    torch.cat([p, n], -1))
+            else:
+                # v2 multi-constellation: per-book health, worst-case
+                # aggregates surfaced (the collapse flags key on these),
+                # consumed erank over the concatenated oriented reads.
+                healths, cats = [], []
+                for c in blk.attn.consts:
+                    q = c.q(tap_attn)
+                    healths.append(c.addr.health(q))
+                    p, n = c.addr.oriented(
+                        q.reshape(-1, q.shape[-1]).float())
+                    cats.append(torch.cat([p, n], -1))
+                agg = {}
+                for k in healths[0]:
+                    vals = [h[k] for h in healths]
+                    if k == "anchor_merge_pairs":
+                        agg[k] = sum(vals)            # total across books
+                    elif "max" in k:
+                        agg[k] = max(vals)            # worst book
+                    else:
+                        agg[k] = sum(vals) / len(vals)
+                li["hub_addr"] = agg
+                li["hub_consumed_erank"] = effective_rank(
+                    torch.cat(cats, -1))
         x = x + blk.attn(tap_attn)
         if blk.is_hub and blk.attn.last_den_stats is not None:
             dmin, dmean, dfloor = blk.attn.last_den_stats

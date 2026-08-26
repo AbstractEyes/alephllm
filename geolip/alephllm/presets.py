@@ -11,7 +11,12 @@ own path prefix (checkpoints + manifest + tensorboard).
                    screen (P1) running live.
   mini-beatrix-1   d768  L16 ctx2048 byte-trigram  112.5M   first Colab
                    mission (default).
-  mini-beatrix-2   d1024 L20 ctx2048 byte-trigram  249.1M
+  mini-beatrix-2   d1024 L32 ctx8192 byte-trigram ~873.7M   FULL SPLAT:
+                   a governed multi-constellation hub in EVERY block
+                   (2026-08-26 rescale; the v1 249M 3-hub shape retired
+                   untrained — plan 2026-08-26_mini_beatrix_v2_shape.md).
+  mini-beatrix-2s  d1024 L20 ctx4096 byte-trigram ~233M    the lawful
+                   screen craft: every v2 gating cell runs here first.
   beatrix-voyager  d1536 L24 ctx4096 BPE(gpt2 50k)  775.3M   flagship;
                    vocab-scale head + BPE screens (P2/P5) still open —
                    launch only after mini-beatrix verdicts.
@@ -45,6 +50,10 @@ class AlephLMConfig:
     gate_init: float = -3.0
     tie_embeddings: bool = False       # BPE crafts tie; byte crafts cannot (trigram)
     hub_chunk: int = 128               # chunked-scan block for the hub prefix memories
+    # v2 (2026-08-26): multi-constellation hubs — the product-code form at
+    # lawful supply (K <= 2*hub_D per book; ROUND 5e). 1 = the v1 layout,
+    # bit-identical state dict. Old manifests load via the default.
+    hub_const: int = 1
 
     def to_dict(self):
         d = asdict(self)
@@ -81,6 +90,13 @@ class TrainConfig:
     canary_episodes: int = 128
     seed: int = 1337
     compile: bool = False
+    # The anchor governor (ROUND 5f, 2026-08-25): post-optimizer-step
+    # min-separation projection over hub/head codebooks — preventive
+    # anti-crowding, identity when slack, zero parameters, outside the
+    # task gradient (the no-balance-machinery law is untouched).
+    governor: str = ""                 # "" off (v1 verbatim) | "minsep"
+    governor_theta: float = 45.0       # deg; scale ~ gamma*(D): 45 at D=256
+    governor_every: int = 8            # steps between slack checks (~free)
 
 
 # All missions upload to the one training repo, each under its own prefix
@@ -129,10 +145,34 @@ PRESETS: dict[str, Preset] = {
         train=TrainConfig(micro_batch=48, grad_accum=3),
         curriculum=_curriculum(300_000_000, 3_000_000_000, 6_000_000_000),
     ),
+    # v2 (2026-08-26, Phil's draft off the Foundry console): FULL-SPLAT —
+    # a hub in every block, multi-constellation product code at lawful
+    # supply (16 books x 256 anchors in 256-dim spaces = 1.0x supply;
+    # v1's single book ran 16x and crowded), governed from birth, ctx 8192
+    # where the O(L) read is ~4.5x cheaper than the MHA equivalent.
+    # ~873.7M params. Plan: history/plans/2026-08-26_mini_beatrix_v2_shape.md.
     "mini-beatrix-2": Preset(
-        model=AlephLMConfig(name="mini-beatrix-2", d_model=1024, n_layers=20,
-                            n_heads=16, context=2048, hub_layers=(5, 11, 17)),
-        train=TrainConfig(micro_batch=32, grad_accum=6),
+        model=AlephLMConfig(name="mini-beatrix-2", d_model=1024, n_layers=32,
+                            n_heads=16, context=8192,
+                            hub_layers=tuple(range(32)),
+                            hub_K=256, hub_D=256, hub_const=16,
+                            bank_experts=6, bank_ff=1024,
+                            head_K=256, head_D=256, hub_chunk=256),
+        train=TrainConfig(micro_batch=4, grad_accum=16,
+                          governor="minsep", governor_theta=45.0),
+        curriculum=_curriculum(500_000_000, 8_000_000_000, 16_000_000_000),
+    ),
+    # The lawful screen craft for the same era: every gating cell (full-splat
+    # causal viability, constellation composition, D ladder) runs here first.
+    "mini-beatrix-2s": Preset(
+        model=AlephLMConfig(name="mini-beatrix-2s", d_model=1024, n_layers=20,
+                            n_heads=16, context=4096,
+                            hub_layers=tuple(range(20)),
+                            hub_K=64, hub_D=128, hub_const=4,
+                            bank_experts=3, bank_ff=1024,
+                            head_K=256, head_D=256, hub_chunk=256),
+        train=TrainConfig(micro_batch=16, grad_accum=4,
+                          governor="minsep", governor_theta=45.0),
         curriculum=_curriculum(300_000_000, 5_000_000_000, 10_000_000_000),
     ),
     "beatrix-voyager": Preset(

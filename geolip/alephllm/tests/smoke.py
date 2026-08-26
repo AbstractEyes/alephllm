@@ -260,14 +260,18 @@ def t_instruments():
 
 @case("presets: all constructible, param counts in expected bands")
 def t_presets():
+    # mini-beatrix-2 rescaled 2026-08-26: FULL SPLAT (hub every block,
+    # 16 constellations x 256 anchors @ D=256), ~849M measured at build.
     bands = {"mini-beatrix-0": (30, 55), "mini-beatrix-1": (95, 155),
-             "mini-beatrix-2": (210, 330)}
+             "mini-beatrix-2": (780, 920), "mini-beatrix-2s": (200, 280)}
     for name, (lo, hi) in bands.items():
         p = get_preset(name)
         n = AlephLM(p.model).param_count() / 1e6
         assert lo < n < hi, f"{name}: {n:.1f}M outside [{lo},{hi}]M"
     assert get_preset("mini-beatrix-1-control").model.hub_layers == ()
     assert "beatrix-voyager" in PRESETS
+    assert get_preset("mini-beatrix-2").model.hub_const == 16
+    assert get_preset("mini-beatrix-2").train.governor == "minsep"
 
 
 @case("mini train loop: 8 steps on synthetic, finite, resume-safe exit")
@@ -561,6 +565,53 @@ def t_refuse_clobber():
             raise AssertionError("should refuse to start over an existing run")
         except RuntimeError as e:
             assert "refusing" in str(e)
+
+
+@case("v2 hub: multi-constellation fused == naive; v1 layout untouched")
+def t_hub_multiconst():
+    import warnings
+    from ..model.attention import CausalSplatHUB
+    torch.manual_seed(3)
+    h = CausalSplatHUB(48, K=16, D=16, chunk=16, n_const=3).eval()
+    x = torch.randn(2, 50, 48)
+    with torch.no_grad():
+        d = (h.forward(x) - h.forward_naive(x)).abs().max()
+        assert d < 1e-4, f"fused vs naive {float(d)}"
+        out, cache = h.prefill(x)
+        assert "consts" in cache and len(cache["consts"]) == 3
+        y = h.step(x[:, :1], cache)
+        assert y.shape == (2, 1, 48)
+    h1 = CausalSplatHUB(48, K=16, D=8, chunk=16)      # v1 form
+    ks = set(h1.state_dict())
+    assert "addr.codebook" in ks and "q.weight" in ks, "v1 keys must survive"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        CausalSplatHUB(48, K=64, D=8)
+        assert any("supply" in str(x.message) for x in w), "K>2D must warn"
+
+
+@case("governor: identity when slack (mission D), projects crowded books")
+def t_governor():
+    from ..model.governor import govern_model, minsep_project_
+    from ..model.address import AlephAddress
+    torch.manual_seed(4)
+    # mission-scale geometry: K=64 @ D=128 is born slack at theta=45
+    a = AlephAddress(64, 128)
+    before = a.codebook.data.clone()
+    assert minsep_project_(a.codebook, 45.0) == 0
+    assert torch.equal(a.codebook.data, before), "slack must be zero-write"
+    with torch.no_grad():
+        a.codebook[1] = torch.nn.functional.normalize(
+            a.codebook[0] * 0.999 + 1e-3 * torch.randn(128), dim=-1)
+    hits = minsep_project_(a.codebook, 45.0)
+    A = torch.nn.functional.normalize(a.codebook.data, dim=-1)
+    G = (A @ A.T).abs()
+    G.fill_diagonal_(0)
+    import math
+    assert hits > 0 and float(G.max()) <= math.cos(math.radians(45)) + 5e-3
+    assert minsep_project_(a.codebook, 45.0) == 0, "idempotent"
+    m = AlephLM(TINY)
+    govern_model(m, 45.0)                             # runs wrapper-aware
 
 
 def main():

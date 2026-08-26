@@ -177,3 +177,31 @@ rewind cell). The arm system is external:
 [amoe-lora](https://github.com/AbstractEyes/amoe-lora). The byte
 information system is external:
 [geolip-bytelex](https://github.com/AbstractEyes/geolip-bytelex).
+
+## v2 mechanisms (0.7.0, 2026-08-26) — the governed full-splat era
+
+Measured provenance: claude-mind canon/splat_aleph_battery.md ROUNDs 5a-5f,
+canon/covariant_codebook_prior_art.md, plan 2026-08-26_mini_beatrix_v2_shape.md.
+
+- **Supply law** (ROUND 5e): anchors crowd past ~2x supply per address space.
+  `CausalSplatHUB` now WARNS at construction when K > 2*D. v1's 512@32 (16x)
+  produced 333/646/181 duplicate anchor pairs and a consumed-erank-2 hub.
+- **Multi-constellation hubs** (`hub_const` > 1): H independent codebooks per
+  hub, each with routing-owned q/k frames, composed BY BUDGET (numerators and
+  agreement masses sum before one divide; never softmax over books). The
+  product-code form (B2) at lawful supply. `hub_const=1` is the v1 layout,
+  bit-identical state dict.
+- **The anchor governor** (`TrainConfig.governor="minsep"`, ROUND 5f):
+  post-optimizer-step projective min-separation over hub/head codebooks,
+  every `governor_every` steps. Identity when slack; preventive, not curative
+  (the separation lemma); outside the task gradient (no-balance-machinery law
+  intact). Birth-slack holds when cos(theta) exceeds the random-book
+  coherence ~ sqrt(2 ln(K^2/2)/D) — true at mission D (128-256), not at toy D.
+- **mini-beatrix-2 rescaled**: FULL SPLAT — a governed hub in every block.
+  d1024 x L32, ctx 8192 (the O(L) payoff regime), 16 x 256@D256 constellations,
+  6 banks @ ff1024, ~849M measured. `mini-beatrix-2s` (~237M) is the lawful
+  screen craft: every gating cell (full-splat causal viability, constellation
+  composition, D ladder) runs there first. Both carry auto `-control` twins.
+- **Binding rider**: the additive hub write saturates at high demand
+  (R=64: .84 vs .99) — the delta-on-S-and-z write is the queued repair; no
+  "guaranteed" claim covers retrieval until its screen passes.

@@ -31,7 +31,14 @@ def capture(model, ids: torch.Tensor) -> dict:
         blk = getattr(wrap, "block", wrap)
         tap = blk.n1(x)
         if blk.is_hub:
-            w = blk.attn.addr.signed(blk.attn.q(tap))     # (B, T, K)
+            if getattr(blk.attn, "n_const", 1) == 1:
+                w = blk.attn.addr.signed(blk.attn.q(tap))  # (B, T, K)
+            else:
+                # v2: concatenate the books' signed reads; the top anchor
+                # id is then a (const, k) flat index — stable for boundary
+                # detection, which only needs identity-change events.
+                w = torch.cat([c.addr.signed(c.q(tap))
+                               for c in blk.attn.consts], dim=-1)
             tops[f"hub_L{i}"] = w.abs().argmax(-1)        # (B, T)
         x = x + blk.attn(tap)
         x = x + blk.bank(blk.n2(x))

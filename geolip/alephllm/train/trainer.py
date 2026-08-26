@@ -233,6 +233,18 @@ class Trainer:
                 for opt in self.optimizers:
                     opt.step()
 
+                # ANCHOR GOVERNOR (ROUND 5f): post-step min-sep projection,
+                # every governor_every steps. Identity when slack (one small
+                # matmul per codebook, zero writes); fires only on crowding.
+                # Outside the task gradient — the no-balance-machinery law
+                # (bank.py) is untouched. Measured on the gov25m rung:
+                # census tail 5.4x cut, fragile seed +.007, zero cost.
+                if tc.governor == "minsep" and \
+                        (self.step % tc.governor_every) == 0:
+                    from ..model.governor import govern_model
+                    self._gov_hits = getattr(self, "_gov_hits", 0) + \
+                        govern_model(self.raw_model, tc.governor_theta)
+
                 self.step += 1
                 self.manifest.steps = self.step
                 self.manifest.add_tokens(tokens_per_step)
@@ -258,6 +270,9 @@ class Trainer:
                     w.add_scalar("train/tokens_per_sec",
                                  tokens_per_step / dt, self.step)
                     w.add_scalar("collapse/loss_spike", float(spike), self.step)
+                    if tc.governor:
+                        w.add_scalar("governor/hits_cum",
+                                     getattr(self, "_gov_hits", 0), self.step)
                     if self.device == "cuda":
                         w.add_scalar("sys/vram_gb",
                                      torch.cuda.max_memory_allocated() / 2**30,

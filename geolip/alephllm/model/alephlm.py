@@ -40,7 +40,8 @@ class Block(nn.Module):
         self.n2 = nn.LayerNorm(d)
         if self.is_hub:
             self.attn = CausalSplatHUB(d, cfg.hub_K, cfg.hub_D, cfg.tau,
-                                       chunk=cfg.hub_chunk)
+                                       chunk=cfg.hub_chunk,
+                                       n_const=getattr(cfg, "hub_const", 1))
         else:
             self.attn = CausalSDPA(d, cfg.n_heads)
         self.bank = AnchoredBank(d, cfg.bank_experts, cfg.bank_ff, cfg.tau,
