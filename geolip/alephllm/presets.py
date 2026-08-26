@@ -54,6 +54,12 @@ class AlephLMConfig:
     # lawful supply (K <= 2*hub_D per book; ROUND 5e). 1 = the v1 layout,
     # bit-identical state dict. Old manifests load via the default.
     hub_const: int = 1
+    # Activation checkpointing (training only; inference/decode untouched).
+    # 0 = off (v1 verbatim). 1 = recompute the hub read in backward.
+    # 2 = also recompute the bank branch. At v2 scale (16 books x ctx 8192
+    # x 32 layers) the retained scan tensors alone exceed a 95GB card —
+    # measured OOM, Blackwell preflight 2026-08-26. ~2x hub recompute cost.
+    hub_ckpt: int = 0
 
     def to_dict(self):
         d = asdict(self)
@@ -157,7 +163,8 @@ PRESETS: dict[str, Preset] = {
                             hub_layers=tuple(range(32)),
                             hub_K=256, hub_D=256, hub_const=16,
                             bank_experts=6, bank_ff=1024,
-                            head_K=256, head_D=256, hub_chunk=256),
+                            head_K=256, head_D=256, hub_chunk=256,
+                            hub_ckpt=2),
         train=TrainConfig(micro_batch=4, grad_accum=16,
                           governor="minsep", governor_theta=45.0),
         curriculum=_curriculum(500_000_000, 8_000_000_000, 16_000_000_000),
@@ -170,7 +177,8 @@ PRESETS: dict[str, Preset] = {
                             hub_layers=tuple(range(20)),
                             hub_K=64, hub_D=128, hub_const=4,
                             bank_experts=3, bank_ff=1024,
-                            head_K=256, head_D=256, hub_chunk=256),
+                            head_K=256, head_D=256, hub_chunk=256,
+                            hub_ckpt=2),
         train=TrainConfig(micro_batch=16, grad_accum=4,
                           governor="minsep", governor_theta=45.0),
         curriculum=_curriculum(300_000_000, 5_000_000_000, 10_000_000_000),

@@ -15,6 +15,9 @@ from typing import NamedTuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint  # noqa: F401 — torch<=2.4 does NOT auto-import
+# this submodule; without it the hub_ckpt path AttributeErrors at step 1
+# (the recorded A40 landmine, 2026-08-06)
 
 
 class LMOutput(NamedTuple):
@@ -36,6 +39,7 @@ class Block(nn.Module):
         super().__init__()
         d = cfg.d_model
         self.is_hub = layer_idx in cfg.hub_layers
+        self.ckpt_mode = getattr(cfg, "hub_ckpt", 0)
         self.n1 = nn.LayerNorm(d)
         self.n2 = nn.LayerNorm(d)
         if self.is_hub:
@@ -48,8 +52,20 @@ class Block(nn.Module):
                                  cfg.gate_init)
 
     def forward(self, x, disable_bank=False, disable_hub=False):
+        # hub_ckpt (2026-08-26): recompute-in-backward for the heavy
+        # branches — at v2 scale the retained scan tensors alone exceed a
+        # 95GB card (measured OOM). Training-path only; eval/decode and
+        # the census replay (which calls attn/bank directly) are untouched.
+        ckpt = self.ckpt_mode and self.training and torch.is_grad_enabled()
         if not (disable_hub and self.is_hub):
-            x = x + self.attn(self.n1(x))
+            if ckpt:
+                x = x + torch.utils.checkpoint.checkpoint(
+                    lambda t: self.attn(t), self.n1(x), use_reentrant=False)
+            else:
+                x = x + self.attn(self.n1(x))
+        if ckpt and self.ckpt_mode >= 2 and not disable_bank:
+            return x + torch.utils.checkpoint.checkpoint(
+                lambda t: self.bank(t), self.n2(x), use_reentrant=False)
         return x + self.bank(self.n2(x), disable_dispatch=disable_bank)
 
     def prefill(self, x):

@@ -614,6 +614,31 @@ def t_governor():
     govern_model(m, 45.0)                             # runs wrapper-aware
 
 
+@case("hub_ckpt: checkpointed training path is grad-exact vs plain")
+def t_hub_ckpt():
+    torch.manual_seed(6)
+    cfg = AlephLMConfig(name="ck-test", d_model=64, n_layers=3, n_heads=4,
+                        context=128, hub_layers=(0, 1, 2), hub_K=16, hub_D=16,
+                        hub_const=2, head_K=32, head_D=16, hub_chunk=16,
+                        hub_ckpt=2)
+    m = AlephLM(cfg)
+    m.train()
+    x = torch.randint(0, 255, (2, 64))
+    out = m(x, targets=x)
+    out.loss.backward()
+    g1 = {n: p.grad.clone() for n, p in m.named_parameters()
+          if p.grad is not None}
+    m.zero_grad()
+    for b in m.blocks:
+        b.ckpt_mode = 0
+    out2 = m(x, targets=x)
+    out2.loss.backward()
+    assert float((out.loss - out2.loss).abs()) < 1e-6
+    for n, p in m.named_parameters():
+        if p.grad is not None:
+            assert torch.allclose(g1[n], p.grad, atol=1e-5), n
+
+
 def main():
     passed = failed = 0
     for name, fn in RESULTS:
