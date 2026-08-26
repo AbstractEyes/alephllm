@@ -161,12 +161,21 @@ class Trainer:
 
     # -------------------------------------------------------------- train
     def train(self, max_steps: int | None = None, max_hours: float | None = None,
-              max_tokens: int | None = None):
+              max_tokens: int | None = None, stop_at_boundary: bool = False):
         """All caps are SESSION-RELATIVE: max_steps/max_tokens count only
         this call's work (max_tokens=12e9 trains 12B tokens NOW, regardless
         of lifetime total). Cap stops announce themselves as session caps —
-        only the curriculum itself prints 'curriculum complete'."""
+        only the curriculum itself prints 'curriculum complete'.
+
+        stop_at_boundary=True returns after each phase's boundary
+        checkpoint instead of rolling into the next phase — the driver
+        contract (0.8.1): the caller reads self._last_boundary (the phase
+        that just completed; None on a cap stop) and self._interrupted
+        (True on KeyboardInterrupt — a manual stop; drivers must NOT
+        auto-resume it; the 2s run0 driver silently resumed one)."""
         model, tc = self.model, self.tc
+        self._interrupted = False
+        self._last_boundary = None
         tokens_per_step = tc.micro_batch * tc.grad_accum * self.cfg.context
         t0 = time.time()
         start_step = self.step
@@ -298,6 +307,7 @@ class Trainer:
                 if newph is None:
                     # final boundary: archive before the curriculum ends
                     self._checkpoint(final=True, boundary=done_name)
+                    self._last_boundary = done_name
                     print("[train] curriculum complete")
                     break
                 if newph is not phase and newph["name"] != phase["name"]:
@@ -307,9 +317,15 @@ class Trainer:
                     # overwritten constantly and cannot serve as a rewind
                     # target — measured need, 2026-08-15.
                     self._checkpoint(boundary=done_name)
+                    self._last_boundary = done_name
+                    if stop_at_boundary:
+                        print(f"[train] BOUNDARY: '{done_name}' complete — "
+                              "returning to the driver")
+                        break
                     phase = self._open_stream()
                     self.manifest.note(f"switched to phase '{phase['name']}'")
         except KeyboardInterrupt:
+            self._interrupted = True
             print("\n[train] interrupted — saving resume state")
         except BaseException:
             # a crash (divergence, OOM, bug) must NEVER overwrite the last

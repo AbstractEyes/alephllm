@@ -13,7 +13,7 @@ Notebook API:
     run.evaluate()                                  # bpb, toggles, canaries
 """
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 from .presets import PRESETS, AlephLMConfig, TrainConfig, Preset, get_preset
 from .model.alephlm import AlephLM
