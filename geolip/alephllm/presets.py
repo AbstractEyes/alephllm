@@ -174,8 +174,13 @@ PRESETS: dict[str, Preset] = {
                           governor="minsep", governor_theta=45.0),
         curriculum=_curriculum(500_000_000, 8_000_000_000, 16_000_000_000),
     ),
-    # The lawful screen craft for the same era: every gating cell (full-splat
-    # causal viability, constellation composition, D ladder) runs here first.
+    # THE ACTIVE MISSION (2026-08-26, Phil: "train the next stage up from
+    # the beatrix v1; we can't train the large one currently"): the lawful
+    # full-splat craft one rung above v1 — d1024 L20 ctx4096, governed
+    # 4x64@128 books (4x supply headroom vs v1's crowded 16x). Also the
+    # screen bed for every v2-era gating cell. hub_ckpt=0: at 237M the
+    # retained scan fits the 96GB card, so the recompute tax is pure waste
+    # (fallback: set hub_ckpt=2 if the preflight bench gate aborts >88GB).
     "mini-beatrix-2s": Preset(
         model=AlephLMConfig(name="mini-beatrix-2s", d_model=1024, n_layers=20,
                             n_heads=16, context=4096,
@@ -183,7 +188,7 @@ PRESETS: dict[str, Preset] = {
                             hub_K=64, hub_D=128, hub_const=4,
                             bank_experts=3, bank_ff=1024,
                             head_K=256, head_D=256, hub_chunk=256,
-                            hub_ckpt=2),
+                            hub_ckpt=0),
         train=TrainConfig(micro_batch=16, grad_accum=4,
                           governor="minsep", governor_theta=45.0),
         curriculum=_curriculum(300_000_000, 5_000_000_000, 10_000_000_000),
