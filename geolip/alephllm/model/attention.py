@@ -142,19 +142,30 @@ class CausalSplatHUB(nn.Module):
         weights (H, D, d) and codebooks (H, K, D) — a few-MB copy — then a
         single projection einsum, one address einsum, and the per-book 2K
         softmax batched over the H axis. Returns (B, n, H*2K)."""
+        # AUTOCAST TRAP (measured, Blackwell 2026-08-26): torch.einsum is in
+        # autocast's PROMOTE category — one fp32 operand (F.normalize output,
+        # raw fp32 params) drags every einsum here AND the whole downstream
+        # scan to fp32 (half the TC rate, double the traffic; the 4-6%-util
+        # smoking gun). Cast the operands to the autocast dtype explicitly.
+        dt = (torch.get_autocast_dtype("cuda")
+              if torch.is_autocast_enabled() and x.is_cuda else x.dtype)
         W = torch.stack([(c.q if which == "q" else c.k).weight
-                         for c in self.consts])          # (H, D, d)
+                         for c in self.consts]).to(dt)   # (H, D, d)
         A = torch.stack([F.normalize(c.addr.codebook, dim=-1)
-                         for c in self.consts])          # (H, K, D)
+                         for c in self.consts]).to(dt)   # (H, K, D)
         tau = self.consts[0].addr.tau
-        xh = torch.einsum("bnd,hkd->bnhk", x, W)         # (B, n, H, D)
+        xh = torch.einsum("bnd,hkd->bnhk", x.to(dt), W)  # (B, n, H, D)
         u = torch.einsum("bnhd,hkd->bnhk",
-                         F.normalize(xh, dim=-1), A) / tau
+                         F.normalize(xh, dim=-1).to(dt), A) / tau
         m = u.abs().amax(dim=-1, keepdim=True)
         e = torch.exp(torch.cat([u - m, -u - m], dim=-1))  # (B, n, H, 2K)
         e = e / e.sum(dim=-1, keepdim=True)              # per-book softmax
         B, n = x.shape[:2]
-        return e.reshape(B, n, -1)
+        # torch.exp is ALSO on autocast's fp32 list (bf16 in -> fp32 out), so
+        # the softmax tail runs fp32 regardless — standard attention practice
+        # (fp32 softmax, low-precision output). Cast the CODE to dt so the
+        # whole downstream scan + backward runs bf16.
+        return e.reshape(B, n, -1).to(dt)
 
     def _units(self):
         """Uniform view: [(addr, q, k)] whether single- or multi-book."""
@@ -216,6 +227,9 @@ class CausalSplatHUB(nn.Module):
             # cat_h(kc_h) equals summing 16 separate scans (fp reorder).
             qc = self._books_cat(x, "q")                # (B, n, H*2K)
             kc = self._books_cat(x, "k")
+        if qc.dtype != v.dtype:      # the einsum-promote trap, single-book
+            qc = qc.to(v.dtype)      # path included (oriented_cat's exp
+            kc = kc.to(v.dtype)      # chain runs fp32 under autocast)
         if pad:
             qc = F.pad(qc, (0, 0, 0, pad))
             kc = F.pad(kc, (0, 0, 0, pad))
