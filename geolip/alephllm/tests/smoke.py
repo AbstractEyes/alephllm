@@ -639,6 +639,82 @@ def t_hub_ckpt():
             assert torch.allclose(g1[n], p.grad, atol=1e-5), n
 
 
+
+@case("special tokens: invalid-UTF-8 law, DOC packing, chat frame, BPE guard")
+def t_special_tokens():
+    import numpy as np
+    from ..data import special_tokens as sp
+    # registry invariants: 13 ids, all provably outside UTF-8
+    assert sp.SPECIALS <= sp.INVALID_UTF8 and len(sp.SPECIALS) == 13
+    tok = ByteTrigramTokenizer()
+    sp.assert_unreachable(tok)          # the law, executed
+    # DOC packing from birth: synthetic rows are short, so a batch spans
+    # many documents -> DOC must appear, exactly at row boundaries
+    s = build_stream("synthetic", tok, context=64, micro_batch=4, seed=5)
+    bs = [s.next_batch() for _ in range(6)]
+    b = bs[0]
+    n_doc = sum(int((x == sp.DOC).sum()) for x in bs)
+    assert n_doc >= 4, f"DOC missing from packed byte stream ({n_doc})"
+    others = sp.SPECIALS - {sp.DOC}
+    assert not any(int((x == t).sum()) for x in bs for t in others),         "non-DOC special leaked into a plain-text stream"
+    # resume determinism still holds with DOC in the pack
+    st = s.state_dict()
+    b2 = s.next_batch()
+    s2 = build_stream("synthetic", tok, context=64, micro_batch=4, seed=5)
+    s2.load_state_dict(st)
+    assert torch.equal(b2, s2.next_batch()), "DOC packing broke resume"
+    # the specials-native chat frame: unforgeable + round-trip visible
+    ids = sp.render_chat_ids(
+        [{"role": "user", "content": "hi ÿ😀"},
+         {"role": "model", "content": "hello"}])
+    assert int((ids == sp.USER).sum()) == 1 and int((ids == sp.MODEL).sum()) == 1
+    assert int((ids == sp.END).sum()) == 3 and int((ids == sp.SYS).sum()) == 1
+    vis = sp.decode_visible(ids)
+    for tag in ("⟦SYS⟧", "⟦USER⟧", "⟦MODEL⟧", "⟦END⟧"):
+        assert tag in vis
+    # ids-row generator packs, carries the frame, and appends DOC
+    sb = build_stream("beatrix-texture-sp", tok, context=96, micro_batch=2,
+                      seed=7)
+    bbs = [sb.next_batch() for _ in range(4)]
+    assert sum(int((x == sp.DOC).sum()) for x in bbs) >= 1
+    assert sum(int((x == sp.END).sum()) for x in bbs) >= 2
+    # BPE guard: no DOC on a non-256 vocab; ids-row datasets refuse outright
+    class FakeBPE:
+        vocab_size = 50257
+        def encode(self, text):
+            import numpy as _np
+            return _np.frombuffer(text.encode("utf-8", errors="replace"),
+                                  dtype=_np.uint8).astype(_np.int64)
+    fb = build_stream("synthetic", FakeBPE(), context=64, micro_batch=2,
+                      seed=5)
+    assert fb._doc_id is None
+    try:
+        build_stream("beatrix-texture-sp", FakeBPE(), context=64,
+                     micro_batch=2, seed=5)
+        raise RuntimeError("ids-row dataset accepted a BPE tokenizer")
+    except AssertionError:
+        pass
+    # the eval gauge runs and returns the three numbers
+    from ..train.instruments import special_token_gauge
+    cfg = AlephLMConfig(name="sp", d_model=64, n_layers=2, n_heads=2,
+                        context=64, hub_layers=(1,), hub_K=16, hub_D=16,
+                        head_K=16, head_D=16, hub_chunk=16)
+    m = AlephLM(cfg)
+    g = special_token_gauge(m, [x[:, :65] for x in bs])
+    assert g and g["doc_count"] >= 1 and g["doc_bpb"] > 0 and g["reset_bpb"] > 0
+    # audit hardening: strict roles, esc guards
+    try:
+        sp.render_chat_ids([{"role": "system", "content": "x"}])
+        raise RuntimeError("unknown role accepted")
+    except AssertionError:
+        pass
+    for bad in (0x00, 0xFC, 0xC0, True, 0.5):
+        try:
+            sp.esc(bad)
+            raise RuntimeError(f"esc accepted {bad!r}")
+        except AssertionError:
+            pass
+
 def main():
     passed = failed = 0
     for name, fn in RESULTS:

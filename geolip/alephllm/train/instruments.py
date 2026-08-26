@@ -286,3 +286,49 @@ def readout(step: int, tokens: int, census: dict, ledger: dict | None,
     if extra:
         lines.append(" · ".join(f"{k} {v}" for k, v in extra.items()))
     return "\n".join(lines)
+
+
+@torch.no_grad()
+def special_token_gauge(model, val_batches: list, doc_id: int | None = None,
+                        reset_window: int = 16) -> dict | None:
+    """The DOC-boundary instrument (0.8.0 specials era, byte crafts only).
+
+    Three numbers per eval, from the same fixed val batches as the ledger,
+    IN BITS so they read directly against val bpb (audit catch: the first
+    draft reported nats beside a bits gauge):
+      doc_count   DOC targets seen (frequency sanity — 0 means the
+                  formatter is not running; the zeros then logged are
+                  ABSENCE, not perfection)
+      doc_bpb     mean bits at positions whose TARGET is DOC — can the
+                  craft see documents ending?
+      reset_bpb   mean bits over the first `reset_window` targets AFTER
+                  each DOC — the context-reset cost vs val bpb. (Windows
+                  clip at packed-row edges; bias ~ W/ctx, negligible.)
+    """
+    if doc_id is None:
+        from ..data.special_tokens import DOC as doc_id  # single source
+    if getattr(model.cfg, "vocab_size", None) != 256:
+        return None
+    was_training = model.training
+    model.eval()
+    doc_tot = doc_n = reset_tot = reset_n = 0.0
+    for xb in val_batches:
+        x, y = xb[:, :-1], xb[:, 1:]
+        logits, _ = model(x)
+        nll = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]).float(),
+            y.reshape(-1), reduction="none").view_as(y)
+        at_doc = y == doc_id
+        doc_tot += float(nll[at_doc].sum())
+        doc_n += float(at_doc.sum())
+        after = torch.zeros_like(at_doc)
+        for k in range(1, reset_window + 1):
+            after[:, k:] |= at_doc[:, :-k]
+        after &= ~at_doc
+        reset_tot += float(nll[after].sum())
+        reset_n += float(after.sum())
+    if was_training:
+        model.train()
+    return {"doc_count": int(doc_n),
+            "doc_bpb": doc_tot / max(doc_n, 1.0) / math.log(2),
+            "reset_bpb": reset_tot / max(reset_n, 1.0) / math.log(2)}

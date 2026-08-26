@@ -66,6 +66,11 @@ class Trainer:
             torch.backends.cudnn.allow_tf32 = True
 
         self.tokenizer = build_tokenizer(self.cfg.tokenizer)
+        if getattr(self.tokenizer, "name", "") == "byte-trigram":
+            # the invalid-UTF-8 law, EXECUTED at every launch (~0.2s):
+            # a codec/errors= drift is caught here, never in the data
+            from ..data.special_tokens import assert_unreachable
+            assert_unreachable(self.tokenizer)
         self.raw_model = AlephLM(self.cfg).to(self.device)
         self.optimizers = build_optimizers(
             self.raw_model, self.tc.muon_lr, self.tc.muon_momentum,
@@ -382,10 +387,19 @@ class Trainer:
         instruments.log_census_tb(self.writer, census, ledger, self.step)
         for k, v in can.items():
             self.writer.add_scalar(f"canary/{k}", v, self.step)
+        sp = instruments.special_token_gauge(self.raw_model, self._val())
+        if sp is not None:
+            for k, v in sp.items():
+                self.writer.add_scalar(f"special/{k}", v, self.step)
+        extra = {"canary_acc": f"{can['recall_acc']:.3f}"}
+        if sp is not None:
+            extra["doc"] = (f"n={sp['doc_count']} bpb={sp['doc_bpb']:.2f} "
+                            f"reset={sp['reset_bpb']:.2f}")
         self._say(instruments.readout(
             self.step, self.manifest.tokens_seen, census, ledger,
-            extra={"canary_acc": f"{can['recall_acc']:.3f}"}))
-        self._last_eval = {"census": census, "ledger": ledger, "canary": can}
+            extra=extra))
+        self._last_eval = {"census": census, "ledger": ledger, "canary": can,
+                           "special": sp}
         return self._last_eval
 
     # -------------------------------------------------------- checkpoints

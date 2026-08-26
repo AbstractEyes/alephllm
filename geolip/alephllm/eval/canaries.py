@@ -17,10 +17,18 @@ import torch
 
 
 def _special_ids(vocab: int):
-    hi = min(vocab, 256)
-    alpha_hi = hi - 6          # payload alphabet: 1..alpha_hi
-    SEP, QRY = hi - 2, hi - 1
-    return alpha_hi, SEP, QRY
+    """Byte crafts (vocab 256) use the 0.8.0 specials layout: CUE (0xF6)
+    marks the query, SEP is the frame separator (0xF8), and the payload
+    alphabet stops below 0xC0 so NO special can appear as content. The
+    old frame used QRY=255/SEP=254 — under 0.8.0 those are DOC/USER:
+    QRY==DOC planted a document-reset token at exactly the retrieval
+    point (audit catch, 2026-08-26). recall_acc re-baselines here.
+    BPE crafts keep the old top-of-vocab convention."""
+    if vocab == 256:
+        from ..data.special_tokens import CUE, SEP as SEP_ID
+        return 0xC0, SEP_ID, CUE       # payload alphabet: 1..0xBF
+    hi = vocab
+    return hi - 6, hi - 2, hi - 1
 
 
 def make_episodes(n: int, vocab: int, pairs: int = 4, klen: int = 3,

@@ -22,6 +22,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from .special_tokens import DOC, render_chat_ids
+
 REGISTRY = {
     "wikitext-103": dict(path="Salesforce/wikitext",
                          name="wikitext-103-raw-v1",
@@ -44,15 +46,28 @@ REGISTRY = {
                           column="dialogue", render="soda",
                           columns=["narrative", "speakers", "dialogue"]),
     "beatrix-texture": dict(path=None, generator="beatrix"),
+    # specials-native identity texture (0.8.0): the SYS/USER/MODEL/END
+    # frame from special_tokens — emits token IDS, byte crafts only.
+    "beatrix-texture-sp": dict(path=None, generator="beatrix_sp",
+                               ids_rows=True),
     "recall-synth": dict(path=None, generator="recall"),
 }
 
 RESERVED_HEAD_ROWS = 2048
 
-# anneal-mix recipe: (dataset, weight)
+
+def _is_byte_craft(tokenizer) -> bool:
+    """Specials gate: tokenizer IDENTITY, not the vocab-256 proxy."""
+    return (getattr(tokenizer, "name", "") == "byte-trigram"
+            and getattr(tokenizer, "vocab_size", None) == 256)
+
+# anneal-mix recipe: (dataset, weight). 0.8.0: the identity component is
+# the SPECIALS-native form — the byte era anneals onto the unforgeable
+# frame (v1's plain-tag "beatrix-texture" stays registered for the shipped
+# arms' bridge compatibility; a BPE craft defines its own recipe).
 ANNEAL_MIX = [("fineweb-edu", 0.45), ("cosmopedia", 0.20),
               ("tinystories", 0.15), ("soda-dialogue", 0.12),
-              ("beatrix-texture", 0.05), ("recall-synth", 0.03)]
+              ("beatrix-texture-sp", 0.05), ("recall-synth", 0.03)]
 
 
 def _render_soda(row) -> str:
@@ -66,37 +81,60 @@ def _render_soda(row) -> str:
     return "\n".join(x for x in lines if x)
 
 
+_BEATRIX_QA = [
+    ("Who are you?",
+     "I am Beatrix, a small byte-level language model. I read raw "
+     "bytes instead of words, and I am still in training."),
+    ("Hello!", "Hello! How can I help you today?"),
+    ("What can you do?",
+     "I continue text and hold simple conversations. I am a small "
+     "model, so simple questions work best."),
+    ("Are you human?",
+     "No, I am a language model - a computer program that learned "
+     "from reading text."),
+    ("What is a byte-level model?",
+     "It means I read text one byte at a time instead of using a "
+     "word vocabulary. My tokens are learned inside the network."),
+    ("Can you make mistakes?",
+     "Yes, often. I am small and still learning, so please check "
+     "anything important.")]
+
+
 def _beatrix_texture_rows(seed: int):
     """Template-exact self-descriptive exchanges at low rate: the CORE
     learns who Beatrix is as world knowledge, and her exact chat format
-    becomes in-distribution before any arm training."""
+    becomes in-distribution before any arm training. (v1 plain-tag form —
+    the shipped arms' bridge contract; the 0.8.0 byte era anneals on
+    _beatrix_texture_sp_rows instead.)"""
     import numpy as _np
     from ..amoe_bridge import CHAT_HEADER, USER_TAG, ASSISTANT_TAG
-    qa = [("Who are you?",
-           "I am Beatrix, a small byte-level language model. I read raw "
-           "bytes instead of words, and I am still in training."),
-          ("Hello!", "Hello! How can I help you today?"),
-          ("What can you do?",
-           "I continue text and hold simple conversations. I am a small "
-           "model, so simple questions work best."),
-          ("Are you human?",
-           "No, I am a language model - a computer program that learned "
-           "from reading text."),
-          ("What is a byte-level model?",
-           "It means I read text one byte at a time instead of using a "
-           "word vocabulary. My tokens are learned inside the network."),
-          ("Can you make mistakes?",
-           "Yes, often. I am small and still learning, so please check "
-           "anything important.")]
     rng = _np.random.default_rng(seed)
     while True:
         k = int(rng.integers(1, 4))
-        idx = rng.choice(len(qa), size=k, replace=False)
+        idx = rng.choice(len(_BEATRIX_QA), size=k, replace=False)
         text = CHAT_HEADER
         for i in idx:
-            q, a = qa[int(i)]
+            q, a = _BEATRIX_QA[int(i)]
             text += USER_TAG + q + "\n" + ASSISTANT_TAG + " " + a + "\n"
         yield {"text": text}
+
+
+def _beatrix_texture_sp_rows(seed: int):
+    """The specials-native identity texture (0.8.0): the same QA pool on
+    the unforgeable SYS/USER/MODEL/END frame — encoded text can never
+    contain a special, so the frame cannot be spoofed by content. Yields
+    token IDS (ids_rows=True in the REGISTRY spec; byte crafts only)."""
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    while True:
+        k = int(rng.integers(1, 4))
+        idx = rng.choice(len(_BEATRIX_QA), size=k, replace=False)
+        turns = []
+        for i in idx:
+            q, a = _BEATRIX_QA[int(i)]
+            turns += [{"role": "user", "content": q},
+                      {"role": "model", "content": a}]
+        yield {"ids": render_chat_ids(turns)}
 
 
 def _recall_rows(seed: int):
@@ -122,7 +160,9 @@ def _recall_rows(seed: int):
         yield {"text": " ".join(lines)}
 
 
-_GENERATORS = {"beatrix": _beatrix_texture_rows, "recall": _recall_rows}
+_GENERATORS = {"beatrix": _beatrix_texture_rows,
+               "beatrix_sp": _beatrix_texture_sp_rows,
+               "recall": _recall_rows}
 
 # render-fn dispatch: specs name a renderer; curriculum.py registers more.
 # A renderer returning "" REJECTS the row (row-filter); specs that filter
@@ -153,6 +193,20 @@ class PackedStream:
             raise KeyError(f"unknown dataset '{dataset}' — have {sorted(REGISTRY)}")
         assert role in ("train", "val")
         self.dataset, self.tokenizer, self.role = dataset, tokenizer, role
+        # 0.8.0 specials: byte crafts get a DOC boundary token appended
+        # after every document, every phase, from birth. The gate is
+        # TOKENIZER IDENTITY (name == 'byte-trigram'), not the vocab-256
+        # proxy — a future 256-vocab BPE could reach 0xFF from text
+        # (audit catch). BPE crafts never see specials; ids-row
+        # generators emit byte-special ids and are gated identically.
+        self._doc_id = DOC if _is_byte_craft(tokenizer) else None
+        if REGISTRY[dataset].get("ids_rows"):
+            assert REGISTRY[dataset]["path"] is None, \
+                "ids_rows is an owned-generator contract"
+            assert self._doc_id is not None, (
+                f"dataset '{dataset}' emits byte-special token ids — "
+                f"byte-trigram crafts only (got tokenizer "
+                f"{getattr(tokenizer, 'name', type(tokenizer).__name__)!r})")
         self.context, self.micro_batch = context, micro_batch
         self.seed, self.shuffle_buffer = seed, shuffle_buffer
         self.epoch = 0
@@ -280,6 +334,21 @@ class PackedStream:
                 return text
             empties += 1
 
+    def _next_row_ids(self) -> np.ndarray:
+        """One document as token ids: encoded text (or an ids-row from an
+        owned generator), with the DOC boundary appended on byte crafts."""
+        if REGISTRY[self.dataset].get("ids_rows"):
+            if self._it is None:
+                self._open()
+            row = next(self._it)      # owned generators are infinite
+            self.rows_consumed += 1
+            ids = np.asarray(row["ids"], dtype=np.int64)
+        else:
+            ids = self.tokenizer.encode(self._next_row_text() + "\n")
+        if self._doc_id is not None:
+            ids = np.append(ids, np.int64(self._doc_id))
+        return ids
+
     # ------------------------------------------------------------------ iterate
     def next_batch(self) -> torch.Tensor:
         """(micro_batch, context+1) int64 CPU tensor."""
@@ -287,7 +356,7 @@ class PackedStream:
         chunks = [self._buf]
         have = self._buf.size
         while have < need:
-            ids = self.tokenizer.encode(self._next_row_text() + "\n")
+            ids = self._next_row_ids()
             chunks.append(ids)
             have += ids.size
         flat = np.concatenate(chunks)
@@ -350,7 +419,16 @@ def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
         if role == "val":   # gauge continuity: anneal val = fineweb holdout
             return PackedStream("fineweb-edu", tokenizer, context,
                                 micro_batch, seed, role="val")
-        return MixStream(tokenizer, context, micro_batch, seed)
+        recipe = ANNEAL_MIX
+        if not _is_byte_craft(tokenizer):
+            # BPE crafts cannot carry the byte-special identity texture
+            # (0xFF etc. are real BPE ids) — they anneal on the v1
+            # plain-tag form. Without this the flagship's plan-of-record
+            # anneal phase crashed at construction (audit catch).
+            recipe = [(("beatrix-texture" if n == "beatrix-texture-sp"
+                        else n), w) for n, w in ANNEAL_MIX]
+        return MixStream(tokenizer, context, micro_batch, seed,
+                         recipe=recipe)
     if dataset in CURRICULUM_MIXES:
         if role == "val":   # gauge continuity: every stage vals on the
             return PackedStream("fineweb-edu", tokenizer, context,   # same
