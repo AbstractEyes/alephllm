@@ -163,7 +163,12 @@ PRESETS: dict[str, Preset] = {
                             hub_layers=tuple(range(32)),
                             hub_K=256, hub_D=256, hub_const=16,
                             bank_experts=6, bank_ff=1024,
-                            head_K=256, head_D=256, hub_chunk=256,
+                            # chunk 1024 MEASURED on the mission card (C2e,
+                            # Blackwell 2026-08-26): 72.2 vs 83.2 ms/layer
+                            # fwd+bwd at chunk 256, peak 39.4 -> 26.6 GB.
+                            # S/P traffic ~ 1/C, att work ~ C; config-only,
+                            # checkpoint-compatible, exactness C-independent.
+                            head_K=256, head_D=256, hub_chunk=1024,
                             hub_ckpt=2),
         train=TrainConfig(micro_batch=4, grad_accum=16,
                           governor="minsep", governor_theta=45.0),
