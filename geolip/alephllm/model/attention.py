@@ -137,6 +137,25 @@ class CausalSplatHUB(nn.Module):
         return m
 
     # ------------------------------------------------ constellation access
+    def _books_cat(self, x, which: str):
+        """All books' oriented codes in one batched pass: stack the frame
+        weights (H, D, d) and codebooks (H, K, D) — a few-MB copy — then a
+        single projection einsum, one address einsum, and the per-book 2K
+        softmax batched over the H axis. Returns (B, n, H*2K)."""
+        W = torch.stack([(c.q if which == "q" else c.k).weight
+                         for c in self.consts])          # (H, D, d)
+        A = torch.stack([F.normalize(c.addr.codebook, dim=-1)
+                         for c in self.consts])          # (H, K, D)
+        tau = self.consts[0].addr.tau
+        xh = torch.einsum("bnd,hkd->bnhk", x, W)         # (B, n, H, D)
+        u = torch.einsum("bnhd,hkd->bnhk",
+                         F.normalize(xh, dim=-1), A) / tau
+        m = u.abs().amax(dim=-1, keepdim=True)
+        e = torch.exp(torch.cat([u - m, -u - m], dim=-1))  # (B, n, H, 2K)
+        e = e / e.sum(dim=-1, keepdim=True)              # per-book softmax
+        B, n = x.shape[:2]
+        return e.reshape(B, n, -1)
+
     def _units(self):
         """Uniform view: [(addr, q, k)] whether single- or multi-book."""
         if self.n_const == 1:
@@ -185,16 +204,22 @@ class CausalSplatHUB(nn.Module):
         nc = (n + pad) // C
         vc = vp.view(B, nc, C, d)
         mask = self._mask(C, x.device, v.dtype)
-        num = den = None
-        for addr, q, k in self._units():
-            qc = addr.oriented_cat(q(x))                # (B, n, 2K)
-            kc = addr.oriented_cat(k(x))
-            if pad:
-                qc = F.pad(qc, (0, 0, 0, pad))
-                kc = F.pad(kc, (0, 0, 0, pad))
-            nu, de = self._scan_cat(qc, kc, vc, mask, B, n, nc, C, d)
-            num = nu if num is None else num + nu
-            den = de if den is None else den + de
+        if self.n_const == 1:
+            qc = self.addr.oriented_cat(self.q(x))      # (B, n, 2K)
+            kc = self.addr.oriented_cat(self.k(x))
+        else:
+            # BATCHED multi-book path (2026-08-26 Blackwell verdict: the
+            # per-book Python loop was 512 sequential little scans per
+            # forward — launch-bound). Budget composition is algebraically
+            # ONE scan over the concatenated code: num and den are sums of
+            # per-book bilinear forms, so scanning cat_h(qc_h) against
+            # cat_h(kc_h) equals summing 16 separate scans (fp reorder).
+            qc = self._books_cat(x, "q")                # (B, n, H*2K)
+            kc = self._books_cat(x, "k")
+        if pad:
+            qc = F.pad(qc, (0, 0, 0, pad))
+            kc = F.pad(kc, (0, 0, 0, pad))
+        num, den = self._scan_cat(qc, kc, vc, mask, B, n, nc, C, d)
         cl = dtype_floor(den)
         self._den_raw = (den.detach(), cl)
         self._den_stats = None

@@ -116,11 +116,22 @@ def govern_model(model, theta_min_deg: float,
             addr = getattr(getattr(blk, "bank", None), "addr", None)
             if isinstance(addr, AlephAddress):
                 books.append(addr.codebook)
+    # Batched slack check (2026-08-26): group same-shape books into ONE bmm
+    # and ONE device sync — the per-book loop was 500+ tiny matmuls each
+    # with a .max() sync on the v2 craft. Only violating books ever enter
+    # the Python projection.
     hits = 0
+    by_shape: dict = {}
     for cb in books:
-        A = torch.nn.functional.normalize(cb.data.float(), dim=-1)
-        G = (A @ A.T).abs()
-        G.fill_diagonal_(0)
-        if float(G.max()) > c_max:              # slack check: one matmul
-            hits += minsep_project_(cb, theta_min_deg)
+        by_shape.setdefault(tuple(cb.shape), []).append(cb)
+    for shape, group in by_shape.items():
+        A = torch.nn.functional.normalize(
+            torch.stack([cb.data for cb in group]).float(), dim=-1)
+        G = torch.bmm(A, A.transpose(1, 2)).abs()        # (n_books, K, K)
+        K = shape[0]
+        eye = torch.eye(K, device=G.device, dtype=torch.bool)
+        G = G.masked_fill(eye, 0)
+        worst = G.amax(dim=(1, 2))                       # one sync for all
+        for idx in (worst > c_max).nonzero().flatten().tolist():
+            hits += minsep_project_(group[idx], theta_min_deg)
     return hits
