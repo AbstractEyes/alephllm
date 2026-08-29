@@ -40,6 +40,11 @@ def _retry(fn, tries: int = 3, wait: float = 5.0, label: str = "op"):
 class HubSync:
     def __init__(self, repo: str, prefix: str, token: str | None,
                  local_dir: str):
+        if token:
+            # a secret pasted with a line-wrap carries embedded CR/LF and
+            # poisons every auth header ("Illegal header value" — cost a
+            # live session, 2026-08-29); strip ALL whitespace at entry
+            token = "".join(token.split())
         self.repo, self.prefix, self.token = repo, prefix, token
         self.local = local_dir
         os.makedirs(os.path.join(local_dir, "checkpoints", "fp8"), exist_ok=True)
