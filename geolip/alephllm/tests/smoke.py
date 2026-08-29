@@ -715,6 +715,57 @@ def t_special_tokens():
         except AssertionError:
             pass
 
+
+@case("head revival: liveness gauge, burial flag, the BOUNDARY-WRITE op")
+def t_head_revival():
+    import torch.nn.functional as Fn
+    from ..train.revival import revive_head
+    from ..train.instruments import model_census
+    torch.manual_seed(3)
+    cfg = AlephLMConfig(name="rev", d_model=64, n_layers=2, n_heads=2,
+                        context=64, hub_layers=(1,), hub_K=16, hub_D=16,
+                        head_K=16, head_D=16, hub_chunk=16)
+    m = AlephLM(cfg).eval()
+    x = torch.randint(0, 256, (4, 64))
+    # bury the head the way the real crafts did (RIDER 12): burial needs
+    # a RANK-COLLAPSED book (a full-rank book spans everything and
+    # normalize rescues any residual) — collapse the book to one line,
+    # then rotate proj into its orthogonal complement
+    with torch.no_grad():
+        v0 = Fn.normalize(torch.randn(16), dim=0)
+        m.head.addr.codebook.copy_(
+            Fn.normalize(v0.expand(16, 16) + 1e-3 * torch.randn(16, 16),
+                         dim=-1))
+        P = torch.eye(16) - v0.outer(v0)
+        m.head.proj.weight.copy_(P @ m.head.proj.weight)
+    c = model_census(m, x)
+    assert c["head"]["liveness_ratio"] < 0.1 and c["flags"]["head_buried"],         c["head"]["liveness_ratio"]
+    # collect head inputs + base logits, run the op
+    hs = []
+    hook = m.nf.register_forward_hook(
+        lambda mod, i, o: hs.append(o.detach().float()
+                                    .reshape(-1, o.shape[-1])))
+    with torch.no_grad():
+        out = m(x[:, :-1], disable_head_aleph=True)
+    hook.remove()
+    H = torch.cat(hs)
+    B = out.logits.float().reshape(-1, 256)
+    Y = x[:, 1:].reshape(-1)
+    prov = revive_head(m, H, B, Y, theta_deg=45.0)
+    assert prov["s_norm"] > 0.01 and prov["delta_bpb"] <= 1e-6, prov
+    c2 = model_census(m, x)
+    assert c2["head"]["liveness_ratio"] > 0.5 and         not c2["flags"]["head_buried"]
+    # the freeze flag: requires_grad off, optimizer groups unchanged
+    m.head.proj.weight.requires_grad_(False)
+    m.head.addr.codebook.requires_grad_(False)
+    muon_p, adam_p = split_params(m)
+    assert any(p is m.head.proj.weight for p in muon_p)  # membership kept
+    out2 = m(x[:, :-1], targets=x[:, 1:])
+    out2.loss.backward()
+    assert m.head.proj.weight.grad is None
+    assert m.head.addr.codebook.grad is None
+    assert m.head.w_s.weight.grad is not None
+
 def main():
     passed = failed = 0
     for name, fn in RESULTS:

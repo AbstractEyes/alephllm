@@ -72,6 +72,13 @@ class Trainer:
             from ..data.special_tokens import assert_unreachable
             assert_unreachable(self.tokenizer)
         self.raw_model = AlephLM(self.cfg).to(self.device)
+        if getattr(self.tc, "head_addr_frozen", False):
+            # post-revival freeze: the burial channel closes structurally;
+            # param groups unchanged (Muon skips grad-less params), so
+            # resume optimizer state loads verbatim.
+            self.raw_model.head.proj.weight.requires_grad_(False)
+            self.raw_model.head.addr.codebook.requires_grad_(False)
+            print("[head] address frozen (proj + codebook) — W_s trains")
         self.optimizers = build_optimizers(
             self.raw_model, self.tc.muon_lr, self.tc.muon_momentum,
             self.tc.adam_lr)

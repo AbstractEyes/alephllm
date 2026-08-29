@@ -103,6 +103,13 @@ class TrainConfig:
     governor: str = ""                 # "" off (v1 verbatim) | "minsep"
     governor_theta: float = 45.0       # deg; scale ~ gamma*(D): 45 at D=256
     governor_every: int = 8            # steps between slack checks (~free)
+    # Post-revival address freeze (0.8.2; RIDERS 11-12): after the
+    # BOUNDARY-WRITE head revival, proj + head codebook freeze so the
+    # self-burial channel (proj rotating to codebook-orthogonality,
+    # measured 2/2 crafts) is structurally closed — only W_s trains.
+    # requires_grad-only: optimizer param groups are UNCHANGED, so resume
+    # state loads verbatim (Muon skips grad-less params).
+    head_addr_frozen: bool = False
 
 
 # All missions upload to the one training repo, each under its own prefix
@@ -190,7 +197,8 @@ PRESETS: dict[str, Preset] = {
                             head_K=256, head_D=256, hub_chunk=256,
                             hub_ckpt=0),
         train=TrainConfig(micro_batch=16, grad_accum=4,
-                          governor="minsep", governor_theta=45.0),
+                          governor="minsep", governor_theta=45.0,
+                          head_addr_frozen=True),
         curriculum=_curriculum(300_000_000, 5_000_000_000, 10_000_000_000),
     ),
     "beatrix-voyager": Preset(
