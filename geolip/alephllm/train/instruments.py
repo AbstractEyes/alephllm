@@ -245,6 +245,10 @@ def log_census_tb(writer, census: dict, ledger: dict | None, step: int):
             writer.add_scalar(f"gates/L{i}_e{k}", g, step)
     writer.add_scalar("head/gamma", census["head"]["gamma"], step)
     writer.add_scalar("head/w_s_norm", census["head"]["w_s_norm"], step)
+    if "liveness_ratio" in census["head"]:
+        writer.add_scalar("head/s_norm", census["head"]["s_norm"], step)
+        writer.add_scalar("head/liveness_ratio",
+                          census["head"]["liveness_ratio"], step)
     writer.add_scalar("head/consumed_erank",
                       census["head"]["consumed_erank"], step)
     writer.add_scalar("erank/head_codebook",
@@ -281,9 +285,13 @@ def readout(step: int, tokens: int, census: dict, ledger: dict | None,
           if li.get("bank_sign_frac_neg") is not None]
     if sf:
         lines.append(f"sign census (bank) : frac_neg mean {sum(sf)/len(sf):.3f}")
+    lr = census['head'].get('liveness_ratio')
+    live_txt = (f" · live {lr:.2f}x" + (" !!BURIED" if lr < 0.1 else "")
+                if lr is not None else "")
     lines.append(f"head aleph         : gamma {census['head']['gamma']:+.3f} · "
                  f"||W_s|| {census['head']['w_s_norm']:.4f} · "
-                 f"consumed erank {census['head']['consumed_erank']:.1f}")
+                 f"consumed erank {census['head']['consumed_erank']:.1f}"
+                 + live_txt)
     if ledger:
         tog = " ".join(f"{k.replace('toggle_', '')}:{v:+.4f}"
                        for k, v in ledger.items() if k.startswith("toggle_"))
