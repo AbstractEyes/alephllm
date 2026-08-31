@@ -16,12 +16,16 @@ earn its way in by gradient.
 trigram byte embedding (dedicated pad row — the pad law)
    ↓
 N pre-norm layers:
-   x + Attn(LN x)      CausalSDPA majority + 3 CausalSplatHUB layers
+   x + Attn(LN x)      CausalSDPA or CausalSplatHUB per layer (v1: 3
+                       hub layers; the v2 era is FULL SPLAT — a governed
+                       multi-constellation hub in EVERY block)
    x + Bank(LN x)      E1-form anchored FFN: trunk + 3 dispatched experts,
                        expert outputs ZERO-INIT (exact null path), gates
                        σ(-3), no balance machinery of any kind
    ↓
-LayerNorm → DualHead:  logits = W_h h + γ·W_s·s(h),  γ = 0 at birth
+LayerNorm → DualHead:  logits = W_h h + W_s·s(h),  W_s = 0 at birth
+                       (weight-zero, never gate-zero — the measured law;
+                       γ survives frozen at 1 as the ablation knob)
 ```
 
 CausalSplatHUB is causal **linear** attention through the oriented
@@ -36,12 +40,13 @@ never trains through fp8 (fp8-e4m3 is the shipping format only).
 
 ## Missions ("Mini-Beatrix" ladder, voyager-style numbering)
 
-| craft | d / L / ctx | params | tokenizer |
-|---|---|---|---|
-| mini-beatrix-0 | 512 / 12 / 1024 | 37.6M | byte-trigram |
-| mini-beatrix-1 | 768 / 16 / 2048 | 112.5M | byte-trigram |
-| mini-beatrix-2 | 1024 / 20 / 2048 | 249.1M | byte-trigram |
-| beatrix-voyager | 1536 / 24 / 4096 | 775.3M | BPE (gpt2) |
+| craft | d / L / ctx | params | tokenizer | status |
+|---|---|---|---|---|
+| mini-beatrix-0 | 512 / 12 / 1024 | 37.6M | byte-trigram | gate craft |
+| mini-beatrix-1 | 768 / 16 / 2048 | 112.5M | byte-trigram | COMPLETE — [automodel](https://huggingface.co/AbstractPhil/mini-beatrix-1) |
+| **mini-beatrix-2s** | 1024 / 20 / 4096 | 237.1M | byte-trigram | **COMPLETE 2026-08-31, 16.101B tokens, full splat — [automodel](https://huggingface.co/AbstractPhil/mini-beatrix-2s)** |
+| mini-beatrix-2 | 1024 / 32 / 8192 | 849.0M | byte-trigram | full splat; shelved pending logistics |
+| beatrix-voyager | 1536 / 24 / 4096 | 775.3M | BPE (gpt2) | awaits BPE screens |
 
 Each craft also has a `*-control` twin (hub layers removed). Training
 runs, checkpoints, manifests and TensorBoard live in
