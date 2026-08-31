@@ -69,6 +69,13 @@ ANNEAL_MIX = [("fineweb-edu", 0.45), ("cosmopedia", 0.20),
               ("tinystories", 0.15), ("soda-dialogue", 0.12),
               ("beatrix-texture-sp", 0.05), ("recall-synth", 0.03)]
 
+# 0.8.6 (Phil 2026-08-31: "run without first, then just train chat on
+# after"): the two-phase anneal — same distribution MINUS the chat-frame
+# component first (MixStream renormalizes weights), so the nochat
+# boundary report is the exact pre-chat baseline and the chat frame's
+# effect is isolated from the anneal shift itself.
+ANNEAL_NOCHAT = [(n, w) for n, w in ANNEAL_MIX if n != "beatrix-texture-sp"]
+
 
 def _render_soda(row) -> str:
     """SODA row -> social narrative + name-tagged dialogue turns (teaches
@@ -415,20 +422,21 @@ class MixStream:
 
 def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
                  seed: int = 1337, role: str = "train"):
-    if dataset == "anneal-mix":
+    if dataset in ("anneal-mix", "anneal-nochat"):
         if role == "val":   # gauge continuity: anneal val = fineweb holdout
             return PackedStream("fineweb-edu", tokenizer, context,
                                 micro_batch, seed, role="val")
-        recipe = ANNEAL_MIX
+        recipe = ANNEAL_NOCHAT if dataset == "anneal-nochat" else ANNEAL_MIX
         if not _is_byte_craft(tokenizer):
             # BPE crafts cannot carry the byte-special identity texture
             # (0xFF etc. are real BPE ids) — they anneal on the v1
             # plain-tag form. Without this the flagship's plan-of-record
             # anneal phase crashed at construction (audit catch).
             recipe = [(("beatrix-texture" if n == "beatrix-texture-sp"
-                        else n), w) for n, w in ANNEAL_MIX]
-        return MixStream(tokenizer, context, micro_batch, seed,
-                         recipe=recipe)
+                        else n), w) for n, w in recipe]
+        ms = MixStream(tokenizer, context, micro_batch, seed, recipe=recipe)
+        ms.dataset = dataset
+        return ms
     if dataset in CURRICULUM_MIXES:
         if role == "val":   # gauge continuity: every stage vals on the
             return PackedStream("fineweb-edu", tokenizer, context,   # same

@@ -688,6 +688,11 @@ def t_special_tokens():
     fb = build_stream("synthetic", FakeBPE(), context=64, micro_batch=2,
                       seed=5)
     assert fb._doc_id is None
+    ns = build_stream("anneal-nochat", tok, context=64, micro_batch=2,
+                      seed=5)
+    assert ns.dataset == "anneal-nochat"
+    assert "beatrix-texture-sp" not in ns._streams, list(ns._streams)
+    assert "fineweb-edu" in ns._streams
     try:
         build_stream("beatrix-texture-sp", FakeBPE(), context=64,
                      micro_batch=2, seed=5)
