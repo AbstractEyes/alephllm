@@ -388,7 +388,17 @@ class Trainer:
         the active phase's dataset changes; deterministic per dataset, so
         the gauge is comparable across sessions (within one dataset)."""
         ph = self.manifest.current_phase()
-        ds = ph["dataset"] if ph else "synthetic"
+        if ph:
+            ds = ph["dataset"]
+        else:
+            # terminal boundary: current_phase() is None once everything is
+            # done/deferred — fall back to the LAST completed phase's
+            # dataset so end-of-curriculum ledgers stay on a comparable
+            # gauge (the s8 final report silently landed on 'synthetic':
+            # doc_count 70 -> 1612, hub_off 5.16 — incomparable artifact,
+            # 2026-08-31). 'synthetic' remains the no-phases fallback.
+            done = [p for p in self.manifest.phases if p["status"] == "done"]
+            ds = done[-1]["dataset"] if done else "synthetic"
         if self._val_batches is None or self._val_dataset != ds:
             vs = build_stream(ds, self.tokenizer, self.cfg.context,
                               self.tc.micro_batch, seed=self.tc.seed + 9999,
