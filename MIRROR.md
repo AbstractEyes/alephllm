@@ -1,12 +1,14 @@
 # The automodel mirror law (unguarded invariant — read before touching model/)
 
-huggingface.co/**AbstractPhil/mini-beatrix-1** is an HF remote-code package
+huggingface.co/**AbstractPhil/mini-beatrix-1** AND
+**AbstractPhil/mini-beatrix-2s** (added 2026-08-31, mission final
+weights) are HF remote-code packages
 (`MiniBeatrixConfig` / `MiniBeatrixForCausalLM` in `modeling_minibeatrix.py`)
 that carries **vendored verbatim copies of `geolip/alephllm/model/*.py`** plus
 `presets.py`. Nothing in this repo enforces the link.
 
 **LAW (claude-mind, repos/alephllm.md): any change to `model/*.py` or
-`presets.py` must be mirrored to that HF repo in the same session** — the
+`presets.py` must be mirrored to BOTH HF repos in the same session** — the
 vendored copies drift silently otherwise. The machine HF_TOKEN can write it.
 
 Mirror procedure:
