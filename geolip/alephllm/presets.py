@@ -218,9 +218,21 @@ for _name in list(PRESETS):
     _m = AlephLMConfig.from_dict(_p.model.to_dict())
     _m.name = _name + "-control"
     _m.hub_layers = ()
+    # 0.8.7: twins get their OWN TrainConfig copy — the shared-instance
+    # form let treatment-specific flags leak into controls (2s-control
+    # inherited head_addr_frozen=True, a post-revival flag no control's
+    # birth recipe may carry) and made cross-mutation possible.
+    _t = TrainConfig(**{k: getattr(_p.train, k)
+                        for k in _p.train.__dataclass_fields__})
     PRESETS[_name + "-control"] = Preset(
-        model=_m, train=_p.train, 
+        model=_m, train=_t,
         curriculum=[dict(x) for x in _p.curriculum])
+
+# The 2s architecture control runs the BIRTH recipe verbatim: born-null
+# unfrozen head (it buries, as the treatment's did for its first 24,860
+# steps — measured 3/3; the +0.01 head term is immaterial at the ±3.4
+# hub scale this control exists to judge).
+PRESETS["mini-beatrix-2s-control"].train.head_addr_frozen = False
 
 
 def get_preset(name: str) -> Preset:

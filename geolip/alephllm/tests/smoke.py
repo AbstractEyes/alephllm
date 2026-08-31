@@ -274,6 +274,13 @@ def t_presets():
     assert get_preset("mini-beatrix-2").train.governor == "minsep"
 
 
+    ctl = get_preset("mini-beatrix-2s-control")
+    trt = get_preset("mini-beatrix-2s")
+    assert ctl.train is not trt.train, "control shares treatment TrainConfig"
+    assert ctl.train.head_addr_frozen is False and         trt.train.head_addr_frozen is True
+    assert ctl.model.hub_layers == ()
+
+
 @case("mini train loop: 8 steps on synthetic, finite, resume-safe exit")
 def t_train_loop():
     from ..train.trainer import Trainer
