@@ -82,28 +82,90 @@ trajectories, anchor drift, and the **toggle ledger** — bank-off /
 hub-off / head-aleph-off bpb deltas, the causal contribution instrument —
 all on TensorBoard and in the runtime health readout.
 
+## Relay adapters (`model/relay.py`)
+
+`RelayPatchwork` is a gated residual patch module over the signed address
+read: project into slots → reconstructive read against a learned codebook →
+squared-ReLU head, output layer zero-initialized (weight and bias) so a
+fresh module is exactly inert (y == x) until gradient earns it in.
+`RelayEMA` widens the same head with two fixed-decay causal EMAs of the
+module's own read (r = 1/16, 1/64); the added input columns start at zero,
+so at birth it equals the plain patchwork. Training uses an exact chunked
+closed-form scan; decode carries (F1, F2) state one position at a time.
+Ported from [amoe-lora](https://github.com/AbstractEyes/amoe-lora);
+validation record and trained weights:
+[mini-beatrix-2s](https://huggingface.co/AbstractPhil/mini-beatrix-2s),
+`arms/btx_e003`.
+
 ## Tests
 
 ```
 python -m geolip.alephllm.tests.smoke
 ```
 
-17 mechanical cases: address identities, exact null paths, chunked-scan
+35 mechanical cases: address identities, exact null paths, chunked-scan
 vs naive-oracle equivalence, causality, optimizer-split coverage,
-checkpoint/stream/manifest resume roundtrips, canary well-formedness,
-a live 8-step train loop.
+checkpoint/stream/manifest resume roundtrips, crash safety (divergence
+never overwrites resume state), multi-constellation hub equivalence,
+governor projection, special-token laws, head revival, relay birth /
+scan / decode parity, canary well-formedness, a live 8-step train loop.
 
-## Package layout
+## Package layout — every code piece, briefly
 
-```
-geolip/alephllm/
-  presets.py        mission ladder + train configs
-  model/            address · attention · bank · head · embedding · alephlm
-  data/             tokenizers · streams (HF columnar streaming, resumable)
-  train/            optim (Muon+Adam) · trainer · instruments · checkpoint · manifest
-  eval/canaries.py  clean-protocol in-context binding probes
-  tests/smoke.py    the full test array
-```
+`presets.py` — the mission ladder: model + train configs per craft,
+including the `*-control` twins.
+
+**model/**
+
+| file | what it is |
+|---|---|
+| `address.py` | `AlephAddress` — the closed-form signed address over 2K oriented half-axes; `signed` / `oriented` reads plus a codebook health census (drift, merging, effective rank, usage) |
+| `attention.py` | `CausalSDPA`, the workhorse block, and `CausalSplatHUB` — causal linear attention through the oriented address, an exact chunked scan with a fused fast path and a naive oracle for parity |
+| `bank.py` | `AnchoredBank` — the anchored FFN: always-on trunk + 3 dispatched experts, expert outputs zero-initialized (exact null path), no balance machinery |
+| `head.py` | `DualHead` — standard readout plus an aleph read whose weights are zero at birth (weight-zero, never gate-zero) |
+| `embedding.py` | `TrigramByteEmbedding` — composed byte embedding e_t = E0[x_t] + E1[x_{t-1}] + E2[x_{t-2}] + P[t], with a dedicated pad row; `TokenEmbedding` for BPE crafts |
+| `governor.py` | the anchor governor — a min-separation projection that relaxes crowded codebooks; exact identity when anchors have room |
+| `relay.py` | `RelayPatchwork` / `RelayEMA` — the relay adapters above |
+| `alephlm.py` | `AlephLM` — the full craft: embedding → pre-norm stack → `DualHead`, with cached prefill/step decode and per-mechanism toggle switches for ablation |
+
+**data/**
+
+| file | what it is |
+|---|---|
+| `tokenizers.py` | the byte tokenizer (vocab 256; trigram composition lives in the embedding) and an HF BPE wrapper |
+| `streams.py` | resumable packed streaming from HF hub datasets; stream state rides in checkpoints |
+| `curriculum.py` | staged training mixes S0–S8 with procedural generators, plus the epoch-cap and ballast audits that guard every mix |
+| `special_tokens.py` | control tokens placed in invalid-UTF-8 byte space (cannot collide with any real text), document packing, and the chat frame |
+
+**train/**
+
+| file | what it is |
+|---|---|
+| `optim.py` | the measured optimizer split: Muon (Newton-Schulz orthogonalized momentum) on 2D transport weights, pure Adam (wd 0, never AdamW) on the rest |
+| `trainer.py` | the resume-first training loop: pulls manifest + state from the hub, session caps, crash-safe checkpointing, structured health readouts |
+| `instruments.py` | the born-in gauge suite: effective-rank census, collapse detectors, sign census, gate trajectories, and the toggle ledger (per-mechanism causal contribution) |
+| `checkpoint.py` | bf16 checkpoints, fp8 shipping copies, resume state, and their HF uploads |
+| `manifest.py` | `RunManifest` — the run's state of record on the hub; pull → resume |
+| `probes.py` | stage probe batteries P0–P8, multiple-choice scored by byte-NLL of the option continuations |
+| `revival.py` | head revival — a boundary write that restores a buried aleph head's contribution without moving the loss |
+
+**eval/**
+
+| file | what it is |
+|---|---|
+| `canaries.py` | synthetic in-context binding probes, run against checkpoints throughout training |
+| `lexicon.py` | lexicon census — reads the learned vocabulary via two independent byte segmentations (surprisal boundaries vs address-switch boundaries) and scores their agreement |
+| `tokenbridge.py` | byte-level token translation matrix for comparing against foreign tokenizers |
+| `exams/*.jsonl` | the 270-item surface-disjoint exam battery (9 suites, difficulty tiers + holdouts) |
+
+**bridges & conditioning**
+
+| file | what it is |
+|---|---|
+| `amoe_bridge.py` | attach/train amoe-lora arms on a locked core: byte chat rows, provenance-stamped anchors, exact-prefix masking |
+| `chat_sft.py` | the first chat-conditioning recipe — produces a detachable chat arm from a locked core |
+
+`tests/smoke.py` — the full 35-case test array above.
 
 
 **Technical companion:** [TECHNICAL.md](TECHNICAL.md) — architecture, training semantics, instruments, and the Beatrix-era numbers spine.
