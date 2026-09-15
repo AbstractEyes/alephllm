@@ -12,6 +12,7 @@ import tempfile
 import traceback
 
 import torch
+import torch.nn as nn
 
 from ..presets import AlephLMConfig, get_preset, PRESETS
 from ..model.address import AlephAddress, dtype_floor
@@ -777,6 +778,84 @@ def t_head_revival():
     assert m.head.proj.weight.grad is None
     assert m.head.addr.codebook.grad is None
     assert m.head.w_s.weight.grad is not None
+
+@case("relay: strict null path at birth + EMA birth parity == organ")
+def t_relay_birth():
+    from ..model.relay import RelayPatchwork, RelayEMA, RelaySpec
+    torch.manual_seed(5)
+    sp = RelaySpec(n_slots=8, K=16, D=4, hidden=32)
+    organ = RelayPatchwork(48, sp)
+    x = torch.randn(2, 20, 48)
+    assert torch.equal(organ(x), x), "zero head weight+bias must be bit-inert"
+    ema = RelayEMA(48, sp)
+    assert torch.equal(ema(x), x), "EMA form inherits the null path"
+    # shared-weight parity with a LIVE head: widen a trained-looking organ
+    with torch.no_grad():
+        nn.init.orthogonal_(organ.consume[-1].weight)
+        organ.consume[-1].bias.normal_()
+        organ.gate.fill_(0.5)
+    ema2 = RelayEMA.from_organ(organ)
+    d = (ema2(x) - organ(x)).abs().max().item()
+    assert d < 1e-5, f"birth parity vs organ: {d} (fp reorder only)"
+
+
+@case("relay: chunked closed-form EMA == naive recurrence")
+def t_relay_ema_scan():
+    from ..model.relay import ema_chunked
+    torch.manual_seed(6)
+    f = torch.randn(3, 70, 12)
+    s0 = torch.randn(3, 12)
+    for rho in (1 / 16, 1 / 64):
+        F_c, s_c = ema_chunked(f, rho, s0, chunk=32)
+        s = s0.clone()
+        outs = []
+        for t in range(70):
+            s = (1 - rho) * s + rho * f[:, t]
+            outs.append(s.clone())
+        F_n = torch.stack(outs, dim=1)
+        d = (F_c - F_n).abs().max().item()
+        assert d < 1e-5, f"rho {rho}: chunked vs loop {d}"
+        assert torch.allclose(s_c, F_n[:, -1], atol=1e-5)
+
+
+@case("relay: one-step decode with carried state == full-sequence scan")
+def t_relay_decode():
+    from ..model.relay import RelayEMA, RelaySpec
+    torch.manual_seed(7)
+    ema = RelayEMA(48, RelaySpec(n_slots=8, K=16, D=4, hidden=32))
+    with torch.no_grad():
+        nn.init.orthogonal_(ema.consume[-1].weight)
+        ema.consume[0].weight.normal_(std=0.05)
+        ema.gate.fill_(0.5)
+    x = torch.randn(2, 24, 48)
+    y_full, _ = ema.run(x, None)
+    y_pre, st = ema.run(x[:, :16], None)          # prefill
+    steps = []
+    for t in range(16, 24):                        # cached decode, 1 pos/call
+        y_t, st = ema.run(x[:, t:t + 1], st)
+        steps.append(y_t)
+    y_inc = torch.cat([y_pre] + steps, dim=1)
+    d = (y_full - y_inc).abs().max().item()
+    assert d < 1e-5, f"incremental vs full: {d}"
+
+
+@case("relay: composed read == direct sinh/cosh reconstruction")
+def t_relay_mhat():
+    from ..model.relay import RelayPatchwork, RelaySpec
+    torch.manual_seed(8)
+    organ = RelayPatchwork(48, RelaySpec(n_slots=8, K=16, D=4, hidden=32))
+    x = torch.randn(2, 10, 48)
+    got = organ.feats(x)
+    import torch.nn.functional as Fn
+    slots = organ.proj(x).view(2, 10, 8, 4)
+    A = Fn.normalize(organ.addr.codebook, dim=-1)
+    u = (Fn.normalize(slots, dim=-1) @ A.transpose(-1, -2)) / organ.addr.tau
+    m = u.abs().amax(dim=-1, keepdim=True)
+    ep, en = torch.exp(u - m), torch.exp(-u - m)
+    ref = (((ep - en) @ A) / (ep + en).sum(-1, keepdim=True)).reshape(2, 10, -1)
+    d = (got - ref).abs().max().item()
+    assert d < 1e-6, f"signed@A vs m_hat closed form: {d}"
+
 
 def main():
     passed = failed = 0
