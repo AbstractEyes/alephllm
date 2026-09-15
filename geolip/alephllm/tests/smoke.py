@@ -779,24 +779,24 @@ def t_head_revival():
     assert m.head.addr.codebook.grad is None
     assert m.head.w_s.weight.grad is not None
 
-@case("relay: strict null path at birth + EMA birth parity == organ")
+@case("relay: exact zero write at birth + EMA birth parity == patchwork")
 def t_relay_birth():
     from ..model.relay import RelayPatchwork, RelayEMA, RelaySpec
     torch.manual_seed(5)
     sp = RelaySpec(n_slots=8, K=16, D=4, hidden=32)
-    organ = RelayPatchwork(48, sp)
+    base = RelayPatchwork(48, sp)
     x = torch.randn(2, 20, 48)
-    assert torch.equal(organ(x), x), "zero head weight+bias must be bit-inert"
+    assert torch.equal(base(x), x), "zero head weight+bias must be exactly inert"
     ema = RelayEMA(48, sp)
-    assert torch.equal(ema(x), x), "EMA form inherits the null path"
-    # shared-weight parity with a LIVE head: widen a trained-looking organ
+    assert torch.equal(ema(x), x), "EMA form inherits the inert birth"
+    # shared-weight parity with a LIVE head: widen a trained-looking patchwork
     with torch.no_grad():
-        nn.init.orthogonal_(organ.consume[-1].weight)
-        organ.consume[-1].bias.normal_()
-        organ.gate.fill_(0.5)
-    ema2 = RelayEMA.from_organ(organ)
-    d = (ema2(x) - organ(x)).abs().max().item()
-    assert d < 1e-5, f"birth parity vs organ: {d} (fp reorder only)"
+        nn.init.orthogonal_(base.consume[-1].weight)
+        base.consume[-1].bias.normal_()
+        base.gate.fill_(0.5)
+    ema2 = RelayEMA.from_patchwork(base)
+    d = (ema2(x) - base(x)).abs().max().item()
+    assert d < 1e-5, f"birth parity vs patchwork: {d} (fp reorder only)"
 
 
 @case("relay: chunked closed-form EMA == naive recurrence")
@@ -843,13 +843,13 @@ def t_relay_decode():
 def t_relay_mhat():
     from ..model.relay import RelayPatchwork, RelaySpec
     torch.manual_seed(8)
-    organ = RelayPatchwork(48, RelaySpec(n_slots=8, K=16, D=4, hidden=32))
+    rp = RelayPatchwork(48, RelaySpec(n_slots=8, K=16, D=4, hidden=32))
     x = torch.randn(2, 10, 48)
-    got = organ.feats(x)
+    got = rp.feats(x)
     import torch.nn.functional as Fn
-    slots = organ.proj(x).view(2, 10, 8, 4)
-    A = Fn.normalize(organ.addr.codebook, dim=-1)
-    u = (Fn.normalize(slots, dim=-1) @ A.transpose(-1, -2)) / organ.addr.tau
+    slots = rp.proj(x).view(2, 10, 8, 4)
+    A = Fn.normalize(rp.addr.codebook, dim=-1)
+    u = (Fn.normalize(slots, dim=-1) @ A.transpose(-1, -2)) / rp.addr.tau
     m = u.abs().amax(dim=-1, keepdim=True)
     ep, en = torch.exp(u - m), torch.exp(-u - m)
     ref = (((ep - en) @ A) / (ep + en).sum(-1, keepdim=True)).reshape(2, 10, -1)

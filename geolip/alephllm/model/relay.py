@@ -1,7 +1,8 @@
-"""RelayPatchwork + RelayEMA — the relay organ and its causal-EMA memory taps.
+"""RelayPatchwork + RelayEMA — a gated residual patch module over a signed
+address read, and a variant with causal-EMA memory taps.
 
-The organ is the certified residual patchwork (amoe-lora's arm geometry,
-brought here as a native model component):
+RelayPatchwork (ported from the amoe-lora adapter of the same name,
+github.com/AbstractEyes/amoe-lora, as a native model component):
 
     slots_t = proj(x_t)                      (B, n, n_slots, D)  orthogonal, no bias
     f_t     = m_hat(slots_t) flattened       the reconstructive signed read
@@ -10,30 +11,25 @@ brought here as a native model component):
     y_t     = x_t + sigmoid(gate) * consume(f_t)
 
 consume = Linear(nD -> hidden), ReLU^2, LayerNorm, Linear(hidden -> d) with the
-output layer zero-initialized (weight AND bias — the strict C6 null path: a
-fresh organ is bit-inert, y == x exactly). Gate initialized -3. Reconstructive,
-never comparative: no softmax-over-choices, no argmax, no top-k.
+output layer zero-initialized (weight AND bias), so a fresh module is exactly
+inert: y == x. Gate initialized -3. Reconstructive, never comparative: no
+softmax-over-choices, no argmax, no top-k.
 
-RelayEMA adds ONE mechanism: two fixed-decay causal EMAs of the organ's own
-read, fed to the head through input columns that are ZERO at birth —
+RelayEMA adds one mechanism: two fixed-decay causal EMAs of the module's own
+read, fed to the head through input columns that start at zero —
 
     F1_t = (1 - r1) F1_{t-1} + r1 f_t        r1 = 1/16
     F2_t = (1 - r2) F2_{t-1} + r2 f_t        r2 = 1/64
     y_t  = x_t + sigmoid(gate) * consume(cat(f_t, F1_t, F2_t))
 
-so at birth RelayEMA's forward EQUALS the memory-free organ. Training uses the
-chunked closed-form scan (ema_chunked, renormalized so q^-t never overflows);
-decode carries (F1, F2) state and updates one step at a time — exact, because
+so at birth RelayEMA's forward equals the memory-free RelayPatchwork. Training
+uses the chunked closed-form scan (ema_chunked, renormalized so q^-t never
+overflows); decode carries (F1, F2) state one step at a time — exact, because
 the head is position-wise.
 
-The record (canon btx_e003, E-G2 2026-09-14, on frozen mini-beatrix-2s):
-the memory-free organ form, trained answer-only with the rule-order shortcut
-blocked in the data, internalized a 5-step rule chain — .527 as-is / .553
-rules-shuffled on out-of-vocabulary words (order-invariant; heuristic ceiling
-~.2), 1.000 in-vocabulary. The EMA taps added nothing measurable on that task
-(.527/.587). Packaged with the taps because they are free at birth and the
-accumulator is the certified form. Default geometry below is the validated
-wide arm (n_slots 32, K 64, D 4, hidden 256 at d 1024: 428k params/site).
+Defaults are the validated geometry (n_slots 32, K 64, D 4, hidden 256; ~428k
+params at d = 1024). Validation record and trained weights:
+huggingface.co/AbstractPhil/mini-beatrix-2s, arms/btx_e003.
 """
 from __future__ import annotations
 
@@ -92,8 +88,8 @@ def _feats(m, x: torch.Tensor) -> torch.Tensor:
 
 
 class RelayPatchwork(nn.Module):
-    """The memory-free relay organ: proj -> reconstructive aleph read ->
-    zero-born squared-ReLU patch head, residual write behind a sigmoid gate."""
+    """The memory-free form: proj -> reconstructive address read ->
+    zero-initialized squared-ReLU head, residual write behind a sigmoid gate."""
 
     def __init__(self, d: int, spec: RelaySpec | None = None):
         super().__init__()
@@ -120,35 +116,36 @@ class RelayPatchwork(nn.Module):
 
 
 class RelayEMA(nn.Module):
-    """The organ plus zero-born EMA memory taps. Built by widening an organ's
-    head to 3nD input columns, the added columns zeroed — at birth the forward
-    equals the organ it came from (shared weights)."""
+    """RelayPatchwork plus the EMA memory taps. Built by widening a patchwork's
+    head to 3nD input columns with the added columns zeroed, so at birth the
+    forward equals the patchwork it came from (shared weights)."""
 
     def __init__(self, d: int, spec: RelaySpec | None = None):
         super().__init__()
         self._widen(RelayPatchwork(d, spec))
 
     @classmethod
-    def from_organ(cls, organ: RelayPatchwork) -> "RelayEMA":
-        """Upgrade a (possibly trained) organ in place: shares proj/addr/gate
-        and the head tail, widens the head's first layer with zeroed columns."""
+    def from_patchwork(cls, base: RelayPatchwork) -> "RelayEMA":
+        """Upgrade a (possibly trained) RelayPatchwork in place: shares its
+        proj/addr/gate and head tail, widens the head's first layer with
+        zeroed columns."""
         self = cls.__new__(cls)
         nn.Module.__init__(self)
-        self._widen(organ)
+        self._widen(base)
         return self
 
-    def _widen(self, organ: RelayPatchwork):
-        self.spec = organ.spec
-        self.nD = organ.nD
-        self.proj, self.addr, self.gate = organ.proj, organ.addr, organ.gate
-        self.n_slots = organ.n_slots
-        wide = nn.Linear(3 * self.nD, organ.spec.hidden)
+    def _widen(self, base: RelayPatchwork):
+        self.spec = base.spec
+        self.nD = base.nD
+        self.proj, self.addr, self.gate = base.proj, base.addr, base.gate
+        self.n_slots = base.n_slots
+        wide = nn.Linear(3 * self.nD, base.spec.hidden)
         with torch.no_grad():
-            wide.weight[:, :self.nD] = organ.consume[0].weight
+            wide.weight[:, :self.nD] = base.consume[0].weight
             wide.weight[:, self.nD:] = 0.0
-            wide.bias.copy_(organ.consume[0].bias)
+            wide.bias.copy_(base.consume[0].bias)
         self.consume = nn.Sequential(
-            wide, organ.consume[1], organ.consume[2], organ.consume[3])
+            wide, base.consume[1], base.consume[2], base.consume[3])
 
     def feats(self, x: torch.Tensor) -> torch.Tensor:
         return _feats(self, x)
