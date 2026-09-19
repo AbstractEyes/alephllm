@@ -31,8 +31,9 @@ from ..presets import AlephLMConfig
 from .attention import CausalSDPA, CausalSplatHUB
 from .bank import AnchoredBank
 from .embedding import TrigramByteEmbedding, TokenEmbedding
-from .fusion import Fusion, cat_caches, zero_cache_rows, snapshot, restore_rows
 from .head import DualHead
+# model/fusion.py is imported lazily (only when a config asks for fusion),
+# so a vendored copy of this file without it keeps loading unfused crafts.
 
 
 class Block(nn.Module):
@@ -99,7 +100,11 @@ class AlephLM(nn.Module):
         # resolution trunk verbatim; otherwise the middle blocks run over
         # units and the front/back blocks stay at byte resolution.
         spec = getattr(cfg, "fusion", None)
-        self.fusion = Fusion(spec, cfg.d_model) if spec else None
+        if spec:
+            from .fusion import Fusion
+            self.fusion = Fusion(spec, cfg.d_model)
+        else:
+            self.fusion = None
         if self.fusion is not None:
             assert self.fusion.k_lo + self.fusion.k_hi <= cfg.n_layers, \
                 "fusion: k_lo + k_hi must not exceed n_layers"
@@ -214,6 +219,7 @@ class AlephLM(nn.Module):
         across rows (the hub's prefix state has one shape per row)."""
         from .embedding import PAD_ROW
         from .governor import raw_block
+        from .fusion import cat_caches, zero_cache_rows
         front, middle, back = self._ranges()
         for b in middle:
             assert raw_block(b).is_hub, "fused decode needs hub blocks in the middle"
@@ -259,6 +265,7 @@ class AlephLM(nn.Module):
     @torch.no_grad()
     def _decode_step_fused(self, next_id, cache, t):
         from .embedding import PAD_ROW
+        from .fusion import snapshot, restore_rows
         front, middle, back = self._ranges()
         prev1, prev2, prev3 = cache["prev1"], cache["prev2"], cache["prev3"]
         st = self.fusion.starts_step(next_id, prev1, prev2, prev3, PAD_ROW)   # (B,) closes the open unit
