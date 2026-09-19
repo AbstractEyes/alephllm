@@ -195,11 +195,17 @@ class PackedStream:
 
     def __init__(self, dataset: str, tokenizer, context: int,
                  micro_batch: int, seed: int = 1337,
-                 shuffle_buffer: int = 10_000, role: str = "train"):
+                 shuffle_buffer: int = 10_000, role: str = "train",
+                 shard: tuple | None = None):
+        """shard (multi-card): (rank, world_size) — a training stream on
+        rank r yields only its 1/world slice of the corpus (disjoint rows
+        across ranks, so a finite corpus's epoch count stays what the
+        recipe planned); val streams are never sharded (one card gauges)."""
         if dataset not in REGISTRY:
             raise KeyError(f"unknown dataset '{dataset}' — have {sorted(REGISTRY)}")
         assert role in ("train", "val")
         self.dataset, self.tokenizer, self.role = dataset, tokenizer, role
+        self.shard = tuple(shard) if shard and int(shard[1]) > 1 and role == "train" else None
         # 0.8.0 specials: byte crafts get a DOC boundary token appended
         # after every document, every phase, from birth. The gate is
         # TOKENIZER IDENTITY (name == 'byte-trigram'), not the vocab-256
@@ -252,7 +258,9 @@ class PackedStream:
         if spec["path"] is None:
             gen = _GENERATORS.get(spec.get("generator"), _synthetic_rows)
             self._ds = None
-            self._it = gen(self.seed + self.epoch)
+            # an owned generator is infinite: ranks draw disjoint streams by seed
+            self._it = gen(self.seed + self.epoch
+                           + (1_000_003 * self.shard[0] if self.shard else 0))
             for _ in range(self._skip_rows):
                 next(self._it)
             self._skip_rows = 0
@@ -289,6 +297,13 @@ class PackedStream:
                     next(self._it, None)
                 self._skip_rows = 0
             return
+        if self.shard is not None:
+            # multi-card: this rank's disjoint 1/world slice (whole shards
+            # when the file count divides, else every world-th row), BEFORE
+            # the shuffle so each rank shuffles its own slice
+            from datasets.distributed import split_dataset_by_node
+            ds = split_dataset_by_node(ds, rank=int(self.shard[0]),
+                                       world_size=int(self.shard[1]))
         ds = ds.shuffle(seed=self.seed + self.epoch,
                         buffer_size=self.shuffle_buffer)
         if self._pending_ds_state is not None and hasattr(ds, "load_state_dict"):
@@ -379,14 +394,14 @@ class MixStream:
     (state = draw counter + every component's state)."""
 
     def __init__(self, tokenizer, context: int, micro_batch: int,
-                 seed: int = 1337, recipe=None):
+                 seed: int = 1337, recipe=None, shard: tuple | None = None):
         self.dataset = "anneal-mix"
         self.recipe = list(recipe or ANNEAL_MIX)
         self._names = [n for n, _ in self.recipe]
         total = sum(w for _, w in self.recipe)
         self._weights = [w / total for _, w in self.recipe]
         self._streams = {n: PackedStream(n, tokenizer, context, micro_batch,
-                                         seed=seed + 101 * i)
+                                         seed=seed + 101 * i, shard=shard)
                          for i, (n, _) in enumerate(self.recipe)}
         self._seed = seed
         self._draws = 0
@@ -437,7 +452,10 @@ class MixStream:
 
 
 def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
-                 seed: int = 1337, role: str = "train"):
+                 seed: int = 1337, role: str = "train",
+                 shard: tuple | None = None):
+    """shard (multi-card): (rank, world_size) for a training stream —
+    every rank reads a disjoint slice; ignored for val streams."""
     if dataset in ("anneal-mix", "anneal-nochat"):
         if role == "val":   # gauge continuity: anneal val = fineweb holdout
             return PackedStream("fineweb-edu", tokenizer, context,
@@ -450,7 +468,8 @@ def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
             # anneal phase crashed at construction (audit catch).
             recipe = [(("beatrix-texture" if n == "beatrix-texture-sp"
                         else n), w) for n, w in recipe]
-        ms = MixStream(tokenizer, context, micro_batch, seed, recipe=recipe)
+        ms = MixStream(tokenizer, context, micro_batch, seed, recipe=recipe,
+                       shard=shard)
         ms.dataset = dataset
         return ms
     if dataset in CURRICULUM_MIXES:
@@ -458,8 +477,8 @@ def build_stream(dataset: str, tokenizer, context: int, micro_batch: int,
             return PackedStream("fineweb-edu", tokenizer, context,   # same
                                 micro_batch, seed, role="val")       # holdout
         ms = MixStream(tokenizer, context, micro_batch, seed,
-                       recipe=CURRICULUM_MIXES[dataset])
+                       recipe=CURRICULUM_MIXES[dataset], shard=shard)
         ms.dataset = dataset
         return ms
     return PackedStream(dataset, tokenizer, context, micro_batch, seed,
-                        role=role)
+                        role=role, shard=shard)

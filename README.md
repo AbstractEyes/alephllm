@@ -83,6 +83,27 @@ a push probe, the boundary-exact session driver (reports, arm anchors,
 clean halts), samples, the anneal watch and the growth table. `LOCAL = True`
 runs the whole notebook on a CPU toy craft.
 
+### Multi-card (data-parallel, one machine)
+
+The same session driver runs on several cards through `torchrun`; the
+notebook's decision block becomes a JSON file:
+
+```
+ALEPHLLM_MISSION_CONFIG=v3.json torchrun --standalone --nproc_per_node=2 -m geolip.alephllm.train.mission
+```
+
+Every rank builds the same craft, reads a disjoint slice of every stream
+(so a finite corpus keeps the epoch count the recipe planned), and the
+gradients — trunk and arms — are averaged across ranks before the clip and
+the optimizer steps; the step is the GLOBAL batch (`micro_batch x
+grad_accum x cards x context` must equal the recipe's tokens per step),
+so the schedule and every settled number carry over unchanged. Rank 0
+owns the record (checkpoints, manifest, reports, uploads); a checkpoint
+carries every rank's stream position, a same-world resume continues each
+slice exactly, and the parameters are re-broadcast from rank 0 at every
+checkpoint and boundary write. A two-rank run reproduces a single-card run
+bit for bit when both ranks read the same data (the parity smoke below).
+
 ## Instrumentation (born-in, no exceptions)
 
 Effective-rank census (hidden states per layer, consumed address per hub,
@@ -131,7 +152,22 @@ no middle, forced starts, causality, cached decode against the parallel
 path for rows with different unit structures, the entropy and hybrid rules
 over an atlas table, gradients reaching the null vector and the middle).
 The stage-arm case needs the `amoe` package with its `alephlm` binding on
-the path (the repo source, not a stale installed copy).
+the path (the repo source, not a stale installed copy). To run the suite
+off-card on a CUDA build, hide the card with `CUDA_VISIBLE_DEVICES=-1`
+(an empty value makes torch report a card that the runtime cannot open).
+
+The multi-card path has its own smoke (CPU over gloo, or cards over nccl):
+
+```
+python -m geolip.alephllm.tests.smoke_multicard parity            # the single-process reference hash
+torchrun --standalone --nproc_per_node=2 -m geolip.alephllm.tests.smoke_multicard parity   # must print the same hash
+torchrun --standalone --nproc_per_node=2 -m geolip.alephllm.tests.smoke_multicard full     # boundaries, arm attach, resume
+```
+
+(`ALEPHLLM_SMOKE_CPU=1 ALEPHLLM_DIST_BACKEND=gloo` for a CPU run; on
+Windows launch the ranks by hand with `MASTER_ADDR/MASTER_PORT/RANK/
+WORLD_SIZE` and `USE_LIBUV=0`, since torchrun's rendezvous ignores the
+libuv switch there.)
 
 ## Package layout — every code piece, briefly
 
@@ -168,7 +204,9 @@ the two-phase anneal planned from birth.
 | file | what it is |
 |---|---|
 | `optim.py` | the measured optimizer split: Muon (Newton-Schulz orthogonalized momentum) on 2D transport weights, pure Adam (wd 0, never AdamW) on the rest |
-| `trainer.py` | the resume-first training loop: pulls manifest + state from the hub, session caps, crash-safe checkpointing, structured health readouts; per-phase LR multipliers, the guard core and the stage-arm program ride in the same step; a data-plane fingerprint is asserted on resume |
+| `trainer.py` | the resume-first training loop: pulls manifest + state from the hub, session caps, crash-safe checkpointing, structured health readouts; per-phase LR multipliers, the guard core and the stage-arm program ride in the same step; a data-plane fingerprint is asserted on resume; multi-card (0.10.0): per-rank stream shards, gradients averaged across ranks before the clip, agreed stop decisions, rank-0 record, per-rank stream positions in every checkpoint |
+| `mission.py` | the session driver as a module (the notebook's decision block, preset, guard core, push probe and boundary loop) for `torchrun` on one or many cards; configuration by JSON, no argparse |
+| `precision.py` | one autocast policy: bf16 on a card, no autocast context off it (a disabled CUDA autocast still queries the card) |
 | `guards.py` | the red-flag guard core: three in-run evaluators (norm surge, dispatch-entropy collapse, rank collapse) over a pinned reference window, per-guard modes (halt / watch / off) filled from a certification ledger; a halt archives the position under its own name and the run refuses to continue until cleared |
 | `arms.py` | the stage-arm program: fresh relay arms attached per curriculum stage (bias-zeroed, inert at birth), trained under one pure-Adam group beside the trunk with a per-member abstention term on off-domain rows; masked-detachability gauges, anchors, resume, and member disabling on a fault |
 | `instruments.py` | the born-in gauge suite: effective-rank census, collapse detectors, sign census, gate trajectories, and the toggle ledger (per-mechanism causal contribution) |
@@ -193,7 +231,7 @@ the two-phase anneal planned from birth.
 | `amoe_bridge.py` | attach/train amoe-lora arms on a locked core: byte chat rows, provenance-stamped anchors, exact-prefix masking |
 | `chat_sft.py` | the first chat-conditioning recipe — produces a detachable chat arm from a locked core |
 
-`tests/smoke.py` — the full 40-case test array above.
+`tests/smoke.py` — the full 47-case test array above; `tests/smoke_multicard.py` — the multi-card parity and full-path smokes.
 
 
 **Technical companion:** [TECHNICAL.md](TECHNICAL.md) — architecture, training semantics, instruments, and the Beatrix-era numbers spine.

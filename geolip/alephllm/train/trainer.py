@@ -35,6 +35,7 @@ from .manifest import RunManifest
 from .optim import build_optimizers, apply_lr
 from .guards import GuardConfig, GuardCore
 from .arms import trunk_state_dict
+from .precision import autocast
 
 
 def _emit(bar, text: str):
@@ -51,6 +52,23 @@ def _emit(bar, text: str):
         print(text)
 
 
+def _dist_env():
+    """(rank, world_size, local_rank) from the torchrun environment;
+    (0, 1, 0) for a single-card run."""
+    return (int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)),
+            int(os.environ.get("LOCAL_RANK", 0)))
+
+
+class _Null:
+    """A silent stand-in for the writer and the hub on non-main ranks of a
+    multi-card run: every method is a no-op returning None. The main rank
+    owns the record (checkpoints, manifest, tensorboard, uploads); the
+    other cards only compute."""
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
 class Trainer:
     def __init__(self, preset: Preset | str, hf_token: str | None = None,
                  out_dir: str = "./alephllm_runs", device: str | None = None,
@@ -64,6 +82,28 @@ class Trainer:
             preset = get_preset(preset)
         self.preset, self.cfg, self.tc = preset, preset.model, preset.train
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # MULTI-CARD (data-parallel, torchrun): every rank builds the same
+        # craft, trains on its own disjoint slice of every stream, and the
+        # gradients are averaged across ranks before the optimizers step —
+        # the recipe's tokens/step is the GLOBAL batch (per-rank micro
+        # batches x accumulation x world). Rank 0 owns the record; the
+        # other ranks compute. Same-machine cards only (one node).
+        self.rank, self.world, self.local_rank = _dist_env()
+        self.is_main = self.rank == 0
+        if self.world > 1:
+            import datetime
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                # a boundary report on the main rank (probes, gauges, uploads)
+                # can take minutes while the other ranks wait at the next
+                # collective — the default 30-minute timeout is kept generous
+                backend = os.environ.get("ALEPHLLM_DIST_BACKEND") or \
+                    ("nccl" if (torch.cuda.is_available() and self.device == "cuda") else "gloo")
+                dist.init_process_group(backend, timeout=datetime.timedelta(hours=3))
+            if torch.cuda.is_available() and self.device == "cuda":
+                torch.cuda.set_device(self.local_rank)     # "cuda" = this rank's card
+            print(f"[dist] rank {self.rank}/{self.world} on {self.device}"
+                  f"{f':{self.local_rank}' if self.device == 'cuda' else ''}", flush=True)
         self.out_dir = os.path.join(out_dir, self.cfg.name)
         os.makedirs(self.out_dir, exist_ok=True)
         # curriculum-stage phases need the stage registry + the preset's
@@ -108,17 +148,23 @@ class Trainer:
         # abstention-chunk graph boundary read this list, never the model's
         # live parameter set (which grows as arms attach)
         self._trunk_params = list(self.raw_model.parameters())
-        self.guard = GuardCore(guard, self.cfg.n_layers) if guard else None
+        # the guard core lives on the main rank (its census is one card's
+        # read; a halt is broadcast to every rank each step)
+        self.guard = GuardCore(guard, self.cfg.n_layers) if (guard and self.is_main) else None
         self.arms = arms.bind(self) if arms is not None else None
         self._guard_halt = None
 
-        self.hub = HubSync(preset.hf_repo, preset.prefix, hf_token,
-                           self.out_dir)
+        self.hub = (HubSync(preset.hf_repo, preset.prefix, hf_token, self.out_dir)
+                    if self.is_main else _Null())
         self.manifest = None
         self.stream = None
         self.step = 0
         self._ckpt_count = 0
+        self._payload = None
+        self._stream_ranks = None
         self._resumed = self._restore() if resume else False
+        if self.world > 1:
+            self._sync_from_main()        # every rank at the main rank's position
         # compile AFTER restore; raw_model stays the checkpoint identity —
         # all saves/loads go through it so resume works with compile on
         self.model = (torch.compile(self.raw_model) if self.tc.compile
@@ -131,7 +177,7 @@ class Trainer:
         else:
             self._check_data_plane()
         tb_dir = os.path.join(self.out_dir, "runs")
-        self.writer = SummaryWriter(tb_dir)
+        self.writer = SummaryWriter(tb_dir) if self.is_main else _Null()
         self.tb_dir = tb_dir
         self._val_batches = None
         self._val_dataset = None
@@ -151,6 +197,14 @@ class Trainer:
                     "pass resume=False EXPLICITLY to abandon the old run.")
             self.manifest = man
             return False
+        self._payload = payload           # kept for the multi-card sync
+        self._apply_payload(payload, man)
+        return True
+
+    def _apply_payload(self, payload: dict, man=None):
+        """Take a resume payload's state: weights, optimizer states, step,
+        the manifest snapshot, the stream position (this rank's, in a
+        multi-card payload), arms, guard, RNG."""
         self.raw_model.load_state_dict(payload["model"])
         for opt, st in zip(self.optimizers, payload["optimizers"]):
             try:
@@ -175,6 +229,20 @@ class Trainer:
         if man is not None and getattr(man, "halt", None):
             self.manifest.halt = dict(man.halt)
         self._stream_state = payload.get("stream")
+        ranks = payload.get("stream_ranks")
+        if self.world > 1:
+            # a multi-card payload carries every rank's stream position;
+            # the same world size resumes each rank's own slice exactly,
+            # a different one restarts the slices (a data-order
+            # discontinuity, recorded — the recipe's tokens are unchanged)
+            if ranks and len(ranks) == self.world:
+                self._stream_state = ranks[self.rank]
+            else:
+                self._stream_state = None
+                if self.is_main:
+                    self.manifest.note(f"multi-card resume with world {self.world} over a payload "
+                                       f"with {len(ranks) if ranks else 0} rank streams: the per-rank "
+                                       "stream slices restart (data-order discontinuity)")
         if self.arms is not None and payload.get("arms"):
             self.arms.load_state_dict(payload["arms"])
         if self.guard is not None and payload.get("guard"):
@@ -196,7 +264,85 @@ class Trainer:
                   f"{h.get('step'):,} in '{h.get('phase')}' (archive "
                   f"{h.get('archive')}) — train() refuses until "
                   "resume_after_halt=True")
-        return True
+
+    # ---------------------------------------------------------- multi-card
+    def _sync_from_main(self):
+        """Every rank takes the main rank's restored payload (or, on a fresh
+        run, nothing) and then the main rank's parameters tensor by tensor,
+        so all cards start from ONE position. Called once at construction."""
+        import torch.distributed as dist
+        obj = [self._payload if self.is_main else None]
+        dist.broadcast_object_list(obj, src=0)
+        if not self.is_main and obj[0] is not None:
+            self._apply_payload(obj[0])
+        self._payload = None
+        dist.barrier()
+        self._broadcast_params()
+
+    def _broadcast_params(self):
+        """Main rank -> every rank, every parameter (the arms' included):
+        the bound on any cross-card drift, applied at construction, after
+        every boundary write and at every checkpoint."""
+        if self.world <= 1:
+            return
+        import torch.distributed as dist
+        with torch.no_grad():
+            for p in self.raw_model.parameters():
+                dist.broadcast(p.data, src=0)
+            for b in self.raw_model.buffers():
+                if b.dtype.is_floating_point:
+                    dist.broadcast(b.data, src=0)
+
+    def _allreduce_grads(self):
+        """Average every present gradient across ranks (trunk and arms), in
+        flat buckets of <= 128 MB, before the clip and the optimizer steps.
+        Manual rather than a DDP wrapper: the abstention chunks and the
+        boundary arm attach then need no special casing."""
+        if self.world <= 1:
+            return
+        import torch.distributed as dist
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+        grads = [p.grad for p in self.raw_model.parameters() if p.grad is not None]
+        by_dtype = {}
+        for g in grads:
+            by_dtype.setdefault(g.dtype, []).append(g)
+        limit = 128 * 2**20
+        for dt, gs in by_dtype.items():
+            bucket, size = [], 0
+            for g in gs + [None]:
+                if g is None or (size + g.numel() * g.element_size() > limit and bucket):
+                    if bucket:
+                        flat = _flatten_dense_tensors(bucket)
+                        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                        flat.div_(self.world)
+                        for b, u in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
+                            b.copy_(u)
+                    bucket, size = [], 0
+                if g is not None:
+                    bucket.append(g)
+                    size += g.numel() * g.element_size()
+
+    def _agree(self, flag: bool, how: str = "any") -> bool:
+        """One decision for every rank: 'any' (a halt / a cap on the main
+        rank stops all) or 'all' (every rank finite)."""
+        if self.world <= 1:
+            return bool(flag)
+        import torch.distributed as dist
+        t = torch.tensor([1 if flag else 0], device=self.device if self.device == "cuda" else "cpu")
+        dist.all_reduce(t, op=dist.ReduceOp.MAX if how == "any" else dist.ReduceOp.MIN)
+        return bool(int(t.item()))
+
+    def _gather_stream_states(self):
+        """Every rank's stream position (a multi-card checkpoint carries all
+        of them so a same-world resume continues each slice exactly)."""
+        if self.world <= 1 or self.stream is None:
+            return None
+        import torch.distributed as dist
+        mine = {"dataset": self.stream.dataset, "state": self.stream.state_dict(),
+                "phase": (self.manifest.current_phase() or {}).get("name")}
+        out = [None] * self.world
+        dist.all_gather_object(out, mine)
+        return out
 
     def _check_data_plane(self):
         """The recipe-fingerprint law: a resumed run continues on the data
@@ -235,9 +381,14 @@ class Trainer:
         if ph is None:
             return None
         if self.stream is None or self.stream.dataset != ph["dataset"]:
+            # ALEPHLLM_NOSHARD=1 (tests only): every rank reads the same
+            # stream, so a multi-card run must reproduce the single-card
+            # weights bit for bit (the step-parity smoke)
+            shard = ((self.rank, self.world) if self.world > 1
+                     and os.environ.get("ALEPHLLM_NOSHARD") != "1" else None)
             self.stream = build_stream(ph["dataset"], self.tokenizer,
                                        self.cfg.context, self.tc.micro_batch,
-                                       seed=self._phase_seed(ph))
+                                       seed=self._phase_seed(ph), shard=shard)
             st = getattr(self, "_stream_state", None)
             if st and st.get("dataset") == ph["dataset"]:
                 self.stream.load_state_dict(st["state"])
@@ -284,17 +435,20 @@ class Trainer:
             self.manifest.halt = None
             print(f"[train] halt {h.get('guard')}@{h.get('step'):,} cleared — "
                   f"continuing from step {self.step:,}")
-        tokens_per_step = tc.micro_batch * tc.grad_accum * self.cfg.context
+        # the GLOBAL batch: per-rank micro batches x accumulation x cards
+        tokens_per_step = tc.micro_batch * tc.grad_accum * self.cfg.context * self.world
         t0 = time.time()
         start_step = self.step
         start_tokens = self.manifest.tokens_seen
-        print(self.manifest.summary())
+        if self.is_main:
+            print(self.manifest.summary())
         phase = self._open_stream()
         if phase is None:
             print("[train] all phases complete — nothing to do")
             return
         print(f"[train] phase '{phase['name']}' on {phase['dataset']} · "
-              f"{tokens_per_step:,} tokens/step · device {self.device}")
+              f"{tokens_per_step:,} tokens/step · device {self.device}"
+              + (f" · {self.world} cards (rank {self.rank})" if self.world > 1 else ""))
         mult = self._phase_mult(phase["name"])
         if self.arms is not None:
             self.arms.sync(phase["name"])
@@ -315,25 +469,27 @@ class Trainer:
             total = min(total, start_step + max_steps)
         if max_tokens is not None:
             total = min(total, self.step + math.ceil(max_tokens / tokens_per_step))
-        bar = tqdm(unit="step", initial=self.step, total=total,
-                   dynamic_ncols=True)
+        bar = (tqdm(unit="step", initial=self.step, total=total, dynamic_ncols=True)
+               if self.is_main else None)
         self._bar = bar
         model.train()
         save_on_exit = True
         try:
             while True:
+                # the session caps: one decision for every card (the main
+                # rank's clock and counters), so all ranks stop together
+                cap = None
                 if max_steps is not None and self.step - start_step >= max_steps:
-                    print("[train] SESSION CAP: max_steps this call — "
-                          "a pause, not completion")
-                    break
-                if max_hours is not None and (time.time() - t0) / 3600 >= max_hours:
-                    print("[train] SESSION CAP: max_hours this call — "
-                          "a pause, not completion")
-                    break
-                if max_tokens is not None and \
+                    cap = "[train] SESSION CAP: max_steps this call — a pause, not completion"
+                elif max_hours is not None and (time.time() - t0) / 3600 >= max_hours:
+                    cap = "[train] SESSION CAP: max_hours this call — a pause, not completion"
+                elif max_tokens is not None and \
                         self.manifest.tokens_seen - start_tokens >= max_tokens:
-                    print(f"[train] SESSION CAP: {max_tokens/1e9:.2f}B tokens "
-                          "this call — a pause, not completion")
+                    cap = (f"[train] SESSION CAP: {max_tokens/1e9:.2f}B tokens "
+                           "this call — a pause, not completion")
+                if self._agree(cap is not None):
+                    if self.is_main:
+                        print(cap or "[train] SESSION CAP reached on another card — a pause, not completion")
                     break
 
                 step_t0 = time.time()
@@ -345,31 +501,37 @@ class Trainer:
                 for _ in range(tc.grad_accum):
                     xb = self.stream.next_batch().to(self.device,
                                                      non_blocking=True)
-                    with torch.autocast(self.device, dtype=torch.bfloat16,
-                                        enabled=self.device == "cuda"):
+                    with autocast(self.device):
                         _, loss = model(xb[:, :-1], targets=xb[:, 1:])
                     (loss / tc.grad_accum).backward()
                     loss_acc += float(loss.item()) / tc.grad_accum
                 abst_acc = 0.0
                 for _ in range(n_abst):        # the quiet term (arms only)
                     abst_acc += self.arms.abstain_backward(1.0 / n_abst) / n_abst
+                # multi-card: the gradients (trunk and arms) averaged
+                # across ranks BEFORE the clip reads them
+                self._allreduce_grads()
                 # the clip reads the TRUNK's gradient (arm gradients are
                 # never clipped — the arm recipe of record)
                 gnorm = torch.nn.utils.clip_grad_norm_(
                     self._trunk_params, tc.grad_clip)
                 # EVERY step, BEFORE the optimizers touch the weights: a
                 # non-finite loss/grad must never enter the parameters (and
-                # therefore never reach a resume checkpoint)
-                if not (math.isfinite(loss_acc) and bool(torch.isfinite(gnorm))):
+                # therefore never reach a resume checkpoint). Multi-card:
+                # every rank raises when any rank's loss is non-finite.
+                finite = math.isfinite(loss_acc) and bool(torch.isfinite(gnorm))
+                if not self._agree(finite, how="all"):
                     raise FloatingPointError(
                         f"non-finite loss/grad at step {self.step + 1} "
-                        f"(loss={loss_acc}, gnorm={float(gnorm)}) "
+                        f"(loss={loss_acc}, gnorm={float(gnorm)}, rank {self.rank}) "
                         "— weights untouched; resume state NOT overwritten")
                 if n_abst:
                     # an arm's fault is the arm's: the member is masked out
                     # of the step and the run continues on a healthy trunk
+                    # (after the all-reduce the arm gradients are identical
+                    # on every rank; the chunk loss is agreed across ranks)
                     bad = self.arms.nonfinite_members()
-                    if not math.isfinite(abst_acc) and not bad:
+                    if self._agree(not math.isfinite(abst_acc)) and not bad:
                         bad = list(self.arms.live())
                     for n in bad:
                         reason = (f"non-finite arm gradient at step {self.step + 1} "
@@ -405,13 +567,14 @@ class Trainer:
                     0.98 * self._loss_ema + 0.02 * loss_acc
                 spike = loss_acc > 2.0 * self._loss_ema + 0.5
                 dt = time.time() - step_t0
-                bar.update(1)
-                bar.set_postfix(bpb=f"{bpb:.3f}",
-                                toks=f"{self.manifest.tokens_seen/1e9:.3f}B",
-                                tps=f"{tokens_per_step/dt/1e3:.0f}k/s",
-                                phase=phase["name"][:12])
+                if bar is not None:
+                    bar.update(1)
+                    bar.set_postfix(bpb=f"{bpb:.3f}",
+                                    toks=f"{self.manifest.tokens_seen/1e9:.3f}B",
+                                    tps=f"{tokens_per_step/dt/1e3:.0f}k/s",
+                                    phase=phase["name"][:12])
 
-                if self.step % tc.log_every == 0:
+                if self.step % tc.log_every == 0 and self.is_main:
                     w = self.writer
                     w.add_scalar("train/loss", loss_acc, self.step)
                     w.add_scalar("train/bpb", bpb, self.step)
@@ -435,7 +598,7 @@ class Trainer:
                         self.guard.observe_gnorm(self.step, float(gnorm))
 
                 halt = None
-                if self.step % tc.health_every == 0:
+                if self.step % tc.health_every == 0 and self.is_main:
                     self._health(bar)
                 g_census = (self.guard is not None
                             and self.step % self.guard.cfg.census_every == 0)
@@ -452,28 +615,35 @@ class Trainer:
                                    f"{info['step']:,}: {info}")
                         if info["mode"] == "halt" and halt is None:
                             halt = (g, info)
-                if self.step % tc.eval_every == 0:
+                if self.step % tc.eval_every == 0 and self.is_main:
                     self._full_eval()
                 if self.step % tc.ckpt_every == 0:
-                    self._checkpoint()
+                    self._checkpoint()          # every rank (a collective inside)
                 if self.step % tc.tb_upload_every == 0:
                     self.writer.flush()
                     self.hub.upload_tensorboard(self.tb_dir)
-                if halt is not None:
+                # a halt is the main rank's read; every rank hears it
+                if self._agree(halt is not None):
                     # a certified red flag: archive the exact position AS
                     # ITS OWN FILE (resume/latest.pt stays at the last
                     # healthy checkpoint), record the halt in the manifest
                     # and RETURN — a diagnostic never crashes the run, and
                     # a halted run is never auto-resumed
-                    g, info = halt
-                    archive = self._halt_checkpoint(g, info, phase["name"])
-                    self._guard_halt = {"guard": g, "info": info,
-                                        "phase": phase["name"], "step": self.step,
-                                        "archive": archive}
+                    stream_ranks = self._gather_stream_states()
+                    if halt is not None:
+                        g, info = halt
+                        archive = self._halt_checkpoint(g, info, phase["name"],
+                                                        stream_ranks=stream_ranks)
+                        self._guard_halt = {"guard": g, "info": info,
+                                            "phase": phase["name"], "step": self.step,
+                                            "archive": archive}
+                        print(f"[train] GUARD HALT: {g} fired at step {info['step']:,} "
+                              f"— position archived at {archive}; latest.pt untouched; "
+                              "the driver decides")
+                    else:
+                        self._guard_halt = {"guard": "main-rank halt", "step": self.step,
+                                            "phase": phase["name"]}
                     save_on_exit = False      # the faulted state never becomes latest.pt
-                    print(f"[train] GUARD HALT: {g} fired at step {info['step']:,} "
-                          f"— position archived at {archive}; latest.pt untouched; "
-                          "the driver decides")
                     break
 
                 done_name = phase["name"]
@@ -502,6 +672,7 @@ class Trainer:
                     if self.arms is not None:
                         self.arms.sync(phase["name"])
                         n_abst = self.arms.chunks_per_step(tc.grad_accum)
+                        self._broadcast_params()   # the fresh arm identical on every card
         except KeyboardInterrupt:
             self._interrupted = True
             print("\n[train] interrupted — saving resume state")
@@ -513,22 +684,24 @@ class Trainer:
                   "left untouched")
             raise
         finally:
-            bar.close()
+            if bar is not None:
+                bar.close()
             self._bar = None
             self.manifest.wall_hours += (time.time() - t0) / 3600
             if save_on_exit and self.step > start_step:
-                if self._weights_finite():
+                if self._agree(self._weights_finite(), how="all"):
                     self._checkpoint(final=True)
                 else:
                     print("[train] REFUSING final checkpoint: non-finite "
                           "weights detected — hub resume state left untouched")
             self.writer.flush()
             self.hub.upload_tensorboard(self.tb_dir)
-            print(self.manifest.summary())
+            if self.is_main:
+                print(self.manifest.summary())
             left = sum(max(0, p["planned_tokens"] - p.get("tokens_done", 0))
                        for p in self.manifest.phases
                        if p["status"] in ("planned", "active"))
-            if left > 0:
+            if left > 0 and self.is_main:
                 print(f"[train] curriculum NOT complete: {left/1e9:.2f}B "
                       "tokens remain in active/planned phases — call "
                       "train() again to continue")
@@ -565,12 +738,15 @@ class Trainer:
                 return instruments.model_census(self.raw_model, xb)
         return instruments.model_census(self.raw_model, xb)
 
-    def _halt_checkpoint(self, g: str, info: dict, phase_name: str) -> str:
+    def _halt_checkpoint(self, g: str, info: dict, phase_name: str,
+                         stream_ranks=None) -> str:
         """The halt archive: resume state at the exact halt position under
         its own name (never latest.pt, no shipping weights, no fp8 — the
         faulted state is a forensic object), the halt recorded in the
-        manifest, the manifest pushed."""
+        manifest, the manifest pushed. Main rank only."""
         sd, extra = self._side_state()
+        if stream_ranks is not None:
+            extra["stream_ranks"] = stream_ranks
         stream_state = None
         if self.stream is not None:
             stream_state = {"dataset": self.stream.dataset,
@@ -681,8 +857,17 @@ class Trainer:
         _emit(getattr(self, "_bar", None), msg)
 
     def _checkpoint(self, final: bool = False, boundary: str | None = None):
+        """Every rank calls this (the stream-position gather and the
+        parameter broadcast are collectives); the main rank writes and
+        uploads."""
         t0 = time.time()
+        stream_ranks = self._gather_stream_states()
+        self._broadcast_params()          # the cards re-pinned to the record
+        if not self.is_main:
+            return
         sd, extra = self._side_state()
+        if stream_ranks is not None:
+            extra["stream_ranks"] = stream_ranks
         st_name = self.hub.save_safetensors(self.raw_model, self.step,
                                             state_dict=sd)
         val_bpb = getattr(self, "_last_eval", {}).get(

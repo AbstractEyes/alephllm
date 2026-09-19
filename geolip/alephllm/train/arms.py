@@ -138,8 +138,15 @@ class StageArmProgram:
             t = self.trainer
             self.offstream = build_stream(self.cfg.offdomain_dataset, t.tokenizer,
                                           t.cfg.context, t.tc.micro_batch,
-                                          seed=self.cfg.offdomain_seed)
+                                          seed=self.cfg.offdomain_seed,
+                                          shard=self._shard())
         return self.offstream.next_batch()
+
+    def _shard(self):
+        """Multi-card: the off-domain stream is sharded like the task stream."""
+        t = self.trainer
+        w = getattr(t, "world", 1)
+        return (t.rank, w) if w > 1 else None
 
     # ------------------------------------------------------------- attach
     def attach(self, arm: StageArm):
@@ -273,8 +280,8 @@ class StageArmProgram:
             for p in trunk:
                 p.requires_grad_(False)
         try:
-            with torch.autocast(t.device, dtype=torch.bfloat16,
-                                enabled=t.device == "cuda"):
+            from .precision import autocast
+            with autocast(t.device):
                 loss = self.abstention_loss(xb)
             (loss * scale).backward()
         finally:
@@ -303,6 +310,7 @@ class StageArmProgram:
         fineweb rows; >= 3x specialize, <= 1.5x blend). Every masked
         number is a MASKED read, never compared to a solo training."""
         import math
+        from .precision import autocast
         model = self.model
         was = model.training
         model.eval()
@@ -310,8 +318,7 @@ class StageArmProgram:
         def bpb(batches):
             tot = n = 0.0
             for xb in batches:
-                with torch.autocast(self.trainer.device, dtype=torch.bfloat16,
-                                    enabled=self.trainer.device == "cuda"):
+                with autocast(self.trainer.device):
                     _, loss = model(xb[:, :-1], targets=xb[:, 1:])
                 tot += float(loss.item()) * xb.shape[0]
                 n += xb.shape[0]
@@ -328,8 +335,7 @@ class StageArmProgram:
             hs = [w.adapter.register_forward_hook(hook) for w in self.wraps[name]]
             try:
                 for xb in batches:
-                    with torch.autocast(self.trainer.device, dtype=torch.bfloat16,
-                                        enabled=self.trainer.device == "cuda"):
+                    with autocast(self.trainer.device):
                         model(xb[:, :-1])
             finally:
                 for h in hs:
@@ -418,7 +424,9 @@ class StageArmProgram:
             t = self.trainer
             self.offstream = build_stream(self.cfg.offdomain_dataset, t.tokenizer,
                                           t.cfg.context, t.tc.micro_batch,
-                                          seed=self.cfg.offdomain_seed)
-            self.offstream.load_state_dict(st["offstream"])
+                                          seed=self.cfg.offdomain_seed,
+                                          shard=self._shard())
+            if self._shard() is None or self._shard()[0] == 0:
+                self.offstream.load_state_dict(st["offstream"])   # the main rank's position; other ranks start their slice
         if self.attached:
             print(f"[arms] restored {self.attached}", flush=True)
