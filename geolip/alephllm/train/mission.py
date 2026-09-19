@@ -58,6 +58,30 @@ def _dist():
     return (int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)))
 
 
+REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale")
+
+
+def _refresh_config(C: dict, run) -> dict:
+    """Re-read the config file at every boundary: the later gates (the arm
+    certification, the anneal multiplier) are settled by screens that run
+    while the mission trains, so their values land in the file, not in a
+    relaunch. Every rank reads the same file, so the gate decision agrees.
+    A multiplier that arrives is applied to the trainer's per-phase LR
+    scale before the anneal phase opens."""
+    try:
+        new = _load_config()
+    except Exception as e:  # noqa: BLE001
+        print(f"[mission] config re-read failed ({e!r}); keeping the launch values")
+        return C
+    for k in REFRESHABLE:
+        if new.get(k) != C.get(k):
+            print(f"[mission] config: {k} {C.get(k)!r} -> {new.get(k)!r}")
+            C[k] = new.get(k)
+    if isinstance(C["anneal_lr_scale"], (int, float)):
+        run.tc.phase_lr_scale = {"anneal": float(C["anneal_lr_scale"])}
+    return C
+
+
 def build_preset(C: dict, token: str | None):
     """The notebook's preflight cell, minus the bench: the preset for the
     chosen depth, the anneal multiplier, the head-birth flag, the fusion
@@ -299,6 +323,7 @@ def main():
         hours_left = (t_end - time.time()) / 3600
         if hours_left < (0.2 if not local else 0.0):
             break
+        C = _refresh_config(C, run)
         nxt = run.manifest.current_phase()
         if nxt is not None and not local:
             if any(a.phase == nxt["name"] for a in (arms.cfg.arms if arms else [])) and not C["arm_spec_certified"]:
