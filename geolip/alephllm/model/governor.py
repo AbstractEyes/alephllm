@@ -80,6 +80,14 @@ def minsep_project_(codebook: torch.nn.Parameter, theta_min_deg: float,
     return hits
 
 
+def raw_block(wrap):
+    """The model's own Block under any depth of adapter wrappers (amoe
+    BlockWithAdapter nests one wrapper per attached arm: .block.block...)."""
+    while hasattr(wrap, "block"):
+        wrap = wrap.block
+    return wrap
+
+
 def _hub_addresses(attn):
     """Every AlephAddress a hub carries (single- or multi-constellation)."""
     if hasattr(attn, "consts"):
@@ -103,7 +111,7 @@ def govern_model(model, theta_min_deg: float,
     books: list[torch.nn.Parameter] = []
     if "hub" in include:
         for wrap in getattr(model, "blocks", []):
-            blk = getattr(wrap, "block", wrap)
+            blk = raw_block(wrap)
             if getattr(blk, "is_hub", False):
                 books += [a.codebook for a in _hub_addresses(blk.attn)]
     if "head" in include and hasattr(model, "head"):
@@ -112,7 +120,7 @@ def govern_model(model, theta_min_deg: float,
             books.append(addr.codebook)
     if "bank" in include:
         for wrap in getattr(model, "blocks", []):
-            blk = getattr(wrap, "block", wrap)
+            blk = raw_block(wrap)
             addr = getattr(getattr(blk, "bank", None), "addr", None)
             if isinstance(addr, AlephAddress):
                 books.append(addr.codebook)

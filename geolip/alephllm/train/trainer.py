@@ -33,6 +33,8 @@ from . import instruments
 from .checkpoint import HubSync
 from .manifest import RunManifest
 from .optim import build_optimizers, apply_lr
+from .guards import GuardConfig, GuardCore
+from .arms import trunk_state_dict
 
 
 def _emit(bar, text: str):
@@ -52,13 +54,32 @@ def _emit(bar, text: str):
 class Trainer:
     def __init__(self, preset: Preset | str, hf_token: str | None = None,
                  out_dir: str = "./alephllm_runs", device: str | None = None,
-                 resume: bool = True):
+                 resume: bool = True, guard: GuardConfig | None = None,
+                 arms=None):
+        """guard (v3): a GuardConfig — the red-flag core runs in-run (halt
+        = a clean return with an archived resume point, watch = logged).
+        arms (v3): a StageArmProgram — arms attach per curriculum stage
+        and train under the same optimizer step (train/arms.py)."""
         if isinstance(preset, str):
             preset = get_preset(preset)
         self.preset, self.cfg, self.tc = preset, preset.model, preset.train
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.out_dir = os.path.join(out_dir, self.cfg.name)
         os.makedirs(self.out_dir, exist_ok=True)
+        # curriculum-stage phases need the stage registry + the preset's
+        # data scale applied BEFORE any stage stream opens (v3: the mixes
+        # are rebalanced under the epoch cap at the scaled budget; a scale
+        # without a rebalance rule REFUSES here, at construction)
+        self._data_plane = {}
+        if any(str(ph.get("dataset", "")).startswith("curriculum-")
+               for ph in preset.curriculum) or preset.data_scale != 1.0:
+            from ..data import curriculum as _cur
+            want = (preset.data_scale, preset.epoch_cap, preset.rebalance_to)
+            have = (_cur._APPLIED_SCALE["factor"], _cur._APPLIED_SCALE["epoch_cap"],
+                    _cur._APPLIED_SCALE["rebalance_to"])
+            if want != have:
+                _cur.apply_curriculum_scale(*want)
+            self._data_plane = _cur.data_plane(*want)
 
         torch.manual_seed(self.tc.seed)
         if self.device == "cuda":
@@ -83,6 +104,13 @@ class Trainer:
             self.raw_model, self.tc.muon_lr, self.tc.muon_momentum,
             self.tc.adam_lr)
         self.base_lrs = [self.tc.muon_lr, self.tc.adam_lr]
+        # the trunk's own parameters, fixed at birth: the clip and the
+        # abstention-chunk graph boundary read this list, never the model's
+        # live parameter set (which grows as arms attach)
+        self._trunk_params = list(self.raw_model.parameters())
+        self.guard = GuardCore(guard, self.cfg.n_layers) if guard else None
+        self.arms = arms.bind(self) if arms is not None else None
+        self._guard_halt = None
 
         self.hub = HubSync(preset.hf_repo, preset.prefix, hf_token,
                            self.out_dir)
@@ -99,6 +127,9 @@ class Trainer:
             self.manifest = RunManifest.fresh(
                 self.cfg.name, self.cfg.to_dict(),
                 [dict(ph) for ph in preset.curriculum])
+            self.manifest.data_plane = dict(self._data_plane)
+        else:
+            self._check_data_plane()
         tb_dir = os.path.join(self.out_dir, "runs")
         self.writer = SummaryWriter(tb_dir)
         self.tb_dir = tb_dir
@@ -138,7 +169,16 @@ class Trainer:
                       "payload snapshot (consistent with the weights)")
         else:
             self.manifest = man
+        # a guard halt is recorded in the HUB manifest after the last
+        # healthy checkpoint (the halt never rewrites resume/latest.pt), so
+        # the payload snapshot cannot know about it: the hub record wins
+        if man is not None and getattr(man, "halt", None):
+            self.manifest.halt = dict(man.halt)
         self._stream_state = payload.get("stream")
+        if self.arms is not None and payload.get("arms"):
+            self.arms.load_state_dict(payload["arms"])
+        if self.guard is not None and payload.get("guard"):
+            self.guard.load_state_dict(payload["guard"])
         rng = payload.get("rng") or {}
         if rng.get("torch") is not None:
             torch.set_rng_state(rng["torch"].cpu().to(torch.uint8))
@@ -150,7 +190,45 @@ class Trainer:
                 pass
         print(f"[resume] restored step {self.step:,} · "
               f"{self.manifest.tokens_seen/1e9:.3f}B tokens")
+        if self.manifest.halt:
+            h = self.manifest.halt
+            print(f"[resume] HALTED RUN: {h.get('guard')} fired at step "
+                  f"{h.get('step'):,} in '{h.get('phase')}' (archive "
+                  f"{h.get('archive')}) — train() refuses until "
+                  "resume_after_halt=True")
         return True
+
+    def _check_data_plane(self):
+        """The recipe-fingerprint law: a resumed run continues on the data
+        plane it was created under, or refuses. A pre-v3 manifest (no
+        record) is stamped with the live plane once."""
+        rec = getattr(self.manifest, "data_plane", None) or {}
+        live = self._data_plane
+        if not rec:
+            if live:
+                self.manifest.data_plane = dict(live)
+                self.manifest.note(f"data plane recorded on resume: {live}")
+            return
+        if not live:
+            return
+        diff = {k: (rec.get(k), live.get(k)) for k in
+                ("data_scale", "epoch_cap", "rebalance_to", "recipe_hash")
+                if rec.get(k) != live.get(k)}
+        if diff:
+            raise RuntimeError(
+                f"data plane changed across resume {diff} (recorded vs live): "
+                "a run continues on the mix it was created under — restore the "
+                "preset's data_scale/epoch_cap/rebalance_to, or start a new run")
+
+    def _phase_seed(self, ph: dict) -> int:
+        """The stream seed for a phase: the run seed, offset per phase
+        position when TrainConfig.phase_seed_offset (v3) so a corpus that
+        recurs across stages does not replay the same shuffle head."""
+        if not getattr(self.tc, "phase_seed_offset", False):
+            return self.tc.seed
+        names = [p["name"] for p in self.manifest.phases]
+        idx = names.index(ph["name"]) if ph["name"] in names else 0
+        return self.tc.seed + 7919 * idx
 
     def _open_stream(self):
         ph = self.manifest.advance_phases()
@@ -159,7 +237,7 @@ class Trainer:
         if self.stream is None or self.stream.dataset != ph["dataset"]:
             self.stream = build_stream(ph["dataset"], self.tokenizer,
                                        self.cfg.context, self.tc.micro_batch,
-                                       seed=self.tc.seed)
+                                       seed=self._phase_seed(ph))
             st = getattr(self, "_stream_state", None)
             if st and st.get("dataset") == ph["dataset"]:
                 self.stream.load_state_dict(st["state"])
@@ -168,7 +246,8 @@ class Trainer:
 
     # -------------------------------------------------------------- train
     def train(self, max_steps: int | None = None, max_hours: float | None = None,
-              max_tokens: int | None = None, stop_at_boundary: bool = False):
+              max_tokens: int | None = None, stop_at_boundary: bool = False,
+              resume_after_halt: bool = False):
         """All caps are SESSION-RELATIVE: max_steps/max_tokens count only
         this call's work (max_tokens=12e9 trains 12B tokens NOW, regardless
         of lifetime total). Cap stops announce themselves as session caps —
@@ -179,10 +258,32 @@ class Trainer:
         contract (0.8.1): the caller reads self._last_boundary (the phase
         that just completed; None on a cap stop) and self._interrupted
         (True on KeyboardInterrupt — a manual stop; drivers must NOT
-        auto-resume it; the 2s run0 driver silently resumed one)."""
+        auto-resume it; the 2s run0 driver silently resumed one).
+
+        resume_after_halt (v3): a run whose manifest records a certified
+        guard halt REFUSES to train until a session says so explicitly;
+        clearing it is recorded in the manifest and the run continues from
+        resume/latest.pt (the last healthy checkpoint — the halt archive
+        is the forensic object, never the continuation point)."""
         model, tc = self.model, self.tc
         self._interrupted = False
         self._last_boundary = None
+        self._guard_halt = None
+        if self.manifest.halt:
+            h = self.manifest.halt
+            if not resume_after_halt:
+                raise RuntimeError(
+                    f"HALTED RUN: guard {h.get('guard')} fired at step "
+                    f"{h.get('step'):,} in '{h.get('phase')}' (archive "
+                    f"{h.get('archive')}; {h.get('info')}) — a red-flag halt "
+                    "is never auto-resumed; read the archive, decide, then "
+                    "call train(resume_after_halt=True) to continue from the "
+                    "last healthy checkpoint")
+            self.manifest.note(f"HALT CLEARED by the session at step {self.step:,}: "
+                               f"{h}")
+            self.manifest.halt = None
+            print(f"[train] halt {h.get('guard')}@{h.get('step'):,} cleared — "
+                  f"continuing from step {self.step:,}")
         tokens_per_step = tc.micro_batch * tc.grad_accum * self.cfg.context
         t0 = time.time()
         start_step = self.step
@@ -194,6 +295,14 @@ class Trainer:
             return
         print(f"[train] phase '{phase['name']}' on {phase['dataset']} · "
               f"{tokens_per_step:,} tokens/step · device {self.device}")
+        mult = self._phase_mult(phase["name"])
+        if self.arms is not None:
+            self.arms.sync(phase["name"])
+        n_abst = (self.arms.chunks_per_step(tc.grad_accum)
+                  if self.arms is not None else 0)
+        if n_abst:
+            print(f"[train] stage arms {self.arms.attached}: {n_abst} abstention "
+                  f"chunks per step beside {tc.grad_accum} task chunks")
         # bar total = whichever bound ends this session first: remaining
         # curriculum budget, max_steps, or max_tokens (max_hours just stops
         # the bar early) — without a total tqdm shows "n/?" and no ETA
@@ -229,7 +338,7 @@ class Trainer:
 
                 step_t0 = time.time()
                 lr_s = apply_lr(self.optimizers, self.base_lrs, self.step,
-                                tc.warmup_steps)
+                                tc.warmup_steps, mult=mult)
                 for opt in self.optimizers:
                     opt.zero_grad(set_to_none=True)
                 loss_acc = 0.0
@@ -241,18 +350,40 @@ class Trainer:
                         _, loss = model(xb[:, :-1], targets=xb[:, 1:])
                     (loss / tc.grad_accum).backward()
                     loss_acc += float(loss.item()) / tc.grad_accum
+                abst_acc = 0.0
+                for _ in range(n_abst):        # the quiet term (arms only)
+                    abst_acc += self.arms.abstain_backward(1.0 / n_abst) / n_abst
+                # the clip reads the TRUNK's gradient (arm gradients are
+                # never clipped — the arm recipe of record)
                 gnorm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), tc.grad_clip)
+                    self._trunk_params, tc.grad_clip)
                 # EVERY step, BEFORE the optimizers touch the weights: a
                 # non-finite loss/grad must never enter the parameters (and
                 # therefore never reach a resume checkpoint)
                 if not (math.isfinite(loss_acc) and bool(torch.isfinite(gnorm))):
                     raise FloatingPointError(
                         f"non-finite loss/grad at step {self.step + 1} "
-                        f"(loss={loss_acc}, gnorm={float(gnorm)}) — weights "
-                        "untouched; resume state NOT overwritten")
+                        f"(loss={loss_acc}, gnorm={float(gnorm)}) "
+                        "— weights untouched; resume state NOT overwritten")
+                if n_abst:
+                    # an arm's fault is the arm's: the member is masked out
+                    # of the step and the run continues on a healthy trunk
+                    bad = self.arms.nonfinite_members()
+                    if not math.isfinite(abst_acc) and not bad:
+                        bad = list(self.arms.live())
+                    for n in bad:
+                        reason = (f"non-finite arm gradient at step {self.step + 1} "
+                                  f"(abstention={abst_acc})")
+                        self.arms.disable(n, reason)
+                        self.manifest.note(f"ARM DISABLED '{n}': {reason}")
+                        _emit(bar, f"[arms] DISABLED '{n}': {reason}")
+                    if bad:
+                        abst_acc = 0.0
+                        n_abst = self.arms.chunks_per_step(tc.grad_accum)
                 for opt in self.optimizers:
                     opt.step()
+                if self.arms is not None and self.arms.active:
+                    self.arms.step()
 
                 # ANCHOR GOVERNOR (ROUND 5f): post-step min-sep projection,
                 # every governor_every steps. Identity when slack (one small
@@ -291,6 +422,8 @@ class Trainer:
                     w.add_scalar("train/tokens_per_sec",
                                  tokens_per_step / dt, self.step)
                     w.add_scalar("collapse/loss_spike", float(spike), self.step)
+                    if n_abst:
+                        w.add_scalar("arms/abstention", abst_acc, self.step)
                     if tc.governor:
                         w.add_scalar("governor/hits_cum",
                                      getattr(self, "_gov_hits", 0), self.step)
@@ -298,9 +431,27 @@ class Trainer:
                         w.add_scalar("sys/vram_gb",
                                      torch.cuda.max_memory_allocated() / 2**30,
                                      self.step)
+                    if self.guard is not None:
+                        self.guard.observe_gnorm(self.step, float(gnorm))
 
+                halt = None
                 if self.step % tc.health_every == 0:
                     self._health(bar)
+                g_census = (self.guard is not None
+                            and self.step % self.guard.cfg.census_every == 0)
+                if g_census:
+                    # the guard's OWN series: its cadence, one pinned batch,
+                    # every arm masked — the certification's conditions
+                    self.guard.observe_census(self.step, self._guard_census())
+                if self.guard is not None and (
+                        self.step % tc.log_every == 0 or g_census):
+                    for g, info in self.guard.check(self.step):
+                        self.writer.add_scalar(f"guard/{g}", float(info["step"]),
+                                               self.step)
+                        _emit(bar, f"[guard] {g} FIRED ({info['mode']}) at step "
+                                   f"{info['step']:,}: {info}")
+                        if info["mode"] == "halt" and halt is None:
+                            halt = (g, info)
                 if self.step % tc.eval_every == 0:
                     self._full_eval()
                 if self.step % tc.ckpt_every == 0:
@@ -308,6 +459,22 @@ class Trainer:
                 if self.step % tc.tb_upload_every == 0:
                     self.writer.flush()
                     self.hub.upload_tensorboard(self.tb_dir)
+                if halt is not None:
+                    # a certified red flag: archive the exact position AS
+                    # ITS OWN FILE (resume/latest.pt stays at the last
+                    # healthy checkpoint), record the halt in the manifest
+                    # and RETURN — a diagnostic never crashes the run, and
+                    # a halted run is never auto-resumed
+                    g, info = halt
+                    archive = self._halt_checkpoint(g, info, phase["name"])
+                    self._guard_halt = {"guard": g, "info": info,
+                                        "phase": phase["name"], "step": self.step,
+                                        "archive": archive}
+                    save_on_exit = False      # the faulted state never becomes latest.pt
+                    print(f"[train] GUARD HALT: {g} fired at step {info['step']:,} "
+                          f"— position archived at {archive}; latest.pt untouched; "
+                          "the driver decides")
+                    break
 
                 done_name = phase["name"]
                 newph = self.manifest.advance_phases()
@@ -331,6 +498,10 @@ class Trainer:
                         break
                     phase = self._open_stream()
                     self.manifest.note(f"switched to phase '{phase['name']}'")
+                    mult = self._phase_mult(phase["name"])
+                    if self.arms is not None:
+                        self.arms.sync(phase["name"])
+                        n_abst = self.arms.chunks_per_step(tc.grad_accum)
         except KeyboardInterrupt:
             self._interrupted = True
             print("\n[train] interrupted — saving resume state")
@@ -366,6 +537,70 @@ class Trainer:
     def _weights_finite(self) -> bool:
         return all(bool(torch.isfinite(p).all())
                    for p in self.raw_model.parameters())
+
+    def _phase_mult(self, phase_name: str) -> float:
+        """The per-phase LR multiplier (TrainConfig.phase_lr_scale, keyed
+        by phase-name prefix; the LONGEST matching prefix wins, so
+        'anneal_mix' can differ from 'anneal'); 1.0 = the flat-LR form."""
+        best, best_len = 1.0, -1
+        for prefix, m in (self.tc.phase_lr_scale or {}).items():
+            if str(phase_name).startswith(prefix) and len(prefix) > best_len:
+                best, best_len = float(m), len(prefix)
+        return best
+
+    def _guard_census(self) -> dict:
+        """The guard core's census: the trunk alone (arms masked) on ONE
+        batch pinned at first use from the guard's census dataset (val
+        head rows) and persisted with the guard state, so the series a
+        guard reads is the series it was certified on."""
+        g = self.guard
+        if g.census_batch is None:
+            vs = build_stream(g.cfg.census_dataset, self.tokenizer, self.cfg.context,
+                              self.tc.micro_batch, seed=self.tc.seed + 9999,
+                              role="val")
+            g.census_batch = vs.next_batch()[:2, :-1].cpu()
+        xb = g.census_batch.to(self.device)
+        if self.arms is not None and self.arms.active:
+            with self.arms.all_off():
+                return instruments.model_census(self.raw_model, xb)
+        return instruments.model_census(self.raw_model, xb)
+
+    def _halt_checkpoint(self, g: str, info: dict, phase_name: str) -> str:
+        """The halt archive: resume state at the exact halt position under
+        its own name (never latest.pt, no shipping weights, no fp8 — the
+        faulted state is a forensic object), the halt recorded in the
+        manifest, the manifest pushed."""
+        sd, extra = self._side_state()
+        stream_state = None
+        if self.stream is not None:
+            stream_state = {"dataset": self.stream.dataset,
+                            "state": self.stream.state_dict(),
+                            "phase": phase_name}
+        name = f"guard_{g}_step{self.step}.pt"
+        self.manifest.record_checkpoint(self.step, "halt", f"resume/{name}")
+        self.manifest.halt = {"guard": g, "step": self.step, "phase": phase_name,
+                              "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                              "archive": f"resume/{name}", "info": dict(info)}
+        self.manifest.note(f"GUARD HALT {g} at step {self.step:,} in '{phase_name}': "
+                           f"{info} — archived as resume/{name}")
+        path = self.hub.save_resume(self.raw_model, self.optimizers, stream_state,
+                                    self.manifest, self.step, archive_as=name,
+                                    state_dict=sd, extra=extra, skip_latest=True)
+        self.hub.push_manifest(self.manifest)
+        return path
+
+    def _side_state(self):
+        """(trunk state dict or None, extra payload) for the checkpoint
+        writers: with arms attached the trunk ships with plain keys and the
+        arms + guard state ride in the resume payload."""
+        sd = None
+        extra = {}
+        if self.arms is not None and self.arms.active:
+            sd = trunk_state_dict(self.raw_model)
+            extra["arms"] = self.arms.state_dict()
+        if self.guard is not None:
+            extra["guard"] = self.guard.state_dict()
+        return sd, extra
 
     # ------------------------------------------------------------- health
     def _sample_batch(self):
@@ -414,6 +649,12 @@ class Trainer:
         model = self.raw_model
         census = instruments.model_census(model, self._sample_batch())
         ledger = instruments.toggle_ledger(model, self._val())
+        if self.arms is not None and self.arms.active:
+            # the ledger above is the ARMED read; the bare trunk beside it
+            with self.arms.all_off():
+                bare = instruments.toggle_ledger(model, self._val())
+            ledger["bpb_arms_off"] = bare["bpb_full"]
+            ledger["toggle_arms_off"] = bare["bpb_full"] - ledger["bpb_full"]
         can = canary_eval(model, self.tokenizer, self.device,
                           episodes=self.tc.canary_episodes,
                           context=self.cfg.context)
@@ -441,7 +682,9 @@ class Trainer:
 
     def _checkpoint(self, final: bool = False, boundary: str | None = None):
         t0 = time.time()
-        st_name = self.hub.save_safetensors(self.raw_model, self.step)
+        sd, extra = self._side_state()
+        st_name = self.hub.save_safetensors(self.raw_model, self.step,
+                                            state_dict=sd)
         val_bpb = getattr(self, "_last_eval", {}).get(
             "ledger", {}).get("bpb_full") if hasattr(self, "_last_eval") else None
         self.manifest.record_checkpoint(self.step, "safetensors", st_name,
@@ -449,7 +692,8 @@ class Trainer:
         self._ckpt_count += 1
         fp8_note = ""
         if self._ckpt_count % self.tc.fp8_every_ckpts == 0 or final:
-            fp8_name = self.hub.save_fp8(self.raw_model, self.step)
+            fp8_name = self.hub.save_fp8(self.raw_model, self.step,
+                                         state_dict=sd)
             self.manifest.record_checkpoint(self.step, "fp8", fp8_name)
             fp8_note = " + fp8"
         stream_state = None
@@ -467,7 +711,8 @@ class Trainer:
         self.hub.save_resume(self.raw_model, self.optimizers, stream_state,
                              self.manifest, self.step,
                              archive_as=(f"boundary_{boundary}_step{self.step}.pt"
-                                         if boundary else None))
+                                         if boundary else None),
+                             state_dict=sd, extra=extra)
         self.hub.push_manifest(self.manifest)
         try:
             st_mb = os.path.getsize(os.path.join(self.out_dir, st_name)) / 2**20
@@ -495,9 +740,14 @@ class Trainer:
 
 
 def prepare(preset: str = "mini-beatrix-1", hf_token: str | None = None,
-            out_dir: str = "./alephllm_runs", resume: bool = True) -> Trainer:
-    """Notebook entrypoint: build (or resume) a run and report its state."""
-    t = Trainer(preset, hf_token=hf_token, out_dir=out_dir, resume=resume)
+            out_dir: str = "./alephllm_runs", resume: bool = True,
+            guard: GuardConfig | None = None, arms=None,
+            device: str | None = None) -> Trainer:
+    """Notebook entrypoint: build (or resume) a run and report its state.
+    device (v3): an explicit target ('cpu' for the toy path) — the single
+    GPU writer rule: a toy run must never land on a card that is busy."""
+    t = Trainer(preset, hf_token=hf_token, out_dir=out_dir, resume=resume,
+                guard=guard, arms=arms, device=device)
     n = t.raw_model.param_count()
     print(f"craft '{t.cfg.name}': {n/1e6:.1f}M params · "
           f"ctx {t.cfg.context} · vocab {t.cfg.vocab_size} · "

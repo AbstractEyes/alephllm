@@ -541,6 +541,7 @@ CORPUS_BYTES = {
     "simple-wiki": 694.6e6,
     "aochildes": 3.2e6,           # ~11MB of very short utterances
     "definitions": 111e6,         # 565,604 glosses x ~197 B rendered
+    "wikitext-103": 540e6,        # the warmup corpus (~1.8M lines of prose)
     "cosmo-young": INF, "fineweb-good": INF, "fineweb-edu": INF,
     "gutenberg": INF,             # ~18GB raw, ~13GB after the cut
     "wikipedia-en": INF,          # ~19GB of article prose
@@ -653,7 +654,8 @@ CURRICULUM_MIXES.update({
                       ("recall-synth", 0.03), ("siqa-narrative", 0.01)],
 })
 
-# stage name -> planned tokens (bytes); plan-of-record budgets
+# stage name -> planned tokens (bytes); plan-of-record budgets (the 1x
+# schedule of the 2s mission, 8.8B in total)
 STAGE_TOKENS = {
     "curriculum-s0": 700_000_000, "curriculum-s1": 700_000_000,
     "curriculum-s2": 1_000_000_000, "curriculum-s3": 1_200_000_000,
@@ -662,13 +664,213 @@ STAGE_TOKENS = {
     "curriculum-s8": 800_000_000,
 }
 
+# ------------------------------------------------------- scaling (v3)
+# The 1x forms are kept verbatim so a scale can be applied, re-applied
+# or undone without drift; apply_curriculum_scale() rewrites the live
+# STAGE_TOKENS / CURRICULUM_MIXES from these.
+#
+# TWO numbers here are the program lead's, not the library's: the epoch
+# cap (the law text above says ~2x per finite corpus; the audit warns at
+# MAX_EPOCHS = 4) and WHERE the freed weight goes (the record's
+# precedent when a finite corpus hit its cap: procedural generators up
+# to their share cap, then natural text). A scale other than 1x
+# therefore REFUSES to apply until both are supplied.
+_BASE_STAGE_TOKENS = dict(STAGE_TOKENS)
+_BASE_MIXES = {k: [tuple(x) for x in v] for k, v in CURRICULUM_MIXES.items()
+               if k in STAGE_TOKENS}
+_APPLIED_SCALE = {"factor": 1.0, "epoch_cap": None, "rebalance_to": None}
+REBALANCE_RULES = ("natural", "generators", "hold")
 
-def append_curriculum_phases(manifest) -> int:
+
+def scaled_curriculum(factor: float, epoch_cap: float | None = None,
+                      rebalance_to: str | None = None,
+                      fallback: str = "fineweb-good") -> dict:
+    """The stage budgets at `factor` x the 1x schedule and the mixes
+    REBALANCED so no finite corpus is re-read past `epoch_cap` within its
+    stage (the epoch-cap law: every finite corpus's epochs-within-stage is
+    computed BEFORE a mix ships). Pure: nothing is mutated.
+
+    epoch_cap: None reads as the audit threshold (MAX_EPOCHS) and is
+    flagged — the law text says ~2; the number is the lead's.
+    rebalance_to (where the freed weight goes):
+      'natural'    pro rata to the mix's NATURAL members with epoch
+                   headroom (infinite ones unbounded), never a generator;
+                   `fallback` is added if no natural member can absorb.
+      'generators' the record's precedent: the mix's procedural
+                   generators first, up to MAX_GENERATOR_SHARE each, then
+                   the natural rule for the remainder.
+      'hold'       the stages stay at 1x bytes (no component moves); the
+                   extra (factor-1) x 8.8B is returned as `held_tokens`
+                   for the preset to spend on general text / the anneals.
+      None         refuses (ValueError) whenever a component would have to
+                   move — the tables are printed so the lead can rule.
+
+    Returns {"factor", "epoch_cap", "rebalance_to", "stage_tokens",
+    "mixes", "table", "cross_stage", "flags", "held_tokens"}; table rows
+    are (stage, component, weight_before, weight_after, epochs_before,
+    epochs_after) for every finite non-generator component; cross_stage
+    maps each finite corpus to its total epochs over ALL stages after the
+    rebalance (a corpus can sit under its per-stage cap in every stage
+    and still be re-read many times over the curriculum).
+    """
+    assert factor > 0
+    flags = {}
+    cap = float(MAX_EPOCHS if epoch_cap is None else epoch_cap)
+    if epoch_cap is None and factor != 1.0:
+        flags["epoch_cap"] = (f"epoch cap not supplied: the audit threshold "
+                              f"{MAX_EPOCHS:g} was used (the law text says ~2)")
+    if rebalance_to is not None and rebalance_to not in REBALANCE_RULES:
+        raise ValueError(f"rebalance_to must be one of {REBALANCE_RULES} or None")
+    hold = rebalance_to == "hold"
+    eff = 1.0 if hold else factor
+    stage_tokens = {k: int(round(v * eff)) for k, v in _BASE_STAGE_TOKENS.items()}
+    held = int(round((factor - eff) * sum(_BASE_STAGE_TOKENS.values())))
+    mixes, table = {}, []
+    cross = {}
+    for stage, recipe in _BASE_MIXES.items():
+        budget = stage_tokens[stage]
+        w = {n: float(x) for n, x in recipe}
+        before = dict(w)
+
+        def cap_of(n, budget=budget):
+            if n.endswith("-synth"):          # a generator's cap is its share
+                return MAX_GENERATOR_SHARE
+            corpus = CORPUS_BYTES.get(n, INF)
+            if corpus == INF:
+                return INF
+            return cap * corpus / budget
+
+        freed = 0.0
+        for n in list(w):
+            c = cap_of(n)
+            if not n.endswith("-synth") and w[n] > c:
+                freed += w[n] - c
+                w[n] = c
+        if freed > 1e-9 and rebalance_to is None:
+            over = [(n, round(before[n], 4), round(cap_of(n), 4)) for n in before
+                    if not n.endswith("-synth") and before[n] > cap_of(n) + 1e-12]
+            raise ValueError(
+                f"curriculum scale x{factor:g}: {stage} re-reads finite corpora "
+                f"past {cap:g} epochs {over} and no rebalance rule was supplied "
+                f"(rebalance_to in {REBALANCE_RULES}) — the lead's decision; run "
+                "scaled_curriculum(factor, epoch_cap, rule) for each rule to see "
+                "the tables")
+        guard = 0
+        while freed > 1e-9 and guard < 50:
+            guard += 1
+            recips = []
+            if rebalance_to == "generators":
+                recips = [n for n in w if n.endswith("-synth")
+                          and cap_of(n) - w[n] > 1e-12]
+            if not recips:
+                recips = [n for n in w if n in NATURAL and cap_of(n) - w[n] > 1e-12]
+            if not recips:
+                if fallback not in w:
+                    w[fallback] = 0.0
+                    flags[stage] = f"no member could absorb {freed:.3f}: added {fallback}"
+                recips = [fallback]
+            total = sum(w[n] for n in recips)
+            moved = 0.0
+            for n in recips:
+                share = freed * (w[n] / total if total > 0 else 1.0 / len(recips))
+                give = min(share, cap_of(n) - w[n])
+                w[n] += give
+                moved += give
+            freed -= moved
+            if moved <= 1e-12:
+                break
+        s = sum(w.values())
+        w = {n: x / s for n, x in w.items()}
+        mixes[stage] = [(n, round(x, 5)) for n, x in w.items() if x > 0]
+        for n in before:
+            corpus = CORPUS_BYTES.get(n, INF)
+            if corpus == INF or n.endswith("-synth"):
+                continue
+            table.append((stage, n, round(before[n], 4), round(w[n], 4),
+                          round(budget * before[n] / corpus, 2),
+                          round(budget * w[n] / corpus, 2)))
+            cross[n] = cross.get(n, 0.0) + budget * w[n] / corpus
+    cross = {n: round(v, 2) for n, v in cross.items()}
+    return {"factor": factor, "epoch_cap": cap, "rebalance_to": rebalance_to,
+            "stage_tokens": stage_tokens, "mixes": mixes, "table": table,
+            "cross_stage": cross, "flags": flags, "held_tokens": held}
+
+
+def data_plane(factor: float = 1.0, epoch_cap: float | None = None,
+               rebalance_to: str | None = None) -> dict:
+    """The data-plane record a run is created under: the three decisions
+    + a fingerprint of the resulting stage recipes, so a resume can assert
+    it continues on the SAME mix (the recipe-fingerprint law)."""
+    import hashlib
+    import json
+    sc = scaled_curriculum(factor, epoch_cap, rebalance_to) if (
+        factor != 1.0 or rebalance_to is not None) else {
+        "stage_tokens": dict(_BASE_STAGE_TOKENS), "mixes": _BASE_MIXES,
+        "epoch_cap": float(MAX_EPOCHS if epoch_cap is None else epoch_cap)}
+    blob = json.dumps({"tokens": sc["stage_tokens"],
+                       "mixes": {k: [list(x) for x in v] for k, v in sc["mixes"].items()}},
+                      sort_keys=True)
+    return {"data_scale": float(factor), "epoch_cap": sc["epoch_cap"],
+            "rebalance_to": rebalance_to,
+            "recipe_hash": hashlib.sha1(blob.encode()).hexdigest()[:12]}
+
+
+def apply_curriculum_scale(factor: float, epoch_cap: float | None = None,
+                           rebalance_to: str | None = None,
+                           verbose: bool = True) -> dict:
+    """Rewrite the live STAGE_TOKENS + CURRICULUM_MIXES for `factor`
+    (idempotent; factor 1.0 restores the 1x forms bit-exact). The streams
+    read CURRICULUM_MIXES at build time, so this must run BEFORE
+    append_curriculum_phases / prepare() opens a stage. Refuses (via
+    scaled_curriculum) when a scale would move a component and no
+    rebalance rule was supplied."""
+    sc = scaled_curriculum(factor, epoch_cap, rebalance_to)
+    STAGE_TOKENS.clear()
+    STAGE_TOKENS.update(sc["stage_tokens"])
+    for k, v in sc["mixes"].items():
+        CURRICULUM_MIXES[k] = list(v)
+    _APPLIED_SCALE.update(factor=factor, epoch_cap=epoch_cap,
+                          rebalance_to=rebalance_to)
+    if verbose:
+        moved = [r for r in sc["table"] if r[2] != r[3]]
+        print(f"[curriculum] scale x{factor:g} ({rebalance_to or 'no rule'}, cap "
+              f"{sc['epoch_cap']:g} ep): {sum(sc['stage_tokens'].values())/1e9:.2f}B "
+              f"over {len(sc['stage_tokens'])} stages; {len(moved)} finite components "
+              f"moved" + (f"; held {sc['held_tokens']/1e9:.1f}B" if sc["held_tokens"] else "")
+              + (f"; FLAGS {sc['flags']}" if sc["flags"] else ""), flush=True)
+        for st, n, wb, wa, eb, ea in moved:
+            print(f"[curriculum]   {st} {n:<18} w {wb:.3f} -> {wa:.3f}  epochs {eb:.1f} -> {ea:.1f}",
+                  flush=True)
+        hot = {n: e for n, e in sc["cross_stage"].items() if e > sc["epoch_cap"]}
+        if hot:
+            print(f"[curriculum]   cross-stage epochs above the cap: {hot}", flush=True)
+    return sc
+
+
+def curriculum_phases(factor: float = 1.0, rebalance_to: str | None = None) -> list:
+    """The S0..S8 manifest phase dicts at `factor` (planned; chronological
+    order) — for presets that carry the curriculum from birth. Budgets
+    only (no mix is touched here): 'hold' keeps the stages at 1x."""
+    eff = 1.0 if rebalance_to == "hold" else float(factor)
+    return [dict(name=ds.replace("-", "_"), dataset=ds,
+                 planned_tokens=int(round(toks * eff)), status="planned")
+            for ds, toks in _BASE_STAGE_TOKENS.items()]
+
+
+def append_curriculum_phases(manifest, scale: float | None = None,
+                             epoch_cap: float | None = None,
+                             rebalance_to: str | None = None) -> int:
     """Idempotently append S0..S8 as manifest phases. Returns how many
     were added (0 on re-run). Status vocabulary is the manifest's:
     planned|active|done|deferred — current_phase() activates 'planned'
     phases; anything else is invisible to the scheduler (a 'pending'
-    typo here once made the whole curriculum read as complete)."""
+    typo here once made the whole curriculum read as complete).
+    `scale` (v3): apply the data scale (rebalanced mixes) first; phases
+    that are still 'planned' take the scaled budget."""
+    if scale is not None and (scale, epoch_cap, rebalance_to) != (
+            _APPLIED_SCALE["factor"], _APPLIED_SCALE["epoch_cap"],
+            _APPLIED_SCALE["rebalance_to"]):
+        apply_curriculum_scale(scale, epoch_cap, rebalance_to)
     audit_epochs(warn=True)
     audit_mix(warn=True)
     have = {p["name"] for p in manifest.phases}
@@ -676,11 +878,16 @@ def append_curriculum_phases(manifest) -> int:
     for ds, toks in STAGE_TOKENS.items():
         name = ds.replace("-", "_")
         if name in have:
-            # repair pass: normalize a curriculum phase left unschedulable
-            # by the pre-fix status string
             for p in manifest.phases:
-                if p["name"] == name and p.get("status") == "pending":
+                if p["name"] != name:
+                    continue
+                # repair pass: normalize a curriculum phase left
+                # unschedulable by the pre-fix status string
+                if p.get("status") == "pending":
                     p["status"] = "planned"
+                # a still-planned phase follows the applied scale
+                if p.get("status") == "planned" and p["planned_tokens"] != toks:
+                    p["planned_tokens"] = toks
             continue
         manifest.phases.append(dict(name=name, dataset=ds,
                                     planned_tokens=toks, tokens_done=0,

@@ -70,10 +70,15 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
     hidden_eranks = []
     x = model.embed(sample_idx)
     for i, wrap in enumerate(model.blocks):
-        # frozen-trunk adapter wrappers (amoe-lora) hold the real block at
-        # .block — census taps read the inner block, then the wrapper's
-        # patch is applied to keep the replayed stream faithful
-        blk = getattr(wrap, "block", wrap)
+        # adapter wrappers (amoe-lora) hold the real block at .block — one
+        # wrapper per attached arm, nested (.block.block...): census taps
+        # read the innermost block, then every wrapper's patch is applied
+        # innermost-first to keep the replayed stream faithful
+        chain = []
+        blk = wrap
+        while hasattr(blk, "block"):
+            chain.append(blk)
+            blk = blk.block
         li = {}
         tap_attn = blk.n1(x)
         if blk.is_hub:
@@ -114,11 +119,11 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
         tap_bank = blk.n2(x)
         li["bank_addr"] = blk.bank.addr.health(tap_bank)
         x = x + blk.bank(tap_bank)
-        if wrap is not blk:
-            if hasattr(wrap, "adapter") and getattr(wrap, "enabled", True):
-                x = wrap.adapter(x)
-            elif hasattr(wrap, "disp"):
-                x = wrap.disp(x)
+        for w in reversed(chain):                 # innermost wrapper first
+            if hasattr(w, "adapter") and getattr(w, "enabled", True):
+                x = w.adapter(x)
+            elif hasattr(w, "disp"):
+                x = w.disp(x)
         li.update({f"bank_{k}": v for k, v in bank_stats(blk.bank).items()})
         li["hidden_erank"] = effective_rank(x[:2])
         hidden_eranks.append(li["hidden_erank"])
@@ -202,7 +207,8 @@ def toggle_ledger(model, val_batches: list) -> dict:
     led = {"bpb_full": full,
            "bpb_bank_off": bpb(disable_bank=True),
            "bpb_head_aleph_off": bpb(disable_head_aleph=True)}
-    if any(getattr(b, "block", b).is_hub for b in model.blocks):
+    from ..model.governor import raw_block
+    if any(raw_block(b).is_hub for b in model.blocks):
         led["bpb_hub_off"] = bpb(disable_hub=True)
     for k in list(led):
         if k != "bpb_full":

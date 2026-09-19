@@ -209,8 +209,9 @@ class AlephLM(nn.Module):
         gated on a grad-parity + throughput check on the training
         hardware — the speed verdict was no-grad forward only."""
         import torch as _torch
+        from .governor import raw_block
         for wrap in self.blocks:
-            blk = getattr(wrap, "block", wrap)
+            blk = raw_block(wrap)
             if blk.is_hub:
                 blk.attn = _torch.compile(blk.attn, **compile_kw)
         return self

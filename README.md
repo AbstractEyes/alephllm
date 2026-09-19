@@ -45,6 +45,7 @@ never trains through fp8 (fp8-e4m3 is the shipping format only).
 | mini-beatrix-0 | 512 / 12 / 1024 | 37.6M | byte-trigram | gate craft |
 | mini-beatrix-1 | 768 / 16 / 2048 | 112.5M | byte-trigram | COMPLETE — [automodel](https://huggingface.co/AbstractPhil/mini-beatrix-1) |
 | **mini-beatrix-2s** | 1024 / 20 / 4096 | 237.1M | byte-trigram | **COMPLETE 2026-08-31, 16.101B tokens, full splat — [automodel](https://huggingface.co/AbstractPhil/mini-beatrix-2s)** |
+| mini-beatrix-3 | 1024 / 24–28 / 4096 | 283–330M | byte-trigram | the v3 routine craft (`make_v3_preset`); designed, decisions pending — [notebook](notebooks/beatrix_v3_colab.ipynb) |
 | mini-beatrix-2 | 1024 / 32 / 8192 | 849.0M | byte-trigram | full splat; shelved pending logistics |
 | beatrix-voyager | 1536 / 24 / 4096 | 775.3M | BPE (gpt2) | awaits BPE screens |
 
@@ -71,6 +72,16 @@ The Colab entrypoint notebook is
 [notebooks/alephllm_colab.ipynb](notebooks/alephllm_colab.ipynb) —
 install cell + prep/train/eval. Training is resume-first: stop any time,
 rerun the notebook, it continues from the uploaded state.
+
+The v3 routine notebook is
+[notebooks/beatrix_v3_colab.ipynb](notebooks/beatrix_v3_colab.ipynb):
+a decision block (depth, data scale, epoch cap, rebalance rule, anneal
+multiplier, arm geometry, stage arms, waivers) that refuses to run while
+unfilled, a preflight with a micro-batch ladder and a price line, the data
+plane with its epoch tables, the guard core from the certification ledger,
+a push probe, the boundary-exact session driver (reports, arm anchors,
+clean halts), samples, the anneal watch and the growth table. `LOCAL = True`
+runs the whole notebook on a CPU toy craft.
 
 ## Instrumentation (born-in, no exceptions)
 
@@ -103,17 +114,26 @@ validation record and trained weights:
 python -m geolip.alephllm.tests.smoke
 ```
 
-35 mechanical cases: address identities, exact null paths, chunked-scan
+40 mechanical cases: address identities, exact null paths, chunked-scan
 vs naive-oracle equivalence, causality, optimizer-split coverage,
 checkpoint/stream/manifest resume roundtrips, crash safety (divergence
 never overwrites resume state), multi-constellation hub equivalence,
 governor projection, special-token laws, head revival, relay birth /
-scan / decode parity, canary well-formedness, a live 8-step train loop.
+scan / decode parity, canary well-formedness, a live 8-step train loop;
+and the v3 set — the v3 preset and its twins, the curriculum scaler
+(epoch cap, three rebalance rules, refusal without a rule, 1x restored
+bit-exact), the guard core (G1/G2/G3 replay; a halt that archives its
+position, never rewrites the last healthy resume point, and refuses to
+continue until a session clears it), per-phase LR multipliers, and the
+stage-arm program (bit-inert attach, plain trunk keys, one shared step,
+gauges, resume, a disabled member).
 
 ## Package layout — every code piece, briefly
 
 `presets.py` — the mission ladder: model + train configs per craft,
-including the `*-control` twins.
+including the `*-control` twins; `make_v3_preset` builds the v3 craft at
+a chosen depth with its data plane (scale, epoch cap, rebalance rule) and
+the two-phase anneal planned from birth.
 
 **model/**
 
@@ -134,7 +154,7 @@ including the `*-control` twins.
 |---|---|
 | `tokenizers.py` | the byte tokenizer (vocab 256; trigram composition lives in the embedding) and an HF BPE wrapper |
 | `streams.py` | resumable packed streaming from HF hub datasets; stream state rides in checkpoints |
-| `curriculum.py` | staged training mixes S0–S8 with procedural generators, plus the epoch-cap and ballast audits that guard every mix |
+| `curriculum.py` | staged training mixes S0–S8 with procedural generators, the epoch-cap and ballast audits that guard every mix, and the scaler that rebalances the mixes under an epoch cap at a larger data budget (three rebalance rules; refuses without one) |
 | `special_tokens.py` | control tokens placed in invalid-UTF-8 byte space (cannot collide with any real text), document packing, and the chat frame |
 
 **train/**
@@ -142,7 +162,9 @@ including the `*-control` twins.
 | file | what it is |
 |---|---|
 | `optim.py` | the measured optimizer split: Muon (Newton-Schulz orthogonalized momentum) on 2D transport weights, pure Adam (wd 0, never AdamW) on the rest |
-| `trainer.py` | the resume-first training loop: pulls manifest + state from the hub, session caps, crash-safe checkpointing, structured health readouts |
+| `trainer.py` | the resume-first training loop: pulls manifest + state from the hub, session caps, crash-safe checkpointing, structured health readouts; per-phase LR multipliers, the guard core and the stage-arm program ride in the same step; a data-plane fingerprint is asserted on resume |
+| `guards.py` | the red-flag guard core: three in-run evaluators (norm surge, dispatch-entropy collapse, rank collapse) over a pinned reference window, per-guard modes (halt / watch / off) filled from a certification ledger; a halt archives the position under its own name and the run refuses to continue until cleared |
+| `arms.py` | the stage-arm program: fresh relay arms attached per curriculum stage (bias-zeroed, inert at birth), trained under one pure-Adam group beside the trunk with a per-member abstention term on off-domain rows; masked-detachability gauges, anchors, resume, and member disabling on a fault |
 | `instruments.py` | the born-in gauge suite: effective-rank census, collapse detectors, sign census, gate trajectories, and the toggle ledger (per-mechanism causal contribution) |
 | `checkpoint.py` | bf16 checkpoints, fp8 shipping copies, resume state, and their HF uploads |
 | `manifest.py` | `RunManifest` — the run's state of record on the hub; pull → resume |
@@ -165,7 +187,7 @@ including the `*-control` twins.
 | `amoe_bridge.py` | attach/train amoe-lora arms on a locked core: byte chat rows, provenance-stamped anchors, exact-prefix masking |
 | `chat_sft.py` | the first chat-conditioning recipe — produces a detachable chat arm from a locked core |
 
-`tests/smoke.py` — the full 35-case test array above.
+`tests/smoke.py` — the full 40-case test array above.
 
 
 **Technical companion:** [TECHNICAL.md](TECHNICAL.md) — architecture, training semantics, instruments, and the Beatrix-era numbers spine.

@@ -61,10 +61,14 @@ def split_params(model: nn.Module):
         if isinstance(m, nn.Embedding):
             emb_ids.add(id(m.weight))
     muon, adam, seen = [], [], set()
-    for p in model.parameters():
+    for name, p in model.named_parameters():
         if id(p) in seen:
             continue
         seen.add(id(p))
+        if ".adapter." in name:
+            # attached arms (amoe wrappers) own their optimizer (pure Adam
+            # in the arm program) — never swept into the trunk's Muon
+            continue
         if p.ndim in (2, 3) and id(p) not in emb_ids:
             muon.append(p)
         else:
@@ -85,8 +89,11 @@ def lr_scale(step: int, warmup: int) -> float:
     return (step + 1) / warmup
 
 
-def apply_lr(optimizers, base_lrs, step: int, warmup: int):
-    s = lr_scale(step, warmup)
+def apply_lr(optimizers, base_lrs, step: int, warmup: int, mult: float = 1.0):
+    """Warmup scale x an optional per-phase multiplier (v3: the anneal as
+    a lower-LR consolidation stage, TrainConfig.phase_lr_scale; mult 1.0
+    everywhere = the flat-LR form verbatim). Returns the applied scale."""
+    s = lr_scale(step, warmup) * float(mult)
     for opt, base in zip(optimizers, base_lrs):
         for g in opt.param_groups:
             g["lr"] = base * s

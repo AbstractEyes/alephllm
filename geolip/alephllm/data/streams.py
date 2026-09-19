@@ -410,10 +410,26 @@ class MixStream:
 
     def state_dict(self) -> dict:
         return {"draws": self._draws,
+                "recipe": [[n, float(w)] for n, w in self.recipe],
                 "components": {n: s.state_dict()
                                for n, s in self._streams.items()}}
 
     def load_state_dict(self, st: dict):
+        # the recipe fingerprint (v3): a recipe change across a resume
+        # silently reshuffles the interleaving — fresh starts only across
+        # recipe changes, so a mismatch refuses instead of drifting
+        saved = st.get("recipe")
+        if saved is not None:
+            live = [[n, float(w)] for n, w in self.recipe]
+            same = (len(saved) == len(live) and all(
+                a[0] == b[0] and abs(float(a[1]) - float(b[1])) < 1e-6
+                for a, b in zip(saved, live)))
+            if not same:
+                raise RuntimeError(
+                    f"mix '{self.dataset}' recipe changed across resume: saved "
+                    f"{saved} vs live {live} — a recipe change needs a fresh "
+                    "start (re-apply the same data scale / rebalance, or start "
+                    "the phase over)")
         self._draws = int(st.get("draws", 0))
         for n, s in self._streams.items():
             if n in st.get("components", {}):

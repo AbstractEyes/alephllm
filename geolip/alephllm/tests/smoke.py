@@ -857,6 +857,301 @@ def t_relay_mhat():
     assert d < 1e-6, f"signed@A vs m_hat closed form: {d}"
 
 
+@case("v3 preset: mini-beatrix-3 builds; 64.4B chronological planned phases; twins isolated")
+def t_v3_presets():
+    from ..presets import make_v3_preset
+    p = get_preset("mini-beatrix-3")
+    assert p.model.n_layers == 24 and p.model.hub_layers == tuple(range(24))
+    assert p.model.hub_K <= 2 * p.model.hub_D, "supply law"
+    assert p.train.head_addr_frozen is False and p.train.compile is False
+    names = [ph["name"] for ph in p.curriculum]
+    assert names[:2] == ["warmup_wikitext", "fineweb_main"]
+    assert names[-2:] == ["anneal_nochat", "anneal_mix"]
+    assert names.index("curriculum_s8") < names.index("anneal_nochat")
+    assert all(ph["status"] == "planned" for ph in p.curriculum)
+    tot = sum(ph["planned_tokens"] for ph in p.curriculum)
+    assert abs(tot - 64.4e9) < 1e6, tot
+    assert p.data_scale == 4.0
+    c = get_preset("mini-beatrix-3-control")
+    assert c.model.hub_layers == () and c.data_scale == 4.0
+    assert c.train.phase_lr_scale is not p.train.phase_lr_scale, "dict aliased"
+    q = make_v3_preset(28, name="x", data_scale=1.0)
+    assert q.model.n_layers == 28 and abs(sum(
+        ph["planned_tokens"] for ph in q.curriculum) - 16.1e9) < 1e6
+    n = AlephLM(get_preset("mini-beatrix-3-l28").model).param_count() / 1e6
+    assert 300 < n < 360, f"L28 {n:.1f}M"
+
+
+@case("curriculum scale: 4x caps every finite corpus; natural/generators/hold rules; refusal; 1x bit-exact")
+def t_curriculum_scale():
+    from ..data import curriculum as C
+    sc = C.scaled_curriculum(4.0, epoch_cap=4.0, rebalance_to="natural")
+    assert abs(sum(sc["stage_tokens"].values())
+               - 4 * sum(C._BASE_STAGE_TOKENS.values())) < 1
+    assert not sc["flags"], sc["flags"]
+    for st, n, wb, wa, eb, ea in sc["table"]:
+        assert ea <= 4.0 + 1e-6, (st, n, ea)
+    moved = [r for r in sc["table"] if r[2] != r[3]]
+    assert moved, "4x must cap something (siqa/aochildes/babi...)"
+    for st, mix in sc["mixes"].items():
+        assert abs(sum(w for _, w in mix) - 1.0) < 1e-3
+        ballast = sum(w for n, w in mix if n in C.NATURAL)
+        assert ballast >= C.MIN_BALLAST - 1e-9, (st, ballast)
+        top = max([w for n, w in mix if n.endswith("-synth")], default=0.0)
+        assert top <= C.MAX_GENERATOR_SHARE + 1e-9, (st, top)
+        base = dict(C._BASE_MIXES[st])
+        for n, w in mix:
+            if n.endswith("-synth"):
+                assert abs(w - base[n]) < 2e-5, "generator share must not move"
+    assert sc["cross_stage"]["siqa-narrative"] > 4.0, "cross-stage column"
+    # the record's precedent: generators absorb first, capped at their share
+    sg = C.scaled_curriculum(4.0, epoch_cap=4.0, rebalance_to="generators")
+    s1 = dict(sg["mixes"]["curriculum-s1"])
+    assert s1["perspective-synth"] > 0.30 - 1e-9 and s1["perspective-synth"] <= C.MAX_GENERATOR_SHARE + 1e-9
+    for st, mix in sg["mixes"].items():
+        for n, w in mix:
+            if n.endswith("-synth"):
+                assert w <= C.MAX_GENERATOR_SHARE + 1e-9, (st, n, w)
+    # the law's ~2 cap moves more weight than the audit's 4
+    s2 = C.scaled_curriculum(4.0, epoch_cap=2.0, rebalance_to="natural")
+    assert len([r for r in s2["table"] if r[2] != r[3]]) >= len(moved)
+    # hold: stages at 1x, the extra returned for general text
+    sh = C.scaled_curriculum(4.0, epoch_cap=4.0, rebalance_to="hold")
+    assert sh["stage_tokens"] == C._BASE_STAGE_TOKENS
+    assert sh["held_tokens"] == 3 * sum(C._BASE_STAGE_TOKENS.values())
+    assert not [r for r in sh["table"] if r[2] != r[3]]
+    # no rule = a refusal, with the offending stage named
+    try:
+        C.scaled_curriculum(4.0)
+        raise AssertionError("4x without a rebalance rule must refuse")
+    except ValueError as e:
+        assert "curriculum-s0" in str(e) and "rebalance_to" in str(e)
+    assert "epoch_cap" in C.scaled_curriculum(4.0, rebalance_to="natural")["flags"]
+    one = C.scaled_curriculum(1.0)
+    for st, mix in one["mixes"].items():
+        base, got = dict(C._BASE_MIXES[st]), dict(mix)
+        assert set(base) == set(got)
+        assert all(abs(base[k] - got[k]) < 1e-9 for k in base), st
+    dp1, dp2 = C.data_plane(4.0, 4.0, "natural"), C.data_plane(4.0, 2.0, "natural")
+    assert dp1["recipe_hash"] != dp2["recipe_hash"] and dp1 == C.data_plane(4.0, 4.0, "natural")
+    assert C.data_plane(1.0)["recipe_hash"] == C.data_plane(1.0)["recipe_hash"]
+    before = {k: [tuple(x) for x in v] for k, v in C.CURRICULUM_MIXES.items()
+              if k in C.STAGE_TOKENS}
+    C.apply_curriculum_scale(4.0, 4.0, "natural", verbose=False)
+    assert C.STAGE_TOKENS["curriculum-s0"] == 2_800_000_000
+    assert dict(C.CURRICULUM_MIXES["curriculum-s1"])["siqa-narrative"] < 0.02
+    C.apply_curriculum_scale(1.0, verbose=False)
+    after = {k: [tuple(x) for x in v] for k, v in C.CURRICULUM_MIXES.items()
+             if k in C.STAGE_TOKENS}
+    assert after == before, "1x restore is not bit-exact"
+    assert len(C.curriculum_phases(4.0)) == 9
+    assert C.curriculum_phases(4.0, "hold")[0]["planned_tokens"] == 700_000_000
+    # a still-planned manifest phase follows the applied scale
+    from ..train.manifest import RunManifest
+    m = RunManifest.fresh("x", {}, C.curriculum_phases(1.0))
+    m.phases[0]["status"] = "done"
+    assert C.append_curriculum_phases(m, 4.0, 4.0, "natural") == 0
+    assert m.phases[0]["planned_tokens"] == 700_000_000
+    assert m.phases[1]["planned_tokens"] == 2_800_000_000
+    C.apply_curriculum_scale(1.0, verbose=False)
+
+
+@case("guards: G1/G2/G3 replay a synthetic series at the expected steps; modes; state roundtrip")
+def t_guards():
+    from ..train.guards import (GuardConfig, GuardCore, g1_eval, g2_eval,
+                                g3_eval, certification_from_ledger)
+    cfg = GuardConfig(ref_window=(100, 200), log_every=10, census_every=10,
+                      g1_window=5, g2_sustain=2, g3_exempt_last=1,
+                      modes={"G1": "halt", "G2": "watch", "G3": "halt"})
+    steps = list(range(10, 401, 10))
+    g = [8.0 if s > 300 else 0.5 for s in steps]
+    f1, r1 = g1_eval(steps, g, cfg)
+    assert f1 == 330, (f1, r1)
+    ent = {"0": [0.8] * 40, "1": [0.8 if s <= 250 else 0.4 for s in steps],
+           "2": [0.8] * 40}
+    f2, r2 = g2_eval(steps, ent, 3, cfg)
+    assert f2 == 270 and r2["fire_layer"] == 1, (f2, r2)
+    er = {"0": [100.0 if s < 300 else 5.0 for s in steps], "1": [100.0] * 40,
+          "2": [3.0 if s >= 200 else 100.0 for s in steps]}
+    f3, r3 = g3_eval(steps, er, 3, cfg)
+    assert f3 == 300 and r3["fire_layer"] == 0, (f3, r3)
+    assert g3_eval(steps, er, 3, cfg, exempt_last=0)[0] == 200, "funnel exempt"
+    core = GuardCore(cfg, 3)
+    fired = []
+    for i, s in enumerate(steps):
+        core.observe_gnorm(s, g[i])
+        census = {"layers": {L: {"bank_dispatch_entropy_frac": ent[str(L)][i],
+                                 "hidden_erank": er[str(L)][i]}
+                             for L in range(3)},
+                  "flags": {"den_floor": s == 50}, "flag_detail": {}}
+        core.observe_census(s, census)
+        fired += core.check(s)
+    assert [n for n, _ in fired] == ["G2", "G3", "G1"], fired
+    assert core.halting(fired[:1]) == [] and len(core.halting(fired)) == 2
+    assert core.flags_first["den_floor"]["step"] == 50
+    core2 = GuardCore(cfg, 3)
+    core2.load_state_dict(core.state_dict())
+    assert core2.fired == core.fired and core2.check(400) == []
+    led = {"verdict": {"certification": {
+        "G1": {"CERTIFIED": True}, "G2": {"CERTIFIED": False},
+        "G3_exempt2": {"CERTIFIED": True}}}}
+    assert certification_from_ledger(led)["modes"] == {"G1": "halt", "G2": "watch",
+                                                         "G3": "halt"}
+
+
+@case("phase LR: multiplier after warmup; {} = the flat form; a guard halt returns cleanly + resumes")
+def t_phase_lr_and_guard_halt():
+    from ..train.optim import apply_lr, lr_scale
+    from ..train.trainer import Trainer
+    from ..train.guards import GuardConfig
+    from ..presets import Preset, TrainConfig
+    m = AlephLM(TINY)
+    opts = build_optimizers(m, 2e-2, 0.95, 3e-4)
+    s = apply_lr(opts, [2e-2, 3e-4], 500, 200, mult=0.3)
+    assert abs(s - 0.3) < 1e-12 and abs(opts[0].param_groups[0]["lr"] - 6e-3) < 1e-12
+    assert abs(apply_lr(opts, [2e-2, 3e-4], 100, 200) - lr_scale(100, 200)) < 1e-12
+
+    class _T:
+        tc = TrainConfig(phase_lr_scale={"anneal": 0.25, "anneal_mix": 0.5})
+    assert Trainer._phase_mult(_T(), "anneal_nochat") == 0.25
+    assert Trainer._phase_mult(_T(), "anneal_mix") == 0.5, "longest prefix wins"
+    assert Trainer._phase_mult(_T(), "curriculum_s0") == 1.0
+    # a guard that fires at the first sample after its reference window
+    # (five samples at steps 1..5; the halt at step 6, after the step-4
+    # checkpoint — so latest.pt must stay at step 4)
+    gc = GuardConfig(ref_window=(0, 5), log_every=1, census_every=2,
+                     census_dataset="synthetic", g1_window=1, g1_ratio=0.0,
+                     g1_clip_points=-1.0,
+                     modes={"G1": "halt", "G2": "off", "G3": "off"})
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        p = Preset(model=TINY,
+                   train=TrainConfig(micro_batch=2, grad_accum=1, warmup_steps=2,
+                                     log_every=1, health_every=100, eval_every=100,
+                                     ckpt_every=4, tb_upload_every=100,
+                                     val_tokens=256, canary_episodes=4),
+                   curriculum=[dict(name="syn", dataset="synthetic",
+                                    planned_tokens=10_000_000, status="planned")])
+        t = Trainer(p, hf_token=None, out_dir=td, resume=False, guard=gc,
+                    device="cpu")
+        t.train(max_steps=20)
+        assert t._guard_halt is not None and t._guard_halt["guard"] == "G1"
+        assert t.step == 6, t.step
+        rdir = os.path.join(td, "tiny-test", "resume")
+        assert os.path.exists(os.path.join(rdir, "guard_G1_step6.pt"))
+        latest = torch.load(os.path.join(rdir, "latest.pt"), map_location="cpu",
+                            weights_only=False)
+        assert latest["step"] == 4, "the halt must not rewrite latest.pt"
+        arch = torch.load(os.path.join(rdir, "guard_G1_step6.pt"), map_location="cpu",
+                          weights_only=False)
+        assert arch["step"] == 6 and "G1" in arch["guard"]["fired"]
+        assert t.manifest.halt["guard"] == "G1" and t.manifest.halt["step"] == 6
+        assert t.manifest.halt["archive"] == "resume/guard_G1_step6.pt"
+        assert any("GUARD HALT" in n["msg"] for n in t.manifest.notes)
+        assert not any(c["kind"] == "fp8" and c["step"] == 6 for c in t.manifest.checkpoints)
+        t2 = Trainer(p, hf_token=None, out_dir=td, resume=True, guard=gc,
+                     device="cpu")
+        assert t2.step == 4 and t2.manifest.halt["guard"] == "G1"
+        assert torch.equal(t2.guard.census_batch, t.guard.census_batch), "pinned batch"
+        try:
+            t2.train(max_steps=1)
+            raise AssertionError("a halted run must refuse to train")
+        except RuntimeError as e:
+            assert "HALTED RUN" in str(e)
+        t2.train(max_steps=1, resume_after_halt=True)
+        assert t2.step == 5 and t2.manifest.halt is None
+        assert any("HALT CLEARED" in n["msg"] for n in t2.manifest.notes)
+        t2.guard.record_boundary_read("G5", "syn", {"fired": False, "step": 5})
+        assert "G5" in t2.guard.summary()["boundary_reads"]
+
+
+@case("stage arms: attach bit-inert; plain trunk keys; one step moves arms+trunk; gauges; resume")
+def t_arms():
+    try:
+        import amoe  # noqa: F401
+    except ImportError:
+        raise AssertionError("amoe-lora is not installed in this env — the "
+                             "stage-arm program needs it: pip install "
+                             "'amoe-lora @ git+https://github.com/AbstractEyes/amoe-lora'")
+    from ..train.arms import (StageArm, ArmProgramConfig, StageArmProgram,
+                              trunk_state_dict)
+    from ..train.trainer import Trainer
+    from ..model.governor import govern_model
+    from ..presets import Preset, TrainConfig
+    from safetensors.torch import load_file
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        acfg = ArmProgramConfig(
+            arms=[StageArm("a0", phase="syn", spec=dict(n_slots=4, K=8, D=4, hidden=16),
+                           lam=2.0, seed=1)],
+            lr=1e-3, abstain_chunks=1, offdomain_dataset="synthetic", offdomain_seed=9)
+        p = Preset(model=TINY,
+                   train=TrainConfig(micro_batch=2, grad_accum=1, warmup_steps=2,
+                                     log_every=2, health_every=4, eval_every=100,
+                                     ckpt_every=100, tb_upload_every=100,
+                                     val_tokens=256, canary_episodes=4),
+                   curriculum=[dict(name="syn", dataset="synthetic",
+                                    planned_tokens=10_000_000, status="planned")])
+        t = Trainer(p, hf_token=None, out_dir=td, resume=False,
+                    arms=StageArmProgram(acfg), device="cpu")
+        x = torch.randint(0, 256, (2, 33))
+        t.raw_model.eval()
+        with torch.no_grad():
+            ref = t.raw_model(x).logits.clone()
+        t.arms.sync("syn")
+        assert t.arms.attached == ["a0"]
+        with torch.no_grad():
+            armed = t.raw_model(x).logits
+        assert torch.equal(ref, armed), "a fresh bias-zeroed arm must be bit-inert"
+        assert set(trunk_state_dict(t.raw_model)) == set(AlephLM(TINY).state_dict())
+        w_arm = [q.detach().clone() for q in t.arms.params()]
+        w_trunk = t.raw_model.embed.emb0.weight.detach().clone()
+        t.train(max_steps=2)
+        assert any(not torch.equal(a, b) for a, b in zip(w_arm, t.arms.params()))
+        assert not torch.equal(w_trunk, t.raw_model.embed.emb0.weight)
+        t.raw_model.eval()
+        with torch.no_grad():        # the armed read AT the checkpoint (the
+            a1 = t.raw_model(x).logits.clone()   # governor below may move weights)
+        census = instruments.model_census(t.raw_model, x[:, :-1])
+        assert set(census["layers"]) == {0, 1, 2} and "hub_consumed_erank" in census["layers"][1]
+        govern_model(t.raw_model, 45.0)
+        ev = t._full_eval()
+        assert "toggle_arms_off" in ev["ledger"]
+        g = t.arms.gauges(t._val(), t._val())
+        assert "a0" in g and math.isfinite(g["a0"]["fineweb_delta"])
+        assert math.isfinite(g["a0"]["selectivity"])
+        sd = load_file(os.path.join(td, "tiny-test",
+                                    f"checkpoints/step_{t.step:08d}.safetensors"))
+        assert "blocks.0.n1.weight" in sd and not any(".adapter." in k for k in sd)
+        t2 = Trainer(p, hf_token=None, out_dir=td, resume=True,
+                     arms=StageArmProgram(acfg), device="cpu")
+        assert t2.step == 2 and t2.arms.attached == ["a0"]
+        t2.raw_model.eval()
+        with torch.no_grad():
+            a2 = t2.raw_model(x).logits
+        assert torch.equal(a1, a2), "resumed armed logits differ"
+        ck = t2.arms.anchor("a0", "tiny-test", t2.step)
+        assert any(k.endswith("addr.home") for k in ck.adapters), "anchor format"
+        assert ck.meta["base_model_id"] == "alephllm/tiny-test@step2"
+        m3 = AlephLM(TINY)
+        m3.load_state_dict({k: v.float() for k, v in
+                            trunk_state_dict(t2.raw_model).items()})
+        m3.eval()
+        with t2.arms.handles["a0"].all_off():
+            with torch.no_grad():
+                off = t2.raw_model(x).logits
+        with torch.no_grad():
+            bare = m3(x).logits
+        assert torch.equal(off, bare), "masked arm != the plain-key trunk"
+        # a faulty member leaves the step, the program stays resumable
+        t2.arms.disable("a0", "smoke")
+        assert not t2.arms.active and t2.arms.chunks_per_step(1) == 0
+        assert t2.arms.state_dict()["disabled"] == {"a0": "smoke"}
+        with torch.no_grad():
+            assert torch.equal(t2.raw_model(x).logits, bare), "disabled = masked"
+        muon_p, _ = split_params(t2.raw_model)
+        assert not any(id(p) in {id(q) for q in t2.arms.params()} for p in muon_p), \
+            "arm parameters must never enter the trunk's optimizer split"
+
+
 def main():
     passed = failed = 0
     for name, fn in RESULTS:

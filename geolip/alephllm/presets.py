@@ -110,6 +110,16 @@ class TrainConfig:
     # requires_grad-only: optimizer param groups are UNCHANGED, so resume
     # state loads verbatim (Muon skips grad-less params).
     head_addr_frozen: bool = False
+    # v3 (2026-09-19): per-phase LR multiplier keyed by phase-name PREFIX
+    # ({"anneal": 0.5} scales both anneal phases). {} = the flat-LR form
+    # verbatim — the v2 anneal ran at lr_scale 1.000 throughout (a diet
+    # change, not an LR decay); the anneal as a LOWER-rate consolidation
+    # stage is the v3 routine's term, its multiplier unmeasured (owed).
+    phase_lr_scale: dict = field(default_factory=dict)
+    # v3: open every phase's stream with a phase-specific seed offset so a
+    # corpus that sits at the same recipe index in several stages does not
+    # replay the identical shuffle head; False = the 2s form.
+    phase_seed_offset: bool = False
 
 
 # All missions upload to the one training repo, each under its own prefix
@@ -123,6 +133,16 @@ class Preset:
     train: TrainConfig
     hf_repo: str = TRAINING_REPO                   # run repo (ckpts+manifest+tb)
     curriculum: list = field(default_factory=list) # [(phase, dataset, planned_tokens)]
+    # v3: the curriculum-stage mixes are scaled (and rebalanced under the
+    # epoch cap) by this factor when the trainer opens a stage — see
+    # data/curriculum.py apply_curriculum_scale. 1.0 = the 2s schedule.
+    data_scale: float = 1.0
+    # v3: the two data-plane decisions a scale other than 1x needs (the
+    # trainer refuses to open a scaled stage without them): the epoch cap
+    # per finite corpus per stage (None = the audit threshold, flagged)
+    # and the rebalance rule ('natural' | 'generators' | 'hold').
+    epoch_cap: float | None = None
+    rebalance_to: str | None = None
 
     @property
     def prefix(self) -> str:                       # path prefix inside hf_repo
@@ -211,6 +231,81 @@ PRESETS: dict[str, Preset] = {
     ),
 }
 
+def make_v3_preset(n_layers: int = 24, d_model: int = 1024,
+                   data_scale: float = 4.0, epoch_cap: float | None = None,
+                   rebalance_to: str | None = None,
+                   name: str | None = None) -> Preset:
+    """The v3 craft (plan of record 2026-09-15, S2/S14; sizing 09-15):
+    the solidified all-splat form at d1024 — a governed hub in EVERY
+    block, the certified hub geometry (4 books x 64 @ D128), banks
+    3 x ff1024, head 256@256, ctx 4096 — at a depth the throughput bench
+    priced (24 or 28 blocks; the choice is the program lead's, with the
+    price beside it). Phases at `data_scale` x the 2s schedule (4x:
+    warmup 0.3B, fineweb_main 20.9B, S0-S8 35.2B rebalanced under the
+    epoch cap, anneal_nochat 4B, anneal_mix 4B = 64.4B bytes), listed
+    CHRONOLOGICALLY and planned from birth (the two-phase anneal is part
+    of the routine, not a post-hoc activation). Birth recipe: the head
+    address trains (head_addr_frozen False — the 2s's True is a
+    post-revival flag); no hub gain, no fusion (owed / the lead's).
+    epoch_cap / rebalance_to: the data-plane decisions (the trainer
+    refuses a scaled stage without a rebalance rule); under 'hold' the
+    stages stay at 1x and the held budget goes to fineweb_main."""
+    from .data.curriculum import curriculum_phases, _BASE_STAGE_TOKENS
+    if name is None:
+        name = "mini-beatrix-3" if n_layers == 24 and d_model == 1024 \
+            else f"mini-beatrix-3-d{d_model}-l{n_layers}"
+    s = float(data_scale)
+    model = AlephLMConfig(name=name, d_model=d_model, n_layers=n_layers,
+                          n_heads=max(1, d_model // 64), context=4096,
+                          hub_layers=tuple(range(n_layers)),
+                          hub_K=64, hub_D=128, hub_const=4,
+                          bank_experts=3, bank_ff=1024,
+                          head_K=256, head_D=256, hub_chunk=256, hub_ckpt=0)
+    train = TrainConfig(micro_batch=16, grad_accum=4,
+                        governor="minsep", governor_theta=45.0,
+                        head_addr_frozen=False, phase_seed_offset=True)
+    # the warmup phase stays at 300M (the LR warmup is 200 steps = 52M
+    # tokens; wikitext-103 is a finite corpus the stage audit does not
+    # cover) and its share of the scale moves to fineweb_main, so the
+    # general-text total is (0.3 + 5.0) x scale exactly
+    warm = 300_000_000
+    main = int((300_000_000 + 5_000_000_000) * s) - warm
+    if rebalance_to == "hold":
+        # the stages stay at 1x bytes; the held (s-1) x 8.8B is general text
+        main += int(round((s - 1.0) * sum(_BASE_STAGE_TOKENS.values())))
+    phases = [
+        dict(name="warmup_wikitext", dataset="wikitext-103",
+             planned_tokens=warm, status="planned"),
+        dict(name="fineweb_main", dataset="fineweb-edu",
+             planned_tokens=main, status="planned"),
+        *curriculum_phases(s, rebalance_to),
+        dict(name="anneal_nochat", dataset="anneal-nochat",
+             planned_tokens=int(1_000_000_000 * s), status="planned"),
+        dict(name="anneal_mix", dataset="anneal-mix",
+             planned_tokens=int(1_000_000_000 * s), status="planned"),
+    ]
+    return Preset(model=model, train=train, curriculum=phases, data_scale=s,
+                  epoch_cap=epoch_cap, rebalance_to=rebalance_to)
+
+
+try:
+    PRESETS["mini-beatrix-3"] = make_v3_preset(24)
+    PRESETS["mini-beatrix-3-l28"] = make_v3_preset(28, name="mini-beatrix-3-l28")
+except ImportError:
+    # the vendored automodel copies (the mirror law) carry model/ +
+    # presets.py without the data stack: the v3 presets need the
+    # curriculum registry and are simply absent there
+    pass
+
+
+def _copy_train(t: TrainConfig) -> TrainConfig:
+    """A field-wise copy with NO shared containers (the dict field would
+    otherwise alias between a treatment and its twin)."""
+    import copy as _copy
+    return TrainConfig(**{k: _copy.deepcopy(getattr(t, k))
+                          for k in t.__dataclass_fields__})
+
+
 # Pure-sdpa control crafts (hub layers removed) — the running architecture
 # control for any mission: same params otherwise, suffix "-control".
 for _name in list(PRESETS):
@@ -222,11 +317,12 @@ for _name in list(PRESETS):
     # form let treatment-specific flags leak into controls (2s-control
     # inherited head_addr_frozen=True, a post-revival flag no control's
     # birth recipe may carry) and made cross-mutation possible.
-    _t = TrainConfig(**{k: getattr(_p.train, k)
-                        for k in _p.train.__dataclass_fields__})
+    _t = _copy_train(_p.train)
     PRESETS[_name + "-control"] = Preset(
         model=_m, train=_t,
-        curriculum=[dict(x) for x in _p.curriculum])
+        curriculum=[dict(x) for x in _p.curriculum],
+        data_scale=_p.data_scale, epoch_cap=_p.epoch_cap,
+        rebalance_to=_p.rebalance_to)
 
 # The 2s architecture control runs the BIRTH recipe verbatim: born-null
 # unfrozen head (it buries, as the treatment's did for its first 24,860

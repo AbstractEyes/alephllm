@@ -28,6 +28,14 @@ class RunManifest:
     # checkpoint: {step, tokens, kind: safetensors|resume|fp8, path, val_bpb}
     data_state: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
+    # v3: a certified red-flag halt ({guard, step, phase, archive, info});
+    # a halted run refuses to continue until a session clears it
+    # explicitly (Trainer.train(resume_after_halt=True))
+    halt: dict | None = None
+    # v3: the data plane the run was created under ({data_scale, epoch_cap,
+    # rebalance_to, recipe_hash}) — asserted on resume so a session cannot
+    # silently continue on a different mix (the recipe-fingerprint law)
+    data_plane: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------- phases
     def current_phase(self) -> dict | None:

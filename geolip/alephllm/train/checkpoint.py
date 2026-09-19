@@ -99,19 +99,24 @@ class HubSync:
             f"(NOT treating this as 'no resume exists'): {last}")
 
     # ----------------------------------------------------------- weights
-    def save_safetensors(self, model, step: int) -> str:
+    def save_safetensors(self, model, step: int, state_dict=None) -> str:
+        """`state_dict` (v3): an explicit trunk view — with arms attached
+        the model's own state dict carries wrapper-prefixed keys that a
+        plain craft cannot load; the trainer passes the plain view."""
+        src = model.state_dict() if state_dict is None else state_dict
         sd = {k: v.detach().to(torch.bfloat16).contiguous().cpu()
-              for k, v in model.state_dict().items()}
+              for k, v in src.items()}
         name = f"checkpoints/step_{step:08d}.safetensors"
         path = os.path.join(self.local, name)
         save_file(sd, path, metadata={"step": str(step), "format": "bf16"})
         self._up(path, name)
         return name
 
-    def save_fp8(self, model, step: int) -> str:
+    def save_fp8(self, model, step: int, state_dict=None) -> str:
         """fp8-e4m3 shipping variant: 2D+ weights stored fp8 with a
         per-tensor fp32 scale (amax -> 448); small params kept bf16."""
-        sd, out = model.state_dict(), {}
+        sd = model.state_dict() if state_dict is None else state_dict
+        out = {}
         for k, v in sd.items():
             v = v.detach().float().cpu()
             if v.ndim >= 2 and v.numel() > 4096:
@@ -130,13 +135,18 @@ class HubSync:
     # ------------------------------------------------------------ resume
     def save_resume(self, model, optimizers, stream_state: dict,
                     manifest: RunManifest, step: int,
-                    archive_as: str | None = None) -> str:
+                    archive_as: str | None = None, state_dict=None,
+                    extra: dict | None = None, skip_latest: bool = False) -> str:
         """archive_as: extra immutable copy (e.g. a stage boundary), so a
         later rollback restores optimizer + stream state EXACTLY instead
         of restarting the optimizer — resume/latest.pt is overwritten
-        every checkpoint and cannot serve that purpose."""
+        every checkpoint and cannot serve that purpose.
+        state_dict / extra (v3): the plain trunk view and the side state
+        (stage arms, guards) that must ride with the resume point.
+        skip_latest (v3): write ONLY the archive — a guard halt keeps
+        resume/latest.pt at the last healthy checkpoint."""
         payload = {
-            "model": model.state_dict(),
+            "model": model.state_dict() if state_dict is None else state_dict,
             "optimizers": [o.state_dict() for o in optimizers],
             "stream": stream_state,
             "manifest": json.loads(manifest.to_json()),
@@ -145,13 +155,18 @@ class HubSync:
                              if torch.cuda.is_available() else None)},
             "step": step,
         }
-        path = os.path.join(self.local, "resume", "latest.pt")
-        torch.save(payload, path)
-        self._up(path, "resume/latest.pt")
+        if extra:
+            payload.update(extra)
+        if not skip_latest:
+            path = os.path.join(self.local, "resume", "latest.pt")
+            torch.save(payload, path)
+            self._up(path, "resume/latest.pt")
         if archive_as:
             apath = os.path.join(self.local, "resume", archive_as)
             torch.save(payload, apath)
             self._up(apath, f"resume/{archive_as}")
+            if skip_latest:
+                return f"resume/{archive_as}"
         return "resume/latest.pt"
 
     def load_resume(self) -> dict | None:
@@ -165,7 +180,13 @@ class HubSync:
 
     # ---------------------------------------------------------- manifest
     def push_manifest(self, manifest: RunManifest):
-        self.upload_bytes(manifest.to_json().encode(), "manifest.json")
+        text = manifest.to_json()
+        # the local copy rides with every push (v3): a tokenless run's
+        # halt record lives here, and a hub run keeps a same-session mirror
+        with open(os.path.join(self.local, "manifest.json"), "w",
+                  encoding="utf-8") as f:
+            f.write(text)
+        self.upload_bytes(text.encode(), "manifest.json")
 
     def pull_manifest(self) -> RunManifest | None:
         path = self.download("manifest.json")
