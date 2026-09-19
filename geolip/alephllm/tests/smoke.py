@@ -1152,6 +1152,158 @@ def t_arms():
             "arm parameters must never enter the trunk's optimizer split"
 
 
+# ------------------------------------------------------------ weak-token fusion (v3)
+def _fusion_cfg(hub_layers=(0, 1, 2), **spec):
+    import dataclasses
+    base = dict(rule="spacelike", k_lo=1, k_hi=1)
+    base.update(spec)
+    return dataclasses.replace(TINY, name="tiny-fused", hub_layers=hub_layers, fusion=base)
+
+
+def _atlas_table(path):
+    """A synthetic atlas table: every cell 'a'-led is a choice point (3 bits), everything else closed (0 bits),
+    cells with the first byte 'z' unwitnessed."""
+    import numpy as np
+    ent = np.zeros(256 ** 3, dtype=np.uint8)
+    wit = np.full(256 ** 3, 100, dtype=np.uint16)
+    idx = np.arange(256 ** 3)
+    b0 = idx // 65536
+    ent[b0 == ord("a")] = 3 * 16
+    wit[b0 == ord("z")] = 0
+    np.savez_compressed(path, entropy_x16=ent, witness=wit)
+    return path
+
+
+@case("fusion: no middle (k_lo = n_layers) reproduces the unfused logits exactly")
+def t_fusion_identity():
+    torch.manual_seed(3)
+    m0 = AlephLM(TINY)
+    torch.manual_seed(3)
+    m1 = AlephLM(_fusion_cfg(hub_layers=TINY.hub_layers, k_lo=3, k_hi=0))   # the same layout; no middle
+    missing, unexpected = m1.load_state_dict(m0.state_dict(), strict=False)
+    assert missing == ["fusion.null"] and not unexpected, (missing, unexpected)
+    m0.eval(); m1.eval()
+    x = torch.randint(0, 256, (2, 48))
+    with torch.no_grad():
+        d = (m0(x).logits - m1(x).logits).abs().max().item()
+    assert d == 0.0 or d < 1e-6, f"identity broken {d:.2e}"
+
+
+@case("fusion: forced starts at specials and newlines (both sides); units never cross them")
+def t_fusion_forced():
+    from ..model.fusion import Fusion
+    from ..data.special_tokens import DOC, END
+    f = Fusion(dict(rule="spacelike"), 8)
+    x = torch.tensor([[ord("a"), ord("b"), 10, 10, ord("c"), DOC, ord("d"), ord("e"), END, ord("f")]])
+    st = f.starts(x)[0].tolist()
+    assert st[2] and st[3] and st[4], f"newline pair must be two units and release the next byte: {st}"
+    assert st[5] and st[6] and st[8] and st[9], f"specials are their own units: {st}"
+    assert not st[1], "b fuses into a"
+    assert not st[7], "e fuses into d"
+
+
+@case("fusion: the parallel path is causal (prefix logits invariant to the suffix)")
+def t_fusion_causal():
+    torch.manual_seed(4)
+    m = AlephLM(_fusion_cfg())
+    m.eval()
+    x = torch.randint(0, 256, (1, 64))
+    y = x.clone()
+    y[0, 40:] = torch.randint(0, 256, (24,))
+    with torch.no_grad():
+        la, _ = m(x)
+        lb, _ = m(y)
+    d = (la[0, :39] - lb[0, :39]).abs().max().item()
+    assert d < 1e-4, f"fusion causality leak {d:.2e}"
+
+
+@case("fusion: cached decode matches the parallel path, rows with different unit structures")
+def t_fusion_decode():
+    torch.manual_seed(5)
+    m = AlephLM(_fusion_cfg())
+    m.eval()
+    text = [b"the quick brown fox jumps over the lazy dog\n\nand then some more words here",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    x = torch.tensor([list(t[:70]) for t in text])
+    with torch.no_grad():
+        full = m(x).logits
+        logits, cache = m.prefill(x[:, :30])
+        assert (logits[:, 0] - full[:, 29]).abs().max().item() < 1e-4, "prefill last-position mismatch"
+        worst = 0.0
+        for t in range(30, 70):
+            lt = m.decode_step(x[:, t], cache)
+            if t + 1 < 70:
+                worst = max(worst, (lt[:, 0] - full[:, t]).abs().max().item())
+    assert worst < 1e-3, f"fused decode drifts from the parallel path: {worst:.2e}"
+
+
+@case("fusion: the entropy rule reads the atlas table (choice points, unwitnessed cells) and decodes")
+def t_fusion_entropy():
+    import numpy as np
+    with tempfile.TemporaryDirectory() as td:
+        path = _atlas_table(os.path.join(td, "atlas.npz"))
+        torch.manual_seed(6)
+        m = AlephLM(_fusion_cfg(rule="entropy", theta=1.0, table=path, witness_floor=8))
+        m.eval()
+        x = torch.tensor([[ord("q"), ord("a"), ord("b"), ord("c"), ord("d"), ord("z"), ord("b"), ord("c"), ord("d"), ord("e")]])
+        st = m.fusion.starts(x)[0].tolist()
+        # cell for target t is (x[t-3], x[t-2], x[t-1]): t=4 -> ('a','b','c') a-led = choice point; t=8 -> ('z','b','c') unwitnessed
+        assert st[4] and st[8], f"choice point / unwitnessed cell must start units: {st}"
+        assert not st[5] and not st[7], f"closed cells fuse: {st}"
+        plan = m.fusion.plan(x)
+        assert int(plan.n_units[0]) == int(sum(st))
+        y = torch.randint(0, 256, (2, 40))
+        with torch.no_grad():
+            full = m(y).logits
+            _, cache = m.prefill(y[:, :20])
+            worst = 0.0
+            for t in range(20, 40):
+                lt = m.decode_step(y[:, t], cache)
+                if t + 1 < 40:
+                    worst = max(worst, (lt[:, 0] - full[:, t]).abs().max().item())
+        assert worst < 1e-3, f"entropy-rule decode drifts: {worst:.2e}"
+
+
+@case("fusion: the hybrid rule fuses a predictable word into the unit before it, and decodes")
+def t_fusion_hybrid():
+    with tempfile.TemporaryDirectory() as td:
+        path = _atlas_table(os.path.join(td, "atlas.npz"))
+        torch.manual_seed(8)
+        m = AlephLM(_fusion_cfg(rule="hybrid", theta=1.0, table=path, witness_floor=8))
+        m.eval()
+        # "xa b" -> the word 'b' starts at t=3 with cell ('x','a',' '): x-led = closed (0 bits) -> 'b' FUSES;
+        # "ba c" -> the word 'c' starts at t=7 with cell ('b','a',' ')... use an a-led cell: "ma c": ('a',' ','c')? cells are
+        # (x[t-3], x[t-2], x[t-1]); for t=7 in "xa bba c": (x[4],x[5],x[6]) = ('b','a',' ') -> closed too. Build explicitly:
+        s = list(b"xa b") + list(b"aa c")            # t=3: cell ('x','a',' ') closed -> fuse; t=7: cell ('a','a',' ') a-led -> start
+        x = torch.tensor([s])
+        st = m.fusion.starts(x)[0].tolist()
+        assert not st[3], f"a predictable word must fuse: {st}"
+        assert st[7], f"a choice-point word must start a unit: {st}"
+        y = torch.tensor([list(b"the cat sat on the mat and the dog ran off to the barn again")])
+        with torch.no_grad():
+            full = m(y).logits
+            _, cache = m.prefill(y[:, :25])
+            worst = 0.0
+            for t in range(25, y.shape[1]):
+                lt = m.decode_step(y[:, t], cache)
+                if t + 1 < y.shape[1]:
+                    worst = max(worst, (lt[:, 0] - full[:, t]).abs().max().item())
+        assert worst < 1e-3, f"hybrid-rule decode drifts: {worst:.2e}"
+
+
+@case("fusion: forward/backward finite; grads reach the null vector and the middle blocks")
+def t_fusion_grads():
+    torch.manual_seed(7)
+    m = AlephLM(_fusion_cfg())
+    x = torch.randint(0, 256, (2, 48))
+    _, loss = m(x[:, :-1], targets=x[:, 1:])
+    assert math.isfinite(loss.item())
+    loss.backward()
+    assert m.fusion.null.grad is not None and m.fusion.null.grad.abs().sum() > 0, "the null vector never trained"
+    mid = [p for p in m.blocks[1].parameters() if p.requires_grad]
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in mid), "no gradient reached the middle block"
+
+
 def main():
     passed = failed = 0
     for name, fn in RESULTS:

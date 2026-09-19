@@ -114,7 +114,7 @@ validation record and trained weights:
 python -m geolip.alephllm.tests.smoke
 ```
 
-40 mechanical cases: address identities, exact null paths, chunked-scan
+47 mechanical cases: address identities, exact null paths, chunked-scan
 vs naive-oracle equivalence, causality, optimizer-split coverage,
 checkpoint/stream/manifest resume roundtrips, crash safety (divergence
 never overwrites resume state), multi-constellation hub equivalence,
@@ -126,7 +126,12 @@ bit-exact), the guard core (G1/G2/G3 replay; a halt that archives its
 position, never rewrites the last healthy resume point, and refuses to
 continue until a session clears it), per-phase LR multipliers, and the
 stage-arm program (bit-inert attach, plain trunk keys, one shared step,
-gauges, resume, a disabled member).
+gauges, resume, a disabled member), and weak-token fusion (identity with
+no middle, forced starts, causality, cached decode against the parallel
+path for rows with different unit structures, the entropy and hybrid rules
+over an atlas table, gradients reaching the null vector and the middle).
+The stage-arm case needs the `amoe` package with its `alephlm` binding on
+the path (the repo source, not a stale installed copy).
 
 ## Package layout — every code piece, briefly
 
@@ -144,6 +149,7 @@ the two-phase anneal planned from birth.
 | `bank.py` | `AnchoredBank` — the anchored FFN: always-on trunk + 3 dispatched experts, expert outputs zero-initialized (exact null path), no balance machinery |
 | `head.py` | `DualHead` — standard readout plus an aleph read whose weights are zero at birth (weight-zero, never gate-zero) |
 | `embedding.py` | `TrigramByteEmbedding` — composed byte embedding e_t = E0[x_t] + E1[x_{t-1}] + E2[x_{t-2}] + P[t], with a dedicated pad row; `TokenEmbedding` for BPE crafts |
+| `fusion.py` | weak-token fusion at the input plane (0.9.0, opt-in via `AlephLMConfig.fusion`): a causal unit-start rule — the atlas entropy table over the three previous bytes (`entropy`), word starts (`spacelike`), or word starts kept only at choice points (`hybrid`), with forced starts at specials and newlines — and the hourglass wiring: front blocks at byte resolution, the middle blocks over units (a position read at each unit's last byte, never a mean pool), an unpool shifted by one unit, back blocks and the head at byte resolution; cached decode keeps a unit-level cache |
 | `governor.py` | the anchor governor — a min-separation projection that relaxes crowded codebooks; exact identity when anchors have room |
 | `relay.py` | `RelayPatchwork` / `RelayEMA` — the relay adapters above |
 | `alephlm.py` | `AlephLM` — the full craft: embedding → pre-norm stack → `DualHead`, with cached prefill/step decode and per-mechanism toggle switches for ablation |

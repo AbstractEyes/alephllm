@@ -60,6 +60,12 @@ class AlephLMConfig:
     # x 32 layers) the retained scan tensors alone exceed a 95GB card —
     # measured OOM, Blackwell preflight 2026-08-26. ~2x hub recompute cost.
     hub_ckpt: int = 0
+    # v3 (2026-09-19): weak-token fusion at the input plane. None = the
+    # byte-resolution trunk verbatim. A dict selects the hourglass form:
+    # {"rule": "entropy" | "spacelike", "theta": bits, "witness_floor": n,
+    #  "table": "<npz path>", "k_lo": front blocks, "k_hi": back blocks} —
+    # see model/fusion.py. Old manifests load via the default.
+    fusion: Optional[dict] = None
 
     def to_dict(self):
         d = asdict(self)

@@ -31,6 +31,7 @@ from ..presets import AlephLMConfig
 from .attention import CausalSDPA, CausalSplatHUB
 from .bank import AnchoredBank
 from .embedding import TrigramByteEmbedding, TokenEmbedding
+from .fusion import Fusion, cat_caches, zero_cache_rows, snapshot, restore_rows
 from .head import DualHead
 
 
@@ -94,6 +95,39 @@ class AlephLM(nn.Module):
         self.nf = nn.LayerNorm(cfg.d_model)
         self.head = DualHead(cfg.d_model, cfg.vocab_size, cfg.head_K,
                              cfg.head_D, cfg.tau, tied_weight=tied)
+        # v3: weak-token fusion (model/fusion.py). None keeps the byte-
+        # resolution trunk verbatim; otherwise the middle blocks run over
+        # units and the front/back blocks stay at byte resolution.
+        spec = getattr(cfg, "fusion", None)
+        self.fusion = Fusion(spec, cfg.d_model) if spec else None
+        if self.fusion is not None:
+            assert self.fusion.k_lo + self.fusion.k_hi <= cfg.n_layers, \
+                "fusion: k_lo + k_hi must not exceed n_layers"
+
+    def _ranges(self):
+        L = len(self.blocks)
+        lo, hi = self.fusion.k_lo, L - self.fusion.k_hi
+        return self.blocks[:lo], self.blocks[lo:hi], self.blocks[hi:]
+
+    def _trunk(self, x, idx, disable_bank=False, disable_hub=False):
+        if self.fusion is None:
+            for b in self.blocks:
+                x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
+            return x
+        front, middle, back = self._ranges()
+        plan = self.fusion.plan(idx)
+        for b in front:
+            x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
+        if len(middle):
+            u = plan.pool(x)
+            for b in middle:
+                u = b(u, disable_bank=disable_bank, disable_hub=disable_hub)
+            x = x + plan.unpool(u, self.fusion.null)
+        else:
+            x = x + self.fusion.null.to(x.dtype)
+        for b in back:
+            x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
+        return x
 
     def forward(self, idx=None, targets=None, disable_bank=False,
                 disable_hub=False, disable_head_aleph=False,
@@ -107,8 +141,7 @@ class AlephLM(nn.Module):
         if idx is None:
             idx = input_ids
         x = self.embed(idx)
-        for b in self.blocks:
-            x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
+        x = self._trunk(x, idx, disable_bank=disable_bank, disable_hub=disable_hub)
         h = self.nf(x)
         logits = self.head(h, disable_aleph=disable_head_aleph)
         if targets is not None:                     # pre-shifted (ours)
@@ -130,6 +163,8 @@ class AlephLM(nn.Module):
         The cache carries per-layer attention state, the trigram history
         bytes, and the absolute position cursor."""
         self.eval()
+        if self.fusion is not None:
+            return self._prefill_fused(idx)
         from .embedding import PAD_ROW
         caches = []
         x = self.embed(idx)
@@ -143,22 +178,103 @@ class AlephLM(nn.Module):
         return logits, {"layers": caches, "t": n,
                         "prev1": idx[:, -1], "prev2": prev2}
 
+    def _embed_step(self, next_id, cache, t):
+        if isinstance(self.embed, TrigramByteEmbedding):
+            e = (self.embed.emb0(next_id) + self.embed.emb1(cache["prev1"])
+                 + self.embed.emb2(cache["prev2"])).unsqueeze(1) \
+                + self.embed.pos[:, t:t + 1]
+            cache["prev3"] = cache.get("prev2")
+            cache["prev2"] = cache["prev1"]
+            cache["prev1"] = next_id
+        else:
+            e = self.embed.emb(next_id).unsqueeze(1) + self.embed.pos[:, t:t + 1]
+        return e
+
     @torch.no_grad()
     def decode_step(self, next_id, cache):
         """One token through the cached path. next_id: (B,) or (B,1)."""
         next_id = next_id.reshape(-1)
         t = cache["t"]
         assert t < self.cfg.context, "decode exceeded the position table"
-        if isinstance(self.embed, TrigramByteEmbedding):
-            e = (self.embed.emb0(next_id) + self.embed.emb1(cache["prev1"])
-                 + self.embed.emb2(cache["prev2"])).unsqueeze(1) \
-                + self.embed.pos[:, t:t + 1]
-            cache["prev2"] = cache["prev1"]
-            cache["prev1"] = next_id
-        else:
-            e = self.embed.emb(next_id).unsqueeze(1) + self.embed.pos[:, t:t + 1]
-        x = e
+        if self.fusion is not None:
+            return self._decode_step_fused(next_id, cache, t)
+        x = self._embed_step(next_id, cache, t)
         for b, c in zip(self.blocks, cache["layers"]):
+            x = b.step(x, c)
+        cache["t"] = t + 1
+        return self.head(self.nf(x))
+
+    # ------------------------------------------------- fused decode path
+    @torch.no_grad()
+    def _prefill_fused(self, idx):
+        """The prompt through the hourglass: front blocks at byte
+        resolution (batched), the middle over each row's COMPLETED units
+        (the last unit stays open until a later byte starts the next), the
+        back blocks at byte resolution. The middle's caches are merged
+        across rows (the hub's prefix state has one shape per row)."""
+        from .embedding import PAD_ROW
+        from .governor import raw_block
+        front, middle, back = self._ranges()
+        for b in middle:
+            assert raw_block(b).is_hub, "fused decode needs hub blocks in the middle"
+        B, T = idx.shape
+        plan = self.fusion.plan(idx)
+        x = self.embed(idx)
+        front_c = []
+        for b in front:
+            x, c = b.prefill(x)
+            front_c.append(c)
+        x_front = x
+        u_all = plan.pool(x_front)                          # (B, J, d) incl. the open unit
+        n_closed = plan.n_units - 1
+        d = x.shape[-1]
+        v_pad = torch.zeros(B, plan.J, d, device=x.device, dtype=x.dtype)
+        mid_rows = []
+        for r in range(B):
+            nc = int(n_closed[r])
+            u = u_all[r:r + 1, :max(nc, 1)]
+            row_c = []
+            for b in middle:
+                u, c = b.prefill(u)
+                row_c.append(c)
+            if nc > 0:
+                v_pad[r, :nc] = u[0]
+            mid_rows.append(row_c)
+        mid_c = [cat_caches([row[i] for row in mid_rows]) for i in range(len(middle))]
+        empty = n_closed == 0
+        if bool(empty.any()):
+            mid_c = [zero_cache_rows(c, empty) for c in mid_c]
+        g = plan.unpool(v_pad, self.fusion.null)              # (B, T, d)
+        x = x_front + g
+        back_c = []
+        for b in back:
+            x, c = b.prefill(x)
+            back_c.append(c)
+        logits = self.head(self.nf(x)[:, -1:])
+        pad = lambda k: idx[:, -k] if T >= k else torch.full_like(idx[:, -1], PAD_ROW)  # noqa: E731
+        return logits, {"front": front_c, "mid": mid_c, "back": back_c, "t": T,
+                        "prev1": idx[:, -1], "prev2": pad(2), "prev3": pad(3),
+                        "front_last": x_front[:, -1], "g": g[:, -1]}
+
+    @torch.no_grad()
+    def _decode_step_fused(self, next_id, cache, t):
+        from .embedding import PAD_ROW
+        front, middle, back = self._ranges()
+        prev1, prev2, prev3 = cache["prev1"], cache["prev2"], cache["prev3"]
+        st = self.fusion.starts_step(next_id, prev1, prev2, prev3, PAD_ROW)   # (B,) closes the open unit
+        if bool(st.any()) and len(middle):
+            u = cache["front_last"].unsqueeze(1)
+            for b, c in zip(middle, cache["mid"]):
+                old = snapshot(c)
+                u = b.step(u, c)
+                restore_rows(c, old, st)
+            cache["g"] = torch.where(st.unsqueeze(-1), u[:, 0], cache["g"])
+        x = self._embed_step(next_id, cache, t)
+        for b, c in zip(front, cache["front"]):
+            x = b.step(x, c)
+        cache["front_last"] = x[:, 0]
+        x = x + cache["g"].unsqueeze(1)
+        for b, c in zip(back, cache["back"]):
             x = b.step(x, c)
         cache["t"] = t + 1
         return self.head(self.nf(x))
