@@ -60,8 +60,10 @@ def main():
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     from ..train.trainer import Trainer
     root = os.environ.get("ALEPHLLM_SMOKE_DIR") or os.path.join(tempfile.gettempdir(), f"alephllm_smoke_{mode}_w{world}")
-    if rank == 0 and os.environ.get("ALEPHLLM_SMOKE_KEEP") != "1":
-        shutil.rmtree(root, ignore_errors=True)
+    if rank == 0 and os.environ.get("ALEPHLLM_SMOKE_KEEP") != "1" and mode != "compare":
+        for sub in ("smoke-parity", "smoke-full"):
+            shutil.rmtree(os.path.join(root, sub), ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
     dev = "cpu" if os.environ.get("ALEPHLLM_SMOKE_CPU") == "1" or not torch.cuda.is_available() else "cuda"
     if world > 1:
         import torch.distributed as dist
@@ -86,6 +88,16 @@ def main():
         if rank == 0:
             with open(os.path.join(root, f"hash_w{world}.txt"), "w") as f:
                 f.write(h)
+            torch.save({k: v.detach().cpu() for k, v in t.raw_model.state_dict().items()},
+                       os.path.join(root, f"state_w{world}.pt"))
+    elif mode == "compare":
+        # the card check: CUDA kernels (index_add in the embedding backward) are not run-to-run
+        # deterministic, so on a card the 1-vs-2 comparison is a tolerance, not a hash
+        a = torch.load(os.path.join(root, "state_w1.pt"))
+        b = torch.load(os.path.join(root, "state_w2.pt"))
+        worst = max((float((a[k].float() - b[k].float()).abs().max()), k) for k in a)
+        scale = max(float(v.float().abs().max()) for v in a.values())
+        print(f"[smoke compare] 1-card vs 2-card: max |dw| {worst[0]:.3e} at {worst[1]} (weights up to {scale:.3f})", flush=True)
     elif mode == "full":
         p = _preset("smoke-full", arms=True)
         t = Trainer(p, hf_token=None, out_dir=root, device=dev, resume=False, guard=None, arms=_arms())
