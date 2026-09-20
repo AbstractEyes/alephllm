@@ -42,6 +42,12 @@ DEFAULTS = {
     "l6_ledger": "v3_preflight/l6_guards/v3_l6_guards_ledger.json",   # hub path (training repo) or a local file
     "local": False,                             # the CPU toy path (tests)
     "fresh": False,                             # abandon any hub resume state (explicit)
+    # the curriculum's difficulty dial (0.10.2): the atlas-minted lexicon for the rules
+    # generator — {"path": "hf://<repo>/<file>" | local, "splits": {"curriculum-s3":
+    # {"rulechain-synth": 0.08, "rulechain-minted": 0.24}}, "pair_rate": 0.3,
+    # "amendment": "<the lead's ruling, dated>"}; None = the legacy predicates only.
+    # Lands at launch, on resume, or at any boundary before its stage opens.
+    "minted_lexicon": None,
 }
 
 
@@ -58,7 +64,49 @@ def _dist():
     return (int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)))
 
 
-REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale")
+REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale", "minted_lexicon", "stage_arms")
+
+
+def _resolve_path(path: str, token: str | None) -> str:
+    """A local path, or hf://<repo_id>/<path in repo> fetched to the cache."""
+    if str(path).startswith("hf://"):
+        from huggingface_hub import hf_hub_download
+        rest = str(path)[len("hf://"):]
+        parts = rest.split("/")
+        repo, sub = "/".join(parts[:2]), "/".join(parts[2:])
+        return hf_hub_download(repo, sub, token=token)
+    return str(path)
+
+
+def apply_minted_lexicon(C: dict, run=None) -> dict | None:
+    """Install the minted lexicon named by the config (the splits, the pair
+    rate) into the curriculum; at a boundary (run given) the data plane is
+    recomputed and recorded with the amendment note. Returns the record."""
+    spec = C.get("minted_lexicon")
+    if not spec:
+        return None
+    from ..data import curriculum as _cur
+    token = os.environ.get("HF_TOKEN")
+    path = _resolve_path(spec["path"], token)
+    rec = _cur.set_minted_lexicon(path, spec.get("splits") or {}, float(spec.get("pair_rate", 0.0)))
+    note = spec.get("amendment") or "minted lexicon installed by config (no note given)"
+    if run is not None:
+        run.amend_data_plane(note)
+    return rec
+
+
+def refresh_stage_arms(C_old: dict, C_new: dict, run) -> None:
+    """A boundary edit of the stage arms' quiet constants lands on the live
+    arms; names, phases, seeds and the arm count are frozen at launch."""
+    old, new = C_old.get("stage_arms") or [], C_new.get("stage_arms") or []
+    if old == new or run is None or getattr(run, "arms", None) is None:
+        return
+    assert len(old) == len(new) and all(o[0] == n[0] and o[1] == n[1] and o[3] == n[3] for o, n in zip(old, new)), \
+        "stage_arms: only the quiet constant (lambda) may change after launch"
+    for o, n in zip(old, new):
+        if float(o[2]) != float(n[2]):
+            run.arms.by_name[n[0]].lam = float(n[2])
+            print(f"[mission] config: arm {n[0]} lambda {float(o[2])} -> {float(n[2])}", flush=True)
 
 
 def _refresh_config(C: dict, run) -> dict:
@@ -73,12 +121,29 @@ def _refresh_config(C: dict, run) -> dict:
     except Exception as e:  # noqa: BLE001
         print(f"[mission] config re-read failed ({e!r}); keeping the launch values")
         return C
+    old = dict(C)
     for k in REFRESHABLE:
         if new.get(k) != C.get(k):
             print(f"[mission] config: {k} {C.get(k)!r} -> {new.get(k)!r}")
             C[k] = new.get(k)
     if isinstance(C["anneal_lr_scale"], (int, float)):
         run.tc.phase_lr_scale = {"anneal": float(C["anneal_lr_scale"])}
+    if C.get("minted_lexicon") != old.get("minted_lexicon"):
+        try:
+            if C.get("minted_lexicon"):
+                apply_minted_lexicon(C, run)
+            else:
+                from ..data import curriculum as _cur
+                _cur.clear_minted_lexicon()
+                run.amend_data_plane("minted lexicon removed by config")
+        except Exception as e:  # noqa: BLE001
+            print(f"[mission] minted lexicon NOT installed ({e!r}); the config value is kept for the next boundary")
+            C["minted_lexicon"] = old.get("minted_lexicon")
+    try:
+        refresh_stage_arms(old, C, run)
+    except AssertionError as e:
+        print(f"[mission] stage_arms edit refused: {e}")
+        C["stage_arms"] = old.get("stage_arms")
     return C
 
 
@@ -280,6 +345,14 @@ def main():
 
     p = build_preset(C, token)
     tc, cfg = p.train, p.model
+    if C.get("minted_lexicon"):
+        # the difficulty dial at launch / resume: the lexicon + splits into the
+        # curriculum before the trainer applies the scale; a resume whose
+        # recipe differs only by it is accepted under the amendment note
+        rec = apply_minted_lexicon(C)
+        tc.data_plane_amendment = C["minted_lexicon"].get("amendment") or "minted lexicon installed by config"
+        print(f"[mission] minted lexicon {rec['sha']}: {rec['words']} words, splits {rec['splits']}, pair rows "
+              f"{rec['pair_rate']:.0%}", flush=True)
     assert cfg.hub_K <= 2 * cfg.hub_D, "supply law violated — this preset should not exist"
     assert tc.compile is False, "eager on Blackwell (the 2026-08-26 law)"
     tokens_step = tc.micro_batch * tc.grad_accum * cfg.context * world

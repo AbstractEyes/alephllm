@@ -102,6 +102,9 @@ class TrainConfig:
     canary_episodes: int = 128
     seed: int = 1337
     compile: bool = False
+    # v3: a lead-ruled change of the mix (the minted lexicon) — a resume
+    # whose recipe differs ONLY by it is accepted and recorded with this note
+    data_plane_amendment: str | None = None
     # The anchor governor (ROUND 5f, 2026-08-25): post-optimizer-step
     # min-separation projection over hub/head codebooks — preventive
     # anti-crowding, identity when slack, zero parameters, outside the

@@ -135,7 +135,7 @@ validation record and trained weights:
 python -m geolip.alephllm.tests.smoke
 ```
 
-47 mechanical cases: address identities, exact null paths, chunked-scan
+48 mechanical cases: address identities, exact null paths, chunked-scan
 vs naive-oracle equivalence, causality, optimizer-split coverage,
 checkpoint/stream/manifest resume roundtrips, crash safety (divergence
 never overwrites resume state), multi-constellation hub equivalence,
@@ -150,7 +150,10 @@ stage-arm program (bit-inert attach, plain trunk keys, one shared step,
 gauges, resume, a disabled member), and weak-token fusion (identity with
 no middle, forced starts, causality, cached decode against the parallel
 path for rows with different unit structures, the entropy and hybrid rules
-over an atlas table, gradients reaching the null vector and the middle).
+over an atlas table, gradients reaching the null vector and the middle),
+and the minted lexicon (the legacy rules stream bit-identical, minted rows
+and onset pairs, a split's ratio under a scale and the frame cap, the plane
+recording the lexicon, refusal without one, the resume amendment).
 The stage-arm case needs the `amoe` package with its `alephlm` binding on
 the path (the repo source, not a stale installed copy). To run the suite
 off-card on a CUDA build, hide the card with `CUDA_VISIBLE_DEVICES=-1`
@@ -196,7 +199,7 @@ the two-phase anneal planned from birth.
 |---|---|
 | `tokenizers.py` | the byte tokenizer (vocab 256; trigram composition lives in the embedding) and an HF BPE wrapper |
 | `streams.py` | resumable packed streaming from HF hub datasets; stream state rides in checkpoints |
-| `curriculum.py` | staged training mixes S0–S8 with procedural generators, the epoch-cap and ballast audits that guard every mix, and the scaler that rebalances the mixes under an epoch cap at a larger data budget (three rebalance rules; refuses without one) |
+| `curriculum.py` | staged training mixes S0–S8 with procedural generators, the epoch-cap and ballast audits that guard every mix, and the scaler that rebalances the mixes under an epoch cap at a larger data budget (three rebalance rules; refuses without one); the minted lexicon (0.10.2): a graded, atlas-minted predicate lexicon swapped into the rules generator's unchanged prose frame as a second source (`rulechain-minted`), installed with per-stage share splits that re-divide the frame's share under the generator cap, its identity carried by the data plane |
 | `special_tokens.py` | control tokens placed in invalid-UTF-8 byte space (cannot collide with any real text), document packing, and the chat frame |
 
 **train/**
@@ -205,7 +208,7 @@ the two-phase anneal planned from birth.
 |---|---|
 | `optim.py` | the measured optimizer split: Muon (Newton-Schulz orthogonalized momentum) on 2D transport weights, pure Adam (wd 0, never AdamW) on the rest |
 | `trainer.py` | the resume-first training loop: pulls manifest + state from the hub, session caps, crash-safe checkpointing, structured health readouts; per-phase LR multipliers, the guard core and the stage-arm program ride in the same step; a data-plane fingerprint is asserted on resume; multi-card (0.10.0): per-rank stream shards, gradients averaged across ranks before the clip, agreed stop decisions, rank-0 record, per-rank stream positions in every checkpoint |
-| `mission.py` | the session driver as a module (the notebook's decision block, preset, guard core, push probe and boundary loop) for `torchrun` on one or many cards; configuration by JSON, no argparse; the JSON is re-read at every boundary (0.10.1), so the later gates — the arm certification flag and the anneal multiplier — land in the file while the mission trains, without a relaunch |
+| `mission.py` | the session driver as a module (the notebook's decision block, preset, guard core, push probe and boundary loop) for `torchrun` on one or many cards; configuration by JSON, no argparse; the JSON is re-read at every boundary (0.10.1), so the later gates — the arm certification flag and the anneal multiplier — land in the file while the mission trains, without a relaunch; 0.10.2 adds the minted lexicon (`minted_lexicon`: path, splits, pair rate, the amendment note; at launch, on resume, or at any boundary before its stage opens) and boundary edits of the stage arms' quiet constants |
 | `precision.py` | one autocast policy: bf16 on a card, no autocast context off it (a disabled CUDA autocast still queries the card) |
 | `guards.py` | the red-flag guard core: three in-run evaluators (norm surge, dispatch-entropy collapse, rank collapse) over a pinned reference window, per-guard modes (halt / watch / off) filled from a certification ledger; a halt archives the position under its own name and the run refuses to continue until cleared |
 | `arms.py` | the stage-arm program: fresh relay arms attached per curriculum stage (bias-zeroed, inert at birth), trained under one pure-Adam group beside the trunk with a per-member abstention term on off-domain rows; masked-detachability gauges, anchors, resume, and member disabling on a fault |

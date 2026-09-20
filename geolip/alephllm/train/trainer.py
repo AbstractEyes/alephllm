@@ -120,6 +120,7 @@ class Trainer:
             if want != have:
                 _cur.apply_curriculum_scale(*want)
             self._data_plane = _cur.data_plane(*want)
+            self._data_plane_want = want
 
         torch.manual_seed(self.tc.seed)
         if self.device == "cuda":
@@ -358,13 +359,39 @@ class Trainer:
         if not live:
             return
         diff = {k: (rec.get(k), live.get(k)) for k in
-                ("data_scale", "epoch_cap", "rebalance_to", "recipe_hash")
+                ("data_scale", "epoch_cap", "rebalance_to", "recipe_hash", "minted_lexicon")
                 if rec.get(k) != live.get(k)}
-        if diff:
-            raise RuntimeError(
-                f"data plane changed across resume {diff} (recorded vs live): "
-                "a run continues on the mix it was created under — restore the "
-                "preset's data_scale/epoch_cap/rebalance_to, or start a new run")
+        if not diff:
+            return
+        note = getattr(self.tc, "data_plane_amendment", None)
+        if note and set(diff) <= {"recipe_hash", "minted_lexicon"}:
+            # a lead-ruled mix amendment (the minted lexicon): accepted once,
+            # recorded with its note; the three plane decisions never move
+            self.manifest.data_plane = dict(live)
+            self.manifest.note(f"data plane AMENDED on resume {diff} (recorded -> live): {note}")
+            print(f"[data plane] amended on resume {diff}: {note}", flush=True)
+            return
+        raise RuntimeError(
+            f"data plane changed across resume {diff} (recorded vs live): "
+            "a run continues on the mix it was created under — restore the "
+            "preset's data_scale/epoch_cap/rebalance_to, or start a new run "
+            "(a minted-lexicon amendment needs TrainConfig.data_plane_amendment)")
+
+    def amend_data_plane(self, note: str) -> dict:
+        """Recompute and record the data plane after a lead-ruled mix
+        amendment landed in-process (a boundary config refresh installing
+        the minted lexicon before its stage opens)."""
+        from ..data import curriculum as _cur
+        want = getattr(self, "_data_plane_want", None)
+        if want is None:
+            return dict(self._data_plane)
+        old = dict(self._data_plane)
+        self._data_plane = _cur.data_plane(*want)
+        self.manifest.data_plane = dict(self._data_plane)
+        diff = {k: (old.get(k), self._data_plane.get(k)) for k in self._data_plane if old.get(k) != self._data_plane.get(k)}
+        self.manifest.note(f"data plane AMENDED at a boundary {diff}: {note}")
+        print(f"[data plane] amended {diff}: {note}", flush=True)
+        return dict(self._data_plane)
 
     def _phase_seed(self, ph: dict) -> int:
         """The stream seed for a phase: the run seed, offset per phase

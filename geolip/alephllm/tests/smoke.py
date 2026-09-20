@@ -1304,6 +1304,72 @@ def t_fusion_grads():
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in mid), "no gradient reached the middle block"
 
 
+@case("minted lexicon: the legacy rules stream bit-identical; minted rows draw only minted words and carry onset pairs at the rate; "
+      "a split keeps its ratio under a scale and the frame cap; the plane records the lexicon; refusal without one; an amendment passes the resume check")
+def t_minted_lexicon():
+    import hashlib
+    import itertools
+    import re
+    import types
+    from ..data import curriculum as C
+    from ..data.streams import CURRICULUM_MIXES
+    from ..train.trainer import Trainer
+    rows = [r["text"] for r in itertools.islice(C._rulechain_rows(7), 500)]
+    assert hashlib.sha1("\n".join(rows).encode()).hexdigest()[:16] == "c8b74cce6c7a3476", "the legacy rules stream changed"
+    easy = [f"{'abcdefghijk'[i]}anes" for i in range(11)]
+    trap = [f"{'abcdefghijk'[i]}ortu" for i in range(11)]
+    lex = {"easy": easy, "trap": trap, "pairs": [["skarn", "skelt"], ["thrum", "thane"], ["plinx", "plost"], ["grend", "grulp"]]}
+    words, weights, pairs = C.minted_vocab(lex)
+    assert len(words) == 30 and len(pairs) == 4
+    pred = re.compile(r"If someone is (\w+), then they are (\w+)\.")
+    seen, pair_rows = set(), 0
+    mrows = list(itertools.islice(C._rulechain_rows(3, vocab=words, weights=weights, pairs=pairs, pair_rate=0.5), 600))
+    for r in mrows:
+        ws = {w for m in pred.finditer(r["text"]) for w in m.groups()}
+        assert ws and not (ws & set(C._PRED)), r
+        seen |= ws
+        pair_rows += any(a in ws and b in ws for a, b in pairs)
+    assert seen == set(words), sorted(set(words) - seen)
+    assert 0.4 <= pair_rows / len(mrows) <= 0.8, pair_rows / len(mrows)
+    C.apply_curriculum_scale(4.0, 2.0, "generators", verbose=False)
+    h0 = C.data_plane(4.0, 2.0, "generators")
+    rec = C.set_minted_lexicon(lex, {"curriculum-s3": {"rulechain-synth": 0.08, "rulechain-minted": 0.24}}, 0.3, verbose=False)
+    fr = {n: w for n, w in CURRICULUM_MIXES["curriculum-s3"] if n in C._FRAMES}
+    assert sum(fr.values()) <= C.MAX_GENERATOR_SHARE + 1e-6, fr
+    assert abs(fr["rulechain-minted"] / sum(fr.values()) - 0.75) < 1e-3, fr
+    assert C.audit_mix(warn=False)["curriculum-s3"]["top_generator"] <= C.MAX_GENERATOR_SHARE + 1e-6
+    h1 = C.data_plane(4.0, 2.0, "generators")
+    assert h1["recipe_hash"] != h0["recipe_hash"] and h1["minted_lexicon"] == rec["sha"]
+    tok = ByteTrigramTokenizer()
+    b = build_stream("curriculum-s3", tok, 128, 2, seed=5).next_batch()
+    assert tuple(b.shape) == (2, 129), b.shape
+    try:
+        C.set_minted_lexicon(lex, {"curriculum-s3": {"rulechain-synth": 0.10, "rulechain-minted": 0.30}}, 0.3, verbose=False)
+        raise RuntimeError("a split that moves the frame's total was accepted")
+    except AssertionError:
+        pass
+    C.clear_minted_lexicon()
+    assert C.data_plane(4.0, 2.0, "generators")["recipe_hash"] == h0["recipe_hash"]
+    try:
+        build_stream("rulechain-minted", tok, 128, 2, seed=1).next_batch()
+        raise AssertionError("the minted source opened without a lexicon")
+    except RuntimeError as e:
+        assert "no minted lexicon" in str(e), e
+    notes = []
+    fake = types.SimpleNamespace(tc=types.SimpleNamespace(data_plane_amendment=None),
+                                 manifest=types.SimpleNamespace(data_plane=dict(h0), note=notes.append),
+                                 _data_plane=dict(h1))
+    try:
+        Trainer._check_data_plane(fake)
+        raise AssertionError("a recipe change was accepted without an amendment note")
+    except RuntimeError as e:
+        assert "data plane changed" in str(e), e
+    fake.tc.data_plane_amendment = "test: the lead's ruling"
+    Trainer._check_data_plane(fake)
+    assert fake.manifest.data_plane == h1 and notes and "AMENDED" in notes[0]
+    C.apply_curriculum_scale(1.0, verbose=False)
+
+
 def main():
     passed = failed = 0
     for name, fn in RESULTS:

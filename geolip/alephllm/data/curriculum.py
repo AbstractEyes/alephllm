@@ -296,17 +296,59 @@ def _concept_flicker_rows(seed: int):
 _PRED = ["blim", "torv", "quen", "harl", "sook", "vell", "mund", "prin"]
 
 
-def _rulechain_rows(seed: int, max_depth: int | None = None):
+_RULECHAIN_NAMES = ["Pia", "Ezo", "Kel", "Vin", "Osa", "Tam"]
+
+
+def _rulechain_rows(seed: int, max_depth: int | None = None, *,
+                    vocab: list | None = None, weights: list | None = None,
+                    pairs: list | None = None, pair_rate: float = 0.0):
     """Prose modus-ponens chains over nonsense predicates (no world
-    knowledge shortcut). Training stream stays BELOW the held-out depth."""
+    knowledge shortcut). Training stream stays BELOW the held-out depth.
+
+    The default draws the legacy eight predicates uniformly and is
+    bit-identical to earlier releases (a stream's rows never change
+    under a resume). `vocab` swaps the predicate lexicon — the graded,
+    atlas-minted lexicon is the difficulty dial of the curriculum;
+    `weights` skews the per-word draw (band mixes); `pairs` (word pairs
+    sharing an onset) with `pair_rate` puts BOTH members of one or two
+    pairs into that share of rows, so commitment between look-alike
+    surfaces is trained at source. Every row's predicates are distinct
+    and the prose frame is the same in every mode."""
     rng = np.random.default_rng(seed)
     cap = (max_depth if max_depth is not None
            else HOLDOUTS["rulechain_depth"] - 1)
-    names = ["Pia", "Ezo", "Kel", "Vin", "Osa", "Tam"]
+    names = _RULECHAIN_NAMES
+    legacy = vocab is None and not pairs
+    words = list(_PRED) if vocab is None else [str(w) for w in vocab]
+    assert len(set(words)) == len(words) >= 2, "predicates must be distinct"
+    p = None
+    if weights is not None:
+        p = np.asarray(weights, dtype=np.float64)
+        assert p.shape == (len(words),) and (p >= 0).all() and p.sum() > 0, "weights: one per word, >= 0"
+        p = p / p.sum()
+    pairs = [[str(a), str(b)] for a, b in (pairs or [])]
+    idx = {w: i for i, w in enumerate(words)}
+    for a, b in pairs:
+        assert a in idx and b in idx and a != b, f"pair {(a, b)} must be two distinct vocabulary words"
     while True:
         d = int(rng.integers(1, cap + 1))
-        ps = [(_PRED[int(i)]) for i in
-              rng.choice(len(_PRED), size=d + 1, replace=False)]
+        k = d + 1
+        if legacy:
+            ps = [(_PRED[int(i)]) for i in
+                  rng.choice(len(_PRED), size=k, replace=False)]
+        elif pairs and pair_rate > 0 and rng.random() < pair_rate:
+            n_pairs = min(2, k // 2, len(pairs))
+            chosen = rng.choice(len(pairs), size=n_pairs, replace=False)
+            ps = [w for i in chosen for w in pairs[int(i)]]
+            taken = set(ps)
+            fill = [i for i, w in enumerate(words) if w not in taken]
+            need = k - len(ps)
+            if need > 0:
+                fp = None if p is None else p[fill] / p[fill].sum()
+                ps += [words[int(i)] for i in rng.choice(fill, size=need, replace=False, p=fp)]
+            rng.shuffle(ps)
+        else:
+            ps = [words[int(i)] for i in rng.choice(len(words), size=k, replace=False, p=p)]
         who = names[int(rng.integers(0, len(names)))]
         rules = [f"If someone is {ps[i]}, then they are {ps[i + 1]}."
                  for i in range(d)]
@@ -494,6 +536,8 @@ REGISTRY.update({
     "perspective-synth": dict(path=None, generator="perspective"),
     "concept-synth": dict(path=None, generator="concept"),
     "rulechain-synth": dict(path=None, generator="rulechain"),
+    # the same prose frame over the atlas-minted lexicon (set_minted_lexicon)
+    "rulechain-minted": dict(path=None, generator="rulechain_minted"),
     "arith-synth": dict(path=None, generator="arith"),
     "causal-synth": dict(path=None, generator="causal"),
     "tryfail-synth": dict(path=None, generator="tryfail"),
@@ -517,6 +561,7 @@ _GENERATORS.update({
     "perspective": _perspective_rows,
     "concept": _concept_flicker_rows,
     "rulechain": _rulechain_rows,
+    "rulechain_minted": lambda seed, max_depth=None: _rulechain_minted_rows(seed, max_depth),
     "arith": _arith_rows,
     "causal": _causal_arc_rows,
     "tryfail": _try_fail_rows,
@@ -548,6 +593,13 @@ CORPUS_BYTES = {
 }
 MAX_EPOCHS = 4.0                  # audit threshold
 MAX_GENERATOR_SHARE = 0.35        # cap per procedural generator
+
+
+def _is_gen(name: str) -> bool:
+    """A procedural generator: the -synth suffix by convention, or a member
+    of a shared prose frame (_FRAMES) whatever its name."""
+    return name.endswith("-synth") or name in _FRAMES
+
 MIN_BALLAST = 0.30                # natural-text floor per stage
 NATURAL = {"tinystories", "simple-wiki", "cosmo-young", "fineweb-good",
            "aochildes", "gutenberg", "wikipedia-en"}
@@ -565,8 +617,14 @@ def audit_mix(warn=True) -> dict:
     out = {}
     for stage, recipe in CURRICULUM_MIXES.items():
         ballast = sum(w for n, w in recipe if n in NATURAL)
-        top_gen = max([w for n, w in recipe if n.endswith("-synth")],
-                      default=0.0)
+        # sources sharing ONE prose frame (_FRAMES) count as one generator:
+        # the colonization risk is the frame's share, not the name's
+        frames: dict = {}
+        for n, w in recipe:
+            if _is_gen(n):
+                key = _FRAMES.get(n, n)
+                frames[key] = frames.get(key, 0.0) + w
+        top_gen = max(frames.values(), default=0.0)
         out[stage] = {"ballast": ballast, "top_generator": top_gen}
         if warn:
             if ballast < MIN_BALLAST:
@@ -588,7 +646,7 @@ def audit_epochs(warn=True) -> list:
         budget = STAGE_TOKENS.get(stage, 0)
         for name, w in recipe:
             corpus = CORPUS_BYTES.get(name, INF)
-            if corpus == INF or name.endswith("-synth"):
+            if corpus == INF or _is_gen(name):
                 continue
             need = budget * w
             rows.append((stage, name, w, need, corpus, need / corpus))
@@ -733,8 +791,13 @@ def scaled_curriculum(factor: float, epoch_cap: float | None = None,
         before = dict(w)
 
         def cap_of(n, budget=budget):
-            if n.endswith("-synth"):          # a generator's cap is its share
-                return MAX_GENERATOR_SHARE
+            if _is_gen(n):
+                # a generator's cap is its share; sources sharing one prose
+                # frame are capped by the FRAME's sum (the live weights)
+                fr = _FRAMES.get(n)
+                others = (sum(x for m, x in w.items() if m != n and _FRAMES.get(m) == fr)
+                          if fr else 0.0)
+                return max(0.0, MAX_GENERATOR_SHARE - others)
             corpus = CORPUS_BYTES.get(n, INF)
             if corpus == INF:
                 return INF
@@ -743,12 +806,12 @@ def scaled_curriculum(factor: float, epoch_cap: float | None = None,
         freed = 0.0
         for n in list(w):
             c = cap_of(n)
-            if not n.endswith("-synth") and w[n] > c:
+            if not _is_gen(n) and w[n] > c:
                 freed += w[n] - c
                 w[n] = c
         if freed > 1e-9 and rebalance_to is None:
             over = [(n, round(before[n], 4), round(cap_of(n), 4)) for n in before
-                    if not n.endswith("-synth") and before[n] > cap_of(n) + 1e-12]
+                    if not _is_gen(n) and before[n] > cap_of(n) + 1e-12]
             raise ValueError(
                 f"curriculum scale x{factor:g}: {stage} re-reads finite corpora "
                 f"past {cap:g} epochs {over} and no rebalance rule was supplied "
@@ -760,7 +823,7 @@ def scaled_curriculum(factor: float, epoch_cap: float | None = None,
             guard += 1
             recips = []
             if rebalance_to == "generators":
-                recips = [n for n in w if n.endswith("-synth")
+                recips = [n for n in w if _is_gen(n)
                           and cap_of(n) - w[n] > 1e-12]
             if not recips:
                 recips = [n for n in w if n in NATURAL and cap_of(n) - w[n] > 1e-12]
@@ -769,12 +832,22 @@ def scaled_curriculum(factor: float, epoch_cap: float | None = None,
                     w[fallback] = 0.0
                     flags[stage] = f"no member could absorb {freed:.3f}: added {fallback}"
                 recips = [fallback]
-            total = sum(w[n] for n in recips)
-            moved = 0.0
+            # recipients sharing one prose frame receive as ONE unit (the
+            # frame's headroom under the cap), split within the frame pro
+            # rata — so a lexicon split keeps its ratio under any scale
+            groups: dict = {}
             for n in recips:
-                share = freed * (w[n] / total if total > 0 else 1.0 / len(recips))
-                give = min(share, cap_of(n) - w[n])
-                w[n] += give
+                groups.setdefault(_FRAMES.get(n, n), []).append(n)
+            gw = {g: sum(w[n] for n in ms) for g, ms in groups.items()}
+            total = sum(gw.values())
+            moved = 0.0
+            for g, ms in groups.items():
+                share = freed * (gw[g] / total if total > 0 else 1.0 / len(groups))
+                room = (max(0.0, MAX_GENERATOR_SHARE - gw[g]) if g in _FRAMES.values() and len(ms) > 1
+                        else cap_of(ms[0]) - w[ms[0]])
+                give = min(share, room)
+                for n in ms:
+                    w[n] += give * (w[n] / gw[g] if gw[g] > 0 else 1.0 / len(ms))
                 moved += give
             freed -= moved
             if moved <= 1e-12:
@@ -784,7 +857,7 @@ def scaled_curriculum(factor: float, epoch_cap: float | None = None,
         mixes[stage] = [(n, round(x, 5)) for n, x in w.items() if x > 0]
         for n in before:
             corpus = CORPUS_BYTES.get(n, INF)
-            if corpus == INF or n.endswith("-synth"):
+            if corpus == INF or _is_gen(n):
                 continue
             table.append((stage, n, round(before[n], 4), round(w[n], 4),
                           round(budget * before[n] / corpus, 2),
@@ -812,7 +885,9 @@ def data_plane(factor: float = 1.0, epoch_cap: float | None = None,
                       sort_keys=True)
     return {"data_scale": float(factor), "epoch_cap": sc["epoch_cap"],
             "rebalance_to": rebalance_to,
-            "recipe_hash": hashlib.sha1(blob.encode()).hexdigest()[:12]}
+            "recipe_hash": hashlib.sha1(blob.encode()).hexdigest()[:12],
+            # the minted lexicon's identity rides with the plane (None = unset)
+            "minted_lexicon": MINTED["sha"]}
 
 
 def apply_curriculum_scale(factor: float, epoch_cap: float | None = None,
@@ -978,3 +1053,121 @@ def rollback_to(run, step: int, first_stage: str, repo: str | None = None):
           f"{'EXACT (optimizer+stream restored)' if exact else 'FRESH OPTIMIZER — flag any arm trained after this'}",
           flush=True)
     return {"step": step, "exact": exact, "first_stage": first_stage}
+
+
+# ------------------------------------------------- the minted lexicon (v3)
+# The curriculum's difficulty dial: a graded lexicon minted by the trigram
+# atlas (geolip-bytelex) — an easy-close band, a trap band and pairs of
+# words sharing an onset — swapped into the rules generator's UNCHANGED
+# prose frame as a second registry source beside the legacy eight
+# predicates. Nothing here is active until set_minted_lexicon() runs; the
+# source refuses to open without a lexicon (no silent fallback). The
+# lexicon's identity rides with the data plane (data_plane()), so a resume
+# on a different lexicon is caught like any other mix change.
+MINTED: dict = {"path": None, "lexicon": None, "pair_rate": 0.0, "splits": {}, "sha": None}
+_FRAMES = {"rulechain-synth": "rulechain", "rulechain-minted": "rulechain"}   # sources sharing one prose frame
+_PRISTINE_MIXES = {k: [tuple(x) for x in v] for k, v in _BASE_MIXES.items()}
+
+
+def minted_vocab(lex: dict) -> tuple:
+    """(words, weights, pairs) from a minted-lexicon artifact:
+    {"easy": [...], "trap": [...], "pairs": [[a, b], ...],
+     "band_weights": {"easy": w, "trap": w, "pairs": w}}  (weights default 1:
+    a uniform draw over the union, so equal band sizes give a 1:1 mix).
+    Pair words are vocabulary members in their own right; `pairs` adds the
+    forced co-occurrence."""
+    bw = dict(lex.get("band_weights") or {})
+    words, weights = [], []
+    for band in ("easy", "trap"):
+        for w in lex.get(band) or []:
+            words.append(str(w)); weights.append(float(bw.get(band, 1.0)))
+    pairs = [[str(a), str(b)] for a, b in (lex.get("pairs") or [])]
+    for a, b in pairs:
+        for w in (a, b):
+            if w not in words:
+                words.append(w); weights.append(float(bw.get("pairs", 1.0)))
+    assert len(set(words)) == len(words), "minted lexicon: duplicate words"
+    assert not (set(words) & set(_PRED)), "minted lexicon: a legacy predicate leaked in"
+    for w in words:
+        assert w.isalpha() and w.islower(), f"minted lexicon: {w!r} is not a lowercase word"
+    return words, weights, pairs
+
+
+def _rulechain_minted_rows(seed: int, max_depth: int | None = None):
+    lex = MINTED["lexicon"]
+    if lex is None:
+        raise RuntimeError("rulechain-minted: no minted lexicon installed — call "
+                           "set_minted_lexicon(path, splits) before the stage opens "
+                           "(this source never falls back to the legacy predicates)")
+    words, weights, pairs = minted_vocab(lex)
+    return _rulechain_rows(seed, max_depth, vocab=words, weights=weights,
+                           pairs=pairs, pair_rate=float(MINTED["pair_rate"]))
+
+
+def _reapply_mixes(stages) -> None:
+    """Re-derive the live mixes for `stages` from the (amended) 1x forms
+    under whatever scale is applied — the streams read CURRICULUM_MIXES
+    at build time, so this runs before the amended stage opens."""
+    a = _APPLIED_SCALE
+    if a["factor"] != 1.0 or a["rebalance_to"] is not None:
+        apply_curriculum_scale(a["factor"], a["epoch_cap"], a["rebalance_to"], verbose=False)
+    else:
+        for st in stages:
+            CURRICULUM_MIXES[st] = list(_BASE_MIXES[st])
+
+
+def set_minted_lexicon(path, splits: dict | None = None, pair_rate: float = 0.0,
+                       verbose: bool = True) -> dict:
+    """Install the minted lexicon (a JSON file path or the loaded dict) and
+    the per-stage share splits, e.g.
+        {"curriculum-s3": {"rulechain-synth": 0.08, "rulechain-minted": 0.24}}
+    A split re-divides the stage's frame members' 1x weights: the split's
+    sum must equal the weight it replaces (the dial re-divides the frame's
+    share; moving the frame's total is a separate mix decision), and the
+    frame's sum stays under MAX_GENERATOR_SHARE. The live mixes are then
+    re-derived under the applied scale. `pair_rate` is the share of minted
+    rows that carry both members of one or two onset pairs. Returns the
+    record (path, sha, counts, splits)."""
+    import hashlib
+    import json
+    if isinstance(path, dict):
+        lex, src = path, "<dict>"
+    else:
+        with open(path, encoding="utf-8") as f:
+            lex = json.load(f)
+        src = str(path)
+    words, weights, pairs = minted_vocab(lex)
+    sha = hashlib.sha1(json.dumps({"w": sorted(words), "p": sorted(map(sorted, pairs)),
+                                   "bw": lex.get("band_weights") or {}}, sort_keys=True).encode()).hexdigest()[:12]
+    splits = {st: {n: float(x) for n, x in sp.items()} for st, sp in (splits or {}).items()}
+    for st, sp in splits.items():
+        assert st in _BASE_MIXES, f"unknown stage {st!r}"
+        assert all(n in _FRAMES for n in sp), f"a split names only frame members {sorted(_FRAMES)}: {sp}"
+        base = list(_PRISTINE_MIXES[st])
+        replaced = sum(w for n, w in base if n in _FRAMES)
+        assert abs(sum(sp.values()) - replaced) < 1e-6, (
+            f"{st}: the split sums to {sum(sp.values()):.4f} but the frame's 1x weight is {replaced:.4f} — "
+            "a split re-divides the frame's share; changing the total is a mix decision")
+        assert sum(sp.values()) <= MAX_GENERATOR_SHARE + 1e-9, f"{st}: the frame would exceed the share cap"
+        new = [(n, w) for n, w in base if n not in _FRAMES] + [(n, w) for n, w in sp.items() if w > 0]
+        _BASE_MIXES[st] = [tuple(x) for x in new]
+    for st in _PRISTINE_MIXES:
+        if st not in splits:
+            _BASE_MIXES[st] = list(_PRISTINE_MIXES[st])
+    MINTED.update(path=src, lexicon=lex, pair_rate=float(pair_rate), splits=splits, sha=sha)
+    _reapply_mixes(list(_BASE_MIXES))
+    rec = {"path": src, "sha": sha, "words": len(words), "easy": len(lex.get("easy") or []),
+           "trap": len(lex.get("trap") or []), "pairs": len(pairs), "pair_rate": float(pair_rate), "splits": splits,
+           "live": {st: [(n, w) for n, w in CURRICULUM_MIXES[st] if n in _FRAMES] for st in splits}}
+    if verbose:
+        print(f"[curriculum] minted lexicon {sha}: {rec['words']} words ({rec['easy']} easy / {rec['trap']} trap / "
+              f"{rec['pairs']} pairs, pair rows {pair_rate:.0%}); live frame shares {rec['live']}", flush=True)
+    return rec
+
+
+def clear_minted_lexicon() -> None:
+    """Remove the lexicon and restore every stage's 1x recipe (tests)."""
+    for st in _PRISTINE_MIXES:
+        _BASE_MIXES[st] = list(_PRISTINE_MIXES[st])
+    MINTED.update(path=None, lexicon=None, pair_rate=0.0, splits={}, sha=None)
+    _reapply_mixes(list(_BASE_MIXES))
