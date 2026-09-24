@@ -35,6 +35,7 @@ DEFAULTS = {
     "coverage_audit": None,                     # the audit report's path (gates the start)
     "head_birth": "revival_birth",
     "quiet_trunk_grad": False,
+    "abstain_chunks": None,                     # None = the certified 50/50 form (grad_accum abstention chunks per step); an int = that many
     "resume_after_halt": False,
     "micro_batch": None, "grad_accum": None,    # PER RANK; required on a card
     "max_hours": 1000.0,
@@ -64,7 +65,7 @@ def _dist():
     return (int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)))
 
 
-REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale", "minted_lexicon", "stage_arms")
+REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale", "minted_lexicon", "stage_arms", "abstain_chunks")
 
 
 def _resolve_path(path: str, token: str | None) -> str:
@@ -144,6 +145,10 @@ def _refresh_config(C: dict, run) -> dict:
     except AssertionError as e:
         print(f"[mission] stage_arms edit refused: {e}")
         C["stage_arms"] = old.get("stage_arms")
+    if C.get("abstain_chunks") != old.get("abstain_chunks") and getattr(run, "arms", None) is not None:
+        v = C.get("abstain_chunks")
+        run.arms.cfg.abstain_chunks = (int(v) if v is not None else None)
+        print(f"[mission] config: abstention chunks per step -> {run.arms.cfg.abstain_chunks!r} (None = every task chunk pairs with one)", flush=True)
     return C
 
 
@@ -219,7 +224,8 @@ def build_arms(C: dict, local: bool):
     return StageArmProgram(ArmProgramConfig(
         arms=[StageArm(n, ph, spec=dict(spec), lam=float(lam), seed=int(seed)) for n, ph, lam, seed in arms],
         offdomain_dataset="synthetic" if local else "fineweb-edu",
-        quiet_trunk_grad=bool(C["quiet_trunk_grad"])))
+        quiet_trunk_grad=bool(C["quiet_trunk_grad"]),
+        abstain_chunks=(int(C["abstain_chunks"]) if C.get("abstain_chunks") is not None else None)))
 
 
 def push_probe(craft: str, token: str | None, extra: dict) -> bool:
@@ -307,8 +313,10 @@ def boundary_report(run, tag: str, craft: str, report_dir: str, prev_anneal: dic
             prev_anneal["sp"] = sp
     if run.arms is not None:
         for n in run.arms.attached:
-            ck = run.arms.anchor(n, craft, run.step)
             apath = os.path.join(run.out_dir, "arms", f"{n}_step{run.step}.safetensors")
+            if os.path.exists(apath):
+                continue          # the checkpoint routine shipped it already (0.10.3)
+            ck = run.arms.anchor(n, craft, run.step)
             os.makedirs(os.path.dirname(apath), exist_ok=True)
             ck.save(apath)
             run.hub._up(apath, f"arms/{n}_step{run.step}.safetensors")

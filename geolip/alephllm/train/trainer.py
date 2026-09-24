@@ -902,6 +902,21 @@ class Trainer:
         self.manifest.record_checkpoint(self.step, "safetensors", st_name,
                                         val_bpb)
         self._ckpt_count += 1
+        # every attached stage arm ships as its own anchor at every checkpoint
+        # (0.10.3; before this the arm lived only inside resume/latest.pt
+        # between phase boundaries)
+        arms_note = ""
+        if self.arms is not None and getattr(self.arms, "attached", None):
+            n_arms = 0
+            for name in list(self.arms.attached):
+                ck = self.arms.anchor(name, self.hub.prefix, self.step)
+                apath = os.path.join(self.out_dir, "arms",
+                                     f"{name}_step{self.step}.safetensors")
+                os.makedirs(os.path.dirname(apath), exist_ok=True)
+                ck.save(apath)
+                self.hub._up(apath, f"arms/{name}_step{self.step}.safetensors")
+                n_arms += 1
+            arms_note = f" + {n_arms} arm anchor{'s' if n_arms != 1 else ''}"
         fp8_note = ""
         if self._ckpt_count % self.tc.fp8_every_ckpts == 0 or final:
             fp8_name = self.hub.save_fp8(self.raw_model, self.step,
@@ -930,9 +945,9 @@ class Trainer:
             st_mb = os.path.getsize(os.path.join(self.out_dir, st_name)) / 2**20
             rs_gb = os.path.getsize(os.path.join(
                 self.out_dir, "resume", "latest.pt")) / 2**30
-            size_note = f" ({st_mb:.0f}MB{fp8_note} + resume {rs_gb:.2f}GB)"
+            size_note = f" ({st_mb:.0f}MB{fp8_note}{arms_note} + resume {rs_gb:.2f}GB)"
         except OSError:
-            size_note = fp8_note
+            size_note = fp8_note + arms_note
         nxt = ("session end" if final
                else f"next at step {self.step + self.tc.ckpt_every:,}")
         self._say(f"[ckpt] step {self.step:,}: weights + optimizer + stream "
