@@ -102,6 +102,12 @@ class ArmProgramConfig:
     # the v3 craft (32 blocks x 4096-byte rows), which walls a 32 GB card
     # at the third arm; recomputed they cost a fraction of that.
     adapter_recompute: bool = False
+    # 0.10.5: the arm chain of every block through torch.compile (amoe-lora
+    # >= 0.2.9: default mode, inductor's precision-cast emulation set by the
+    # library because the aleph address's compiled backward is non-finite
+    # without it). Same math to bf16 rounding, not bit for bit: a card owes a
+    # gradient census (tools/v3_chain_census3.py) before switching it on.
+    adapter_compile: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -195,6 +201,11 @@ class StageArmProgram:
                                   "recompute-in-backward wrapper); installed: "
                                   f"{_amoe_version()}")
             handle.recompute(True)
+        if self.cfg.adapter_compile:
+            if not hasattr(handle, "compile_chain"):
+                raise ImportError("adapter_compile needs amoe-lora >= 0.2.9 (the compiled "
+                                  f"chain); installed: {_amoe_version()}")
+            handle.compile_chain(True)
         if self.cfg.zero_bias:
             with torch.no_grad():
                 for w in wraps:
@@ -219,8 +230,22 @@ class StageArmProgram:
         print(f"[arms] attached '{arm.name}' for phase '{arm.phase}': "
               f"{sum(p.numel() for p in params)/1e6:.2f}M params x {len(wraps)} blocks, "
               f"lambda {arm.lam}, spec {arm.spec}, recompute "
-              f"{'on' if self.cfg.adapter_recompute else 'off'}", flush=True)
+              f"{'on' if self.cfg.adapter_recompute else 'off'}, compile "
+              f"{'on' if self.cfg.adapter_compile else 'off'}", flush=True)
         return handle
+
+    def set_compile(self, on: bool) -> None:
+        """Flip the compiled chain on every attached arm (a boundary edit)."""
+        on = bool(on)
+        self.cfg.adapter_compile = on
+        n = 0
+        for h in self.handles.values():
+            if not hasattr(h, "compile_chain"):
+                raise ImportError("adapter_compile needs amoe-lora >= 0.2.9; "
+                                  f"installed: {_amoe_version()}")
+            n += h.compile_chain(on)
+        print(f"[arms] adapter chain compile {'ON' if on else 'OFF'} on {n} wrapped blocks "
+              f"({len(self.handles)} arms)", flush=True)
 
     def set_recompute(self, on: bool) -> None:
         """Flip the adapters' recompute-in-backward on every attached arm

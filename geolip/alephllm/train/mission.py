@@ -41,6 +41,9 @@ DEFAULTS = {
     # stacked arms: kept, they cost ~3 GB per attached arm at micro_batch 2 on the v3 craft.
     # Refreshable at any boundary.
     "adapter_recompute": False,
+    # 0.10.5: the arm chain compiled (amoe-lora >= 0.2.9; default mode with the library's precision-cast emulation). Same math to
+    # bf16 rounding: switch it on only after the card's gradient census (tools/v3_chain_census3.py) is clean. Refreshable.
+    "adapter_compile": False,
     "resume_after_halt": False,
     "micro_batch": None, "grad_accum": None,    # PER RANK; required on a card
     "max_hours": 1000.0,
@@ -71,7 +74,7 @@ def _dist():
 
 
 REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale", "minted_lexicon", "stage_arms", "abstain_chunks",
-               "adapter_recompute")
+               "adapter_recompute", "adapter_compile")
 
 
 def _resolve_path(path: str, token: str | None) -> str:
@@ -161,6 +164,12 @@ def _refresh_config(C: dict, run) -> dict:
         except ImportError as e:
             print(f"[mission] adapter_recompute NOT applied ({e}); the launch value is kept", flush=True)
             C["adapter_recompute"] = old.get("adapter_recompute")
+    if bool(C.get("adapter_compile")) != bool(old.get("adapter_compile")) and getattr(run, "arms", None) is not None:
+        try:
+            run.arms.set_compile(bool(C.get("adapter_compile")))
+        except ImportError as e:
+            print(f"[mission] adapter_compile NOT applied ({e}); the launch value is kept", flush=True)
+            C["adapter_compile"] = old.get("adapter_compile")
     return C
 
 
@@ -238,7 +247,8 @@ def build_arms(C: dict, local: bool):
         offdomain_dataset="synthetic" if local else "fineweb-edu",
         quiet_trunk_grad=bool(C["quiet_trunk_grad"]),
         abstain_chunks=(int(C["abstain_chunks"]) if C.get("abstain_chunks") is not None else None),
-        adapter_recompute=bool(C.get("adapter_recompute", False))))
+        adapter_recompute=bool(C.get("adapter_recompute", False)),
+        adapter_compile=bool(C.get("adapter_compile", False))))
 
 
 def push_probe(craft: str, token: str | None, extra: dict) -> bool:
