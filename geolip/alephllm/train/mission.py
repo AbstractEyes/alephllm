@@ -36,6 +36,11 @@ DEFAULTS = {
     "head_birth": "revival_birth",
     "quiet_trunk_grad": False,
     "abstain_chunks": None,                     # None = the certified 50/50 form (grad_accum abstention chunks per step); an int = that many
+    # 0.10.4: recompute the stage adapters' intermediates in the backward instead of keeping them
+    # (amoe-lora >= 0.2.7; exact, one extra adapter forward per backward). The memory fix for
+    # stacked arms: kept, they cost ~3 GB per attached arm at micro_batch 2 on the v3 craft.
+    # Refreshable at any boundary.
+    "adapter_recompute": False,
     "resume_after_halt": False,
     "micro_batch": None, "grad_accum": None,    # PER RANK; required on a card
     "max_hours": 1000.0,
@@ -65,7 +70,8 @@ def _dist():
     return (int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)))
 
 
-REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale", "minted_lexicon", "stage_arms", "abstain_chunks")
+REFRESHABLE = ("arm_spec_certified", "anneal_lr_scale", "minted_lexicon", "stage_arms", "abstain_chunks",
+               "adapter_recompute")
 
 
 def _resolve_path(path: str, token: str | None) -> str:
@@ -149,6 +155,12 @@ def _refresh_config(C: dict, run) -> dict:
         v = C.get("abstain_chunks")
         run.arms.cfg.abstain_chunks = (int(v) if v is not None else None)
         print(f"[mission] config: abstention chunks per step -> {run.arms.cfg.abstain_chunks!r} (None = every task chunk pairs with one)", flush=True)
+    if bool(C.get("adapter_recompute")) != bool(old.get("adapter_recompute")) and getattr(run, "arms", None) is not None:
+        try:
+            run.arms.set_recompute(bool(C.get("adapter_recompute")))
+        except ImportError as e:
+            print(f"[mission] adapter_recompute NOT applied ({e}); the launch value is kept", flush=True)
+            C["adapter_recompute"] = old.get("adapter_recompute")
     return C
 
 
@@ -225,7 +237,8 @@ def build_arms(C: dict, local: bool):
         arms=[StageArm(n, ph, spec=dict(spec), lam=float(lam), seed=int(seed)) for n, ph, lam, seed in arms],
         offdomain_dataset="synthetic" if local else "fineweb-edu",
         quiet_trunk_grad=bool(C["quiet_trunk_grad"]),
-        abstain_chunks=(int(C["abstain_chunks"]) if C.get("abstain_chunks") is not None else None)))
+        abstain_chunks=(int(C["abstain_chunks"]) if C.get("abstain_chunks") is not None else None),
+        adapter_recompute=bool(C.get("adapter_recompute", False))))
 
 
 def push_probe(craft: str, token: str | None, extra: dict) -> bool:

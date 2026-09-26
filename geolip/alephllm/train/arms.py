@@ -64,6 +64,14 @@ def _amoe():
     return AdapterSpec, RelayPatchwork, BlockWithAdapter, attach, AnchorCheckpoint
 
 
+def _amoe_version() -> str:
+    try:
+        import amoe
+        return str(getattr(amoe, "__version__", "?"))
+    except ImportError:
+        return "not installed"
+
+
 @dataclass
 class StageArm:
     name: str
@@ -87,6 +95,13 @@ class ArmProgramConfig:
     quiet_trunk_grad: bool = False             # True = the uncertified variant
     freeze_earlier: bool = False               # the FREEZE-schedule contingency
     zero_bias: bool = True                     # bias-zeroed birth (attach bit-inert)
+    # 0.10.4: the adapters' intermediates are dropped after each forward and
+    # recomputed in the backward (amoe-lora >= 0.2.7). Exact — one extra
+    # adapter forward per backward — and the memory fix for stacked arms:
+    # kept intermediates cost ~3 GB per attached arm at micro_batch 2 on
+    # the v3 craft (32 blocks x 4096-byte rows), which walls a 32 GB card
+    # at the third arm; recomputed they cost a fraction of that.
+    adapter_recompute: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -174,6 +189,12 @@ class StageArmProgram:
             model.train()
         wraps = [b for b in model.blocks if isinstance(b, BlockWithAdapter)]
         assert len(wraps) == len(model.blocks), "attach did not wrap every block"
+        if self.cfg.adapter_recompute:
+            if not hasattr(handle, "recompute"):   # the fix is named, not implied
+                raise ImportError("adapter_recompute needs amoe-lora >= 0.2.7 (the "
+                                  "recompute-in-backward wrapper); installed: "
+                                  f"{_amoe_version()}")
+            handle.recompute(True)
         if self.cfg.zero_bias:
             with torch.no_grad():
                 for w in wraps:
@@ -197,8 +218,23 @@ class StageArmProgram:
         self.wraps[arm.name] = wraps
         print(f"[arms] attached '{arm.name}' for phase '{arm.phase}': "
               f"{sum(p.numel() for p in params)/1e6:.2f}M params x {len(wraps)} blocks, "
-              f"lambda {arm.lam}, spec {arm.spec}", flush=True)
+              f"lambda {arm.lam}, spec {arm.spec}, recompute "
+              f"{'on' if self.cfg.adapter_recompute else 'off'}", flush=True)
         return handle
+
+    def set_recompute(self, on: bool) -> None:
+        """Flip the adapters' recompute-in-backward on every attached arm
+        (a boundary edit of the config; memory only, the math unchanged)."""
+        on = bool(on)
+        self.cfg.adapter_recompute = on
+        n = 0
+        for h in self.handles.values():
+            if not hasattr(h, "recompute"):
+                raise ImportError("adapter_recompute needs amoe-lora >= 0.2.7; "
+                                  f"installed: {_amoe_version()}")
+            n += h.recompute(on)
+        print(f"[arms] adapter recompute {'ON' if on else 'OFF'} on {n} wrapped blocks "
+              f"({len(self.handles)} arms)", flush=True)
 
     def sync(self, active_phase: str | None) -> list:
         """Attach every arm registered for `active_phase` that is not yet
