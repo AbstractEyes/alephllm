@@ -13,14 +13,16 @@ Notebook API:
     run.evaluate()                                  # bpb, toggles, canaries
 """
 
-__version__ = "0.10.5"
+__version__ = "0.10.6"
 
 from .presets import PRESETS, AlephLMConfig, TrainConfig, Preset, get_preset
 from .model.alephlm import AlephLM
 from .train.trainer import Trainer, prepare
 from .train.manifest import RunManifest
+from .arm_mount import load_trunk, mount_group, mount_anchors, masked, only, detach_all
 
 __all__ = [
     "PRESETS", "AlephLMConfig", "TrainConfig", "Preset", "get_preset",
     "AlephLM", "Trainer", "prepare", "RunManifest", "__version__",
+    "load_trunk", "mount_group", "mount_anchors", "masked", "only", "detach_all",
 ]

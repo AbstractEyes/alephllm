@@ -159,6 +159,16 @@ the path (the repo source, not a stale installed copy). To run the suite
 off-card on a CUDA build, hide the card with `CUDA_VISIBLE_DEVICES=-1`
 (an empty value makes torch report a card that the runtime cannot open).
 
+**Mounting a trained arm group (0.10.6).** `geolip.alephllm.arm_mount` loads a
+trunk at a stored step (`load_trunk`) and mounts a published group of arm anchors
+on it by the training route itself (`mount_group`: the arm program attaches each
+member in training order from its anchor file, asserts every anchor was trained on
+that exact trunk step, and for a group that extends an earlier one checks the
+carried members' tensor hashes against it). Masks by member (`masked`, `only`) and
+an exact detach (`detach_all`) follow; block-level taps taken after the mount see
+the armed stream. Test: `python -m geolip.alephllm.tests.test_arm_mount` (CPU,
+seconds, a stand-in trunk and group).
+
 The multi-card path has its own smoke (CPU over gloo, or cards over nccl):
 
 ```

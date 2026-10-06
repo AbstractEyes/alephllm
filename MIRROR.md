@@ -43,3 +43,7 @@ unchanged; `model.blocks` / `cfg.d_model` / `cfg.name` names unchanged.
 The 2026-08-26 v2 surgery (multi-constellation + governor + supply warning)
 was designed to keep all of it: v1 checkpoints, the 29 shipped arms, and the
 live Space load bit-identically.
+The group anchor sets on the training repo (`mini-beatrix-3/arm_refit/group/anchors`)
+mount on a trunk through `geolip.alephllm.arm_mount.mount_group` (0.10.6); the public
+package's `arms/` files hold the same tensors in the package's own layout and mount
+through the package's runtime.
