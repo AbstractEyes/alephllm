@@ -4,7 +4,7 @@ huggingface.co/**AbstractPhil/mini-beatrix-1**,
 **AbstractPhil/mini-beatrix-2s** (added 2026-08-31, mission final
 weights), **AbstractPhil/mini-beatrix-2.5s** (added 2026-09-22, the 2s core
 with its arms) AND **AbstractPhil/mini-beatrix-3** (added 2026-10-05, mission
-final weights) are HF remote-code packages
+final weights, with its stage arms since the same day) are HF remote-code packages
 (`MiniBeatrixConfig` / `MiniBeatrixForCausalLM` in `modeling_minibeatrix.py`)
 that carry **vendored copies of `geolip/alephllm/model/*.py`** plus
 `presets.py`. Nothing in this repo enforces the link.
