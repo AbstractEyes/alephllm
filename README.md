@@ -58,8 +58,12 @@ hardware in its shipped form.
 ## Install & run
 
 ```
-pip install git+https://github.com/AbstractEyes/alephllm
+pip install "geolip-alephllm[train] @ git+https://github.com/AbstractEyes/alephllm"
 ```
+
+The `train` extra adds the streamed-corpus dependency (`datasets>=5`). Inference, evaluation and
+the arm mount need only the base install (`pip install git+https://github.com/AbstractEyes/alephllm`),
+which leaves `datasets` and `huggingface_hub` free for stacks pinned to older majors.
 
 ```python
 from geolip.alephllm import prepare

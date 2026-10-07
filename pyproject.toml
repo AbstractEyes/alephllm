@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geolip-alephllm"
-version = "0.10.6"
+version = "0.10.7"
 description = "AlephLLM — signed-address (aleph) language models: anchored FFN banks, CausalSplatHUB attention, born-null dual head. Mini-Beatrix mission presets."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,11 +17,14 @@ dependencies = [
     "tqdm>=4.66",
     "numpy>=1.24",
     "tensorboard>=2.15",
-    "datasets>=5.0.0"
 ]
 
 [project.optional-dependencies]
 bpe = ["tokenizers>=0.19"]
+# Training only: the streamed corpora (data/streams.py, chat_sft.py import it lazily). Inference, evaluation and the arm
+# mount never import it, so the base install stays compatible with stacks pinned below datasets 5 / huggingface_hub 1.0
+# (e.g. transformers 4.x diffusion stacks).
+train = ["datasets>=5.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/AbstractEyes/alephllm"

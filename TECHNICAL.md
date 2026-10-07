@@ -7,9 +7,10 @@ training semantics, data machinery, and the instrument suite. The run
 record (checkpoints, reports, arms) lives in the training repository's
 companion: [alephllm-mini-beatrix-training](https://huggingface.co/AbstractPhil/alephllm-mini-beatrix-training).
 
-Package: `pip install geolip-alephllm @ git+https://github.com/AbstractEyes/alephllm`
-(namespace package `geolip.alephllm`). Python ≥3.10, torch ≥2.4,
-datasets ≥5.0.0 (the `Json` feature type used by curriculum sources).
+Package: `pip install "geolip-alephllm[train] @ git+https://github.com/AbstractEyes/alephllm"`
+(namespace package `geolip.alephllm`). Python ≥3.10, torch ≥2.4; the `train` extra adds
+datasets ≥5.0.0 (the `Json` feature type used by curriculum sources), which inference, evaluation
+and the arm mount never import (0.10.7).
 
 ## 1. Model: `AlephLM` (preset `mini-beatrix-1`)
 
