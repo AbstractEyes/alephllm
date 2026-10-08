@@ -256,7 +256,38 @@ SURFACE_ARMS = {
                 "file": "surface/qwen3/mse_gXB_o1/s10_qwen.safetensors", "seed": "B"},
     "qwen3-solo": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": None,
                    "file": "surface/qwen3/mse_solo_o0/s10_qwen.safetensors", "seed": "A"},
+    # the controls (mountable like the arms; what they are is in the registry): the shuffled-pairing control was trained against
+    # the wrong targets; the untrained-copy control was trained on a random-initialization copy of the trunk (seed 0) and mounts
+    # on such a copy, never on the trunk
+    "qwen3-shuf": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": ("gXA", 8),
+                   "file": "surface/qwen3/mse_gXA_o0_shuf/s10_qwen.safetensors", "seed": "A", "control": "shuffled pairs"},
+    "qwen3-untrained": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": None,
+                        "file": "surface/qwen3/mse_untrained_o0/s10_qwen.safetensors", "seed": "A", "control": "untrained copy (seed 0)"},
+    # the family (the same recipe over the frozen eight; the lossy conventions read A as the text as written; sites = the token
+    # closings unless noted). Populated as the arms land.
+    "qwen3-bytes": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s14_qwen_bytes", "base": ("gXA", 8),
+                    "file": "surface/qwen3/mse_gXA_o0_bytes/s14_qwen_bytes.safetensors", "seed": "A", "sites": "bytes"},
+    "t5": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": ("gXA", 8),
+           "file": "surface/t5/mse_gXA_o0/s11_t5.safetensors", "seed": "A"},
+    "t5-B": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": ("gXB", 8),
+             "file": "surface/t5/mse_gXB_o1/s11_t5.safetensors", "seed": "B"},
+    "clip": {"convention": "clip", "tokenizer": "openai/clip-vit-large-patch14", "member": "s12_clip", "base": ("gXA", 8),
+             "file": "surface/clip/mse_gXA_o0/s12_clip.safetensors", "seed": "A"},
+    "clip-B": {"convention": "clip", "tokenizer": "openai/clip-vit-large-patch14", "member": "s12_clip", "base": ("gXB", 8),
+               "file": "surface/clip/mse_gXB_o1/s12_clip.safetensors", "seed": "B"},
+    "bert": {"convention": "wordpiece", "tokenizer": "bert-base-uncased", "member": "s13_bert", "base": ("gXA", 8),
+             "file": "surface/bert/mse_gXA_o0/s13_bert.safetensors", "seed": "A"},
+    "bert-B": {"convention": "wordpiece", "tokenizer": "bert-base-uncased", "member": "s13_bert", "base": ("gXB", 8),
+               "file": "surface/bert/mse_gXB_o1/s13_bert.safetensors", "seed": "B"},
 }
+
+
+def reader_kwargs(row: dict) -> dict:
+    """The train.surface.read_spelled keyword arguments a registry row implies (its convention, its A text rule, its site set),
+    so a mounted arm is read as it was trained: read_spelled(model, tok, texts, blocks, **reader_kwargs(prog.surface))."""
+    from .train import surface as SF
+    return {"convention": row["convention"], "a_text": row.get("a_text", "written"),
+            "site_fn": SF.sites_every_byte if row.get("sites") == "bytes" else SF.sites}
 
 
 def surface_files(name: str, local_dir: str | None = None, repo: str = SURFACE_REPO) -> dict:

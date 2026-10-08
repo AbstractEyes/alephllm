@@ -61,6 +61,12 @@ C2B = char_to_byte()
 B2C = {b: c for c, b in C2B.items()}
 
 
+CONVENTIONS = ("gpt2", "sentencepiece", "wordpiece", "clip")
+# the spelled surface per convention: the pieces' strings as UTF-8 in order; WordPiece pieces carry no word-start mark, so they
+# are joined by one space (the separator follows each piece and is its closing byte on B)
+_SEP = {"gpt2": b"", "sentencepiece": b"", "wordpiece": b" ", "clip": b""}
+
+
 @dataclass(frozen=True)
 class Spelled:
     text: str
@@ -69,29 +75,99 @@ class Spelled:
     spelled: bytes        # surface B
     a_end: tuple          # per token: the byte after its expansion in raw (len(raw) for the last)
     b_end: tuple          # per token: the byte after its spelling in spelled
+    convention: str = "gpt2"
 
 
-def spell(tok, text: str) -> Spelled:
-    """The two surfaces of `text` under a byte-level BPE tokenizer with the GPT-2 map (`tok`: a transformers tokenizer whose
-    convert_ids_to_tokens gives the stand-in strings). Raises ValueError when the tokens' expansions do not give the text's
-    bytes back (a tokenizer that normalizes the text first; such a text has no exact spelling)."""
-    ids = tok(text, add_special_tokens=False)["input_ids"]
-    pieces = tok.convert_ids_to_tokens(ids)
-    try:
-        expansions = [bytes(C2B[c] for c in p) for p in pieces]
-    except KeyError as e:
-        raise ValueError(f"a token piece holds a character outside the byte map: {e}") from None
+def spelled_surface(pieces, convention: str = "gpt2"):
+    """(surface B, b_end) from the token pieces: the pieces' strings as UTF-8 in order, joined by the convention's separator
+    (none but for WordPiece's space); b_end[t] = the byte after piece t (its separator, or the next piece's first byte)."""
+    sep = _SEP[convention]
+    parts = [p.encode("utf-8") for p in pieces]
+    ends, pos = [], 0
+    for part in parts:
+        pos += len(part)
+        ends.append(pos)
+        pos += len(sep)
+    return sep.join(parts), tuple(ends)
+
+
+def spell(tok, text: str, convention: str = "gpt2", a_text: str = "written") -> Spelled:
+    """The two surfaces of `text` under a tokenizer of the given spelling convention (`tok`: a transformers tokenizer; a fast one
+    for every convention but gpt2). gpt2 (byte-level BPE with GPT-2's map: Qwen 2.5 / 3, Llama 3, GPT-2 and kin) is EXACT: the
+    pieces' characters through the map give the text's bytes, and ValueError means the text has no exact spelling (a tokenizer
+    that normalized it). The other conventions (sentencepiece: '▁' and <0xNN>, T5 and Llama 2 kin; wordpiece: '##' continuations,
+    BERT kin; clip: the byte map with '</w>' word ends) are LOSSY (case folding, re-spacing, normalization), so each token's
+    closing byte on A comes from the tokenizer's offset mapping (the byte after the token's span in the text as written), and a
+    text whose tokens do not tie to it (an empty span, a span out of order, a text not covered to its end) raises ValueError
+    (the callers skip and count it). a_text="normalized" reads A as the tokenizer's own normalization of the text (its backend
+    normalizer) instead of the text as written: the design point for the lossy conventions."""
+    if convention not in CONVENTIONS:
+        raise ValueError(f"unknown convention {convention!r}; one of {CONVENTIONS}")
+    if a_text == "normalized":
+        norm = getattr(getattr(tok, "backend_tokenizer", None), "normalizer", None)
+        if norm is not None:
+            text = norm.normalize_str(text)
+    elif a_text != "written":
+        raise ValueError(f"a_text is 'written' or 'normalized', not {a_text!r}")
     raw = text.encode("utf-8")
-    if b"".join(expansions) != raw:
-        raise ValueError(f"the tokens' byte expansions do not give the text back: {text[:60]!r}")
-    spellings = [p.encode("utf-8") for p in pieces]
-    return Spelled(text, tuple(ids), raw, b"".join(spellings), tuple(accumulate(len(e) for e in expansions)),
-                   tuple(accumulate(len(s) for s in spellings)))
+    if convention == "gpt2":
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        pieces = tok.convert_ids_to_tokens(ids)
+        try:
+            expansions = [bytes(C2B[c] for c in p) for p in pieces]
+        except KeyError as e:
+            raise ValueError(f"a token piece holds a character outside the byte map: {e}") from None
+        if b"".join(expansions) != raw:
+            raise ValueError(f"the tokens' byte expansions do not give the text back: {text[:60]!r}")
+        spelled, b_end = spelled_surface(pieces, convention)
+        return Spelled(text, tuple(ids), raw, spelled, tuple(accumulate(len(e) for e in expansions)), b_end, convention)
+    enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+    ids, offs = list(enc["input_ids"]), list(enc["offset_mapping"])
+    pieces = tok.convert_ids_to_tokens(ids)
+    cum = [0]
+    for ch in text:
+        cum.append(cum[-1] + len(ch.encode("utf-8")))
+    a_end, last = [], 0
+    for p, (s, e) in zip(pieces, offs):
+        if convention == "sentencepiece" and p == "▁":
+            # a lone word-boundary marker (T5 spells ' a' as '▁' + 'a'): the fast tokenizer gives it the following word's span, but
+            # it stands for the space before that word, so its closing byte is the word's first byte; at the text's start it is
+            # the dummy prefix and closes at byte 0 (never a site: the first token gives none)
+            a = cum[s] if 0 <= s <= len(text) else -1
+            if a < last:
+                raise ValueError(f"a lone marker's span ({s}, {e}) does not tie to the text after byte {last}: {text[:60]!r}")
+        else:
+            a = cum[e] if 0 <= s < e <= len(text) else -1
+            if a <= last:
+                raise ValueError(f"a token's span ({s}, {e}) does not tie to the text after byte {last}: {text[:60]!r}")
+        last = a
+        a_end.append(a)
+    if not a_end or a_end[-1] != len(raw):
+        raise ValueError(f"the tokens do not cover the text to its end ({a_end[-1] if a_end else 0} of {len(raw)} bytes): {text[:60]!r}")
+    spelled, b_end = spelled_surface(pieces, convention)
+    return Spelled(text, tuple(ids), raw, spelled, tuple(a_end), b_end, convention)
 
 
 def sites(s: Spelled) -> list:
     """[(token position, closing byte offset on A, closing byte offset on B)] for every token but the first and the last."""
     return [(t, s.a_end[t], s.b_end[t]) for t in range(1, len(s.ids) - 1)]
+
+
+def sites_every_byte(s: Spelled) -> list:
+    """The segmentation-free site set under the gpt2 convention, where B is the byte-wise map of A: one site per byte of the
+    text, (the token holding the byte, the byte after it on A, the byte after its stand-in on B), the first token's bytes and
+    the last byte excluded as the token sites exclude the first and the last token; the token sites are the subset at the
+    tokens' last bytes."""
+    if s.convention != "gpt2":
+        raise ValueError("every-byte sites need the gpt2 convention (B the byte-wise map of A)")
+    out, pos, t = [], 0, 0
+    for i, b in enumerate(s.raw[:-1]):
+        pos += len(B2C[b].encode("utf-8"))
+        while t < len(s.a_end) - 1 and s.a_end[t] <= i:
+            t += 1
+        if t > 0:
+            out.append((t, i + 1, pos))
+    return out
 
 
 # ------------------------------------------------------------------------------------------------------ paired rows
@@ -101,10 +177,12 @@ class PairedRows:
     every position < ctx (the model's input is the row's first ctx ids). Each document is DOC + its bytes; the B row fills
     first, the A row carries the same documents then further ones as context; the last document is cut at the row's end on
     both surfaces (no carry-over, so the two rows always hold the same documents in the same order).
-    `token_ids` beside the sites: S_ids (n_sites,) the tokenizer id at each site, for reads that group by token."""
+    `token_ids` beside the sites: S_ids (n_sites,) the tokenizer id at each site, for reads that group by token.
+    `site_fn` picks the site set of a document (sites: the token closings; sites_every_byte: every byte)."""
 
-    def __init__(self, docs, ctx: int, rows: int = 2):
+    def __init__(self, docs, ctx: int, rows: int = 2, site_fn=sites):
         self.docs, self.ctx, self.rows = iter(docs), int(ctx), int(rows)
+        self.site_fn = site_fn
         self.n_docs = 0
         self.n_sites = 0
 
@@ -119,7 +197,7 @@ class PairedRows:
             A.append(DOC)
             B.extend(d.spelled)
             B.append(DOC)
-            for t, ea, eb in sites(d):
+            for t, ea, eb in self.site_fn(d):
                 qa, qb = pa + ea, pb + eb
                 if qa < self.ctx and qb < self.ctx:
                     S.append((r, qa, qb))
@@ -144,10 +222,10 @@ class PairedRows:
                 torch.tensor(S, dtype=torch.long).reshape(-1, 3), torch.tensor(ids, dtype=torch.long))
 
 
-def single_rows(docs, ctx: int):
+def single_rows(docs, ctx: int, site_fn=sites):
     """The read's form: one document a row, DOC + bytes, right-padded with zeros to the longest (a causal model's states at a
     document's own positions do not see the pad). -> (xa, xb, S, ids) as PairedRows gives them, every document whole (one
-    longer than ctx - 1 bytes on either surface is skipped)."""
+    longer than ctx - 1 bytes on either surface is skipped); `site_fn` as in PairedRows."""
     A, B, S, ids = [], [], [], []
     for d in docs:
         if len(d.raw) + 1 > ctx or len(d.spelled) + 1 > ctx:
@@ -155,7 +233,7 @@ def single_rows(docs, ctx: int):
         r = len(A)
         A.append([DOC] + list(d.raw))
         B.append([DOC] + list(d.spelled))
-        for t, ea, eb in sites(d):
+        for t, ea, eb in site_fn(d):
             S.append((r, 1 + ea, 1 + eb))
             ids.append(d.ids[t])
     la, lb = max(len(a) for a in A), max(len(b) for b in B)
@@ -327,28 +405,29 @@ def doc_count(xs) -> int:
 # ------------------------------------------------------------------------------------------------------ the reader
 @torch.no_grad()
 def read_spelled(model, tok, texts, blocks, *, surface: str = "B", device=None, batch: int = 64, amp: bool = True,
-                 ln_states: bool = True, ctx: int | None = None):
+                 ln_states: bool = True, ctx: int | None = None, convention: str = "gpt2", a_text: str = "written", site_fn=sites):
     """Read texts through the model on one surface and return the states at every token's closing byte.
     surface 'B' = the tokenizer's spelling (what a surface arm serves), 'A' = the texts' own bytes; both use the same sites, so
     the two readings of one text line up token by token. Returns {'states': {block: (n_sites, d) fp32, LayerNorm'd without affine
     unless ln_states=False}, 'sites': (n_sites, 3) long = (text index, token position, token id), 'spelled': [Spelled]}.
     The sites of a text are every token but its first and last (the read's convention: the closing byte is the byte after the
     token's expansion, where the state has read the whole token; a phrase's full stop is the closing byte of the token before it).
-    Texts the tokenizer cannot spell exactly are skipped (their index absent from 'sites'). One document a row, right-padded;
-    a causal model's states at a document's own positions do not see the pad."""
+    Texts the tokenizer cannot spell (exactly under gpt2; tied to the text under the other conventions) are skipped (their index
+    absent from 'sites'). `convention`, `a_text` and `site_fn` as in spell() and PairedRows (the arm's own: its registry row).
+    One document a row, right-padded; a causal model's states at a document's own positions do not see the pad."""
     device = device or next(model.parameters()).device
     ctx = int(ctx or model.cfg.context)
     sp, keep = [], []
     for i, t in enumerate(texts):
         try:
-            s = spell(tok, t)
+            s = spell(tok, t, convention, a_text)
         except ValueError:
             continue
         if len(s.raw) + 1 > ctx or len(s.spelled) + 1 > ctx or len(s.ids) < 3:
             continue
         sp.append(s)
         keep.append(i)
-    xa, xb, S, ids = single_rows(sp, ctx)
+    xa, xb, S, ids = single_rows(sp, ctx, site_fn)
     x = xb if surface == "B" else xa
     where = S[:, [0, 2 if surface == "B" else 1]]
     blocks = sorted(int(b) for b in blocks)
@@ -370,6 +449,6 @@ def read_spelled(model, tok, texts, blocks, *, surface: str = "B", device=None, 
     if was_training:
         model.train()
     # (text index, token position, token id) per site, in the order single_rows laid the sites out (text by text, token by token)
-    table = [(keep[i], t, s.ids[t]) for i, s in enumerate(sp) for t, _, _ in sites(s)]
+    table = [(keep[i], t, s.ids[t]) for i, s in enumerate(sp) for t, _, _ in site_fn(s)]
     assert len(table) == len(S)
     return {"states": out, "sites": torch.tensor(table, dtype=torch.long).reshape(-1, 3), "spelled": sp}

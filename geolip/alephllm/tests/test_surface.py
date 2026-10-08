@@ -72,6 +72,50 @@ class StandInTokenizer:
         return [self.pieces[i] for i in ids]
 
 
+class StandInLossy:
+    """a stand-in for the lossy conventions: a word (split on single spaces) a token, the piece lower-cased and marked as the
+    convention spells it ('##' never arises: whole words; '▁' prefix; '</w>' suffix); offsets = each word's span in the text
+    as written; a backend normalizer that lower-cases. drop_last=True leaves the last word out (an uncovered text). Under
+    sentencepiece a one-letter word is spelled as T5 spells it: a lone '▁' piece then the bare word, both with the word's span."""
+
+    def __init__(self, convention: str, drop_last: bool = False):
+        self.convention, self.drop_last = convention, drop_last
+        self.vocab, self.pieces = {}, []
+        self.backend_tokenizer = types.SimpleNamespace(normalizer=types.SimpleNamespace(normalize_str=lambda s: s.lower()))
+
+    def _piece(self, w: str) -> str:
+        w = w.lower()
+        return {"wordpiece": w, "sentencepiece": "▁" + w, "clip": w + "</w>"}[self.convention]
+
+    @staticmethod
+    def words(text: str):
+        """[(word, start char, end char)] for the non-empty words of the text split on spaces"""
+        out, pos = [], 0
+        for w in text.split(" "):
+            if w:
+                out.append((w, pos, pos + len(w)))
+            pos += len(w) + 1
+        return out
+
+    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+        ids, offs = [], []
+        words = self.words(text)
+        if self.drop_last:
+            words = words[:-1]
+        for w, start, end in words:
+            pieces = ["▁", w.lower()] if self.convention == "sentencepiece" and len(w) == 1 else [self._piece(w)]
+            for p in pieces:
+                if p not in self.vocab:
+                    self.vocab[p] = len(self.pieces)
+                    self.pieces.append(p)
+                ids.append(self.vocab[p])
+                offs.append((start, end))
+        return {"input_ids": ids, "offset_mapping": offs} if return_offsets_mapping else {"input_ids": ids}
+
+    def convert_ids_to_tokens(self, ids):
+        return [self.pieces[i] for i in ids]
+
+
 TEXTS = ["a taco truck parked by the sea", "two dogs  run", "café au lait on a tray", "snow over the harbour at dusk, boats moored",
          "x", "the quick brown fox jumps over the lazy dog again and again", "naïve résumé", "tags: 1girl, red hair, smile"]
 
@@ -105,6 +149,57 @@ def run_all() -> bool:
     check("first and last token give no site", ok_ends)
     sp = S.spell(tok, "a taco")
     check("' taco' -> 'Ġtaco' six bytes against five", tok.convert_ids_to_tokens(sp.ids)[1] == "Ġtaco" and len(sp.spelled) == 7 and len(sp.raw) == 6)
+    # 2b the family's conventions through the offset mapping (stand-ins: a word a token, lower-cased pieces; offsets in the text)
+    ok_wp, ok_spm, ok_clip, ok_norm, ok_err = True, True, True, True, False
+    for text in TEXTS:
+        raw = text.encode("utf-8")
+        for conv, st in (("wordpiece", StandInLossy("wordpiece")), ("sentencepiece", StandInLossy("sentencepiece")), ("clip", StandInLossy("clip"))):
+            s = S.spell(st, text, conv)
+            pieces = st.convert_ids_to_tokens(s.ids)
+            words = StandInLossy.words(text)
+            # A: the closing byte after each word as written (the byte offset of its end), the last at the text's end; a lone
+            # marker (sentencepiece, one-letter words) closes at the word's first byte
+            ends = []
+            for w, b, e in words:
+                if conv == "sentencepiece" and len(w) == 1:
+                    ends.append(len(text[:b].encode("utf-8")))
+                ends.append(len(text[:e].encode("utf-8")))
+            good = s.raw == raw and list(s.a_end) == ends and s.convention == conv and len(s.ids) == len(ends) and ends[-1] == len(raw)
+            # B: the pieces as spelled, the separator after each piece under wordpiece, none under the others
+            sep = b" " if conv == "wordpiece" else b""
+            good &= s.spelled == sep.join(p.encode("utf-8") for p in pieces)
+            good &= all(s.spelled[e - 1:e] == pieces[t].encode("utf-8")[-1:] for t, e in enumerate(s.b_end))
+            good &= all(s.b_end[t] + len(sep) == s.b_end[t + 1] - len(pieces[t + 1].encode("utf-8")) for t in range(len(pieces) - 1))
+            if conv == "wordpiece":
+                ok_wp &= good and all(p == p.lower() for p in pieces)
+            elif conv == "sentencepiece":
+                ok_spm &= good and all(p.startswith("▁") or pieces[i - 1] == "▁" for i, p in enumerate(pieces)) and ("▁" in pieces) == any(len(w) == 1 for w, _, _ in words)
+            else:
+                ok_clip &= good and all(p.endswith("</w>") for p in pieces)
+        # A as the tokenizer's normalization: the lower-cased text, the same ties
+        st = StandInLossy("wordpiece")
+        sn = S.spell(st, text, "wordpiece", a_text="normalized")
+        ok_norm &= sn.text == text.lower() and sn.raw == text.lower().encode("utf-8") and len(sn.a_end) == len(StandInLossy.words(text)) and sn.a_end[-1] == len(sn.raw)
+    try:
+        S.spell(StandInLossy("wordpiece", drop_last=True), "a taco truck", "wordpiece")
+    except ValueError:
+        ok_err = True
+    check("wordpiece: pieces joined by spaces, closings at the separators, A from the offsets", ok_wp)
+    check("sentencepiece: '▁' pieces concatenated, A from the offsets", ok_spm)
+    check("clip: '</w>' pieces concatenated, A from the offsets", ok_clip)
+    check("a_text='normalized': A is the normalizer's text", ok_norm)
+    check("a text not covered to its end raises", ok_err)
+    # 2c every-byte sites under gpt2: one per byte but the first token's and the last; the token sites among them
+    ok_eb = True
+    for text in TEXTS:
+        s = S.spell(tok, text)
+        eb = S.sites_every_byte(s)
+        ts = S.sites(s)
+        n_first = s.a_end[0]
+        ok_eb &= len(eb) == max(len(s.raw) - 1 - n_first, 0) and all(0 < t < len(s.ids) for t, _, _ in eb)
+        ok_eb &= all((qa, qb) in {(a, b) for _, a, b in eb} for _, qa, qb in ts)
+        ok_eb &= all(s.spelled[qb - 1] == S.B2C[s.raw[qa - 1]].encode("utf-8")[-1] for _, qa, qb in eb)
+    check("every-byte sites: count, token sites a subset, each closes its byte on both surfaces", ok_eb)
     # 3 paired rows
     def docs():
         i = 0
