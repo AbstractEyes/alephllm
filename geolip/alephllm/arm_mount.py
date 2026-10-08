@@ -262,7 +262,8 @@ SURFACE_ARMS = {
     "qwen3-shuf": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": ("gXA", 8),
                    "file": "surface/qwen3/mse_gXA_o0_shuf/s10_qwen.safetensors", "seed": "A", "control": "shuffled pairs"},
     "qwen3-untrained": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": None,
-                        "file": "surface/qwen3/mse_untrained_o0/s10_qwen.safetensors", "seed": "A", "control": "untrained copy (seed 0)"},
+                        "file": "surface/qwen3/mse_untrained_o0/s10_qwen.safetensors", "seed": "A", "control": "untrained copy (seed 0)",
+                        "trunk": "untrained copy (seed 0)"},   # its anchor names step 0: the mount skips the step check for this row
     # the family (the same recipe over the frozen eight; the lossy conventions read A as the text as written; sites = the token
     # closings unless noted). Populated as the arms land.
     "qwen3-bytes": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s14_qwen_bytes", "base": ("gXA", 8),
@@ -309,6 +310,8 @@ def mount_surface(model, name: str = "qwen3", *, local_dir: str | None = None, r
     the arm program; prog.surface carries the registry row. The arm serves the tokenizer's spelling: read text through it with
     train.surface.read_spelled(model, tok, texts); mask it with masked(prog, [row['member']]) for the plain reading."""
     row = SURFACE_ARMS[name]
+    if row.get("trunk", "").startswith("untrained"):
+        require_step = None            # the control's arm was trained on a random-initialization copy (its anchor names step 0)
     files = files or surface_files(name, local_dir, repo)
     order = ([m for m in (GROUPS[row["base"][0]][1] if row["base"] and row["base"][0] in GROUPS else STAGE_ARMS)] if row["base"] else []) + [row["member"]]
     phases = dict(PHASES)
