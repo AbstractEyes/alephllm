@@ -203,6 +203,24 @@ def run_all() -> bool:
     loss, _ = S.surface_loss(st_b, st_t, stats3, form="mse")
     loss.backward()
     check("the loss reaches the arm's parameters", any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in prog.params_of("m2")))
+    # 5b the reader: both surfaces, the same sites; the states equal the hand-run gather
+    model.eval()
+    for p in prog.params_of("m2"):
+        p.requires_grad_(False)
+    texts_r = TEXTS[:5]
+    ra = S.read_spelled(model, tok, texts_r, blocks=[0, 2], surface="A", amp=False)
+    rb = S.read_spelled(model, tok, texts_r, blocks=[0, 2], surface="B", amp=False)
+    n_sites = sum(len(S.sites(S.spell(tok, t))) for t in texts_r)
+    ok_read = (ra["sites"].shape == (n_sites, 3) and torch.equal(ra["sites"], rb["sites"]) and ra["states"][2].shape == (n_sites, 64)
+               and set(ra["states"]) == {0, 2} and bool((ra["sites"][:, 0] < 5).all()))
+    # the first text's first site, by hand: DOC + raw, the state at the closing byte, LayerNorm'd
+    sp0 = S.spell(tok, texts_r[0])
+    t0, ea0, _ = S.sites(sp0)[0]
+    x0 = torch.tensor([[DOC] + list(sp0.raw)])
+    with torch.no_grad():
+        st0, _ = S.block_states(model, x0, [2], where=torch.tensor([[0, 1 + ea0]]))
+    ok_read &= torch.allclose(S.ln(st0[2])[0], ra["states"][2][0], atol=1e-5) and int(ra["sites"][0, 2]) == sp0.ids[t0] and int(ra["sites"][0, 1]) == t0
+    check("read_spelled: the same sites on both surfaces; states equal the hand-run gather", ok_read)
     # 6 the gauge
     X = torch.randn(600, 64, dtype=torch.float64)
     Q, _ = torch.linalg.qr(torch.randn(64, 64, dtype=torch.float64))

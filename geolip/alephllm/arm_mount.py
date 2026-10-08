@@ -238,3 +238,51 @@ def detach_all(prog, verify: bool = True):
 def logits(model, x):
     out = model(x)
     return (out.logits if hasattr(out, "logits") else out[0]).float()
+
+
+# ------------------------------------------------------------ surface arms
+# A surface arm makes the trunk read a tokenizer's SPELLING of a text (train/surface.py) as it reads the text's own bytes. The
+# published arms live on SURFACE_REPO under surface/<convention>/<run>/: the member's anchor (amoe format, base_model_id
+# ...@step245674), the standardization statistics the loss used (stats.pt, for the record) and the readout. A surface arm trained
+# over a frozen stage-arm group mounts over that group, in training order (the group from the training repo, the member from
+# SURFACE_REPO); one trained on the bare trunk mounts alone.
+SURFACE_REPO = "AbstractPhil/beatrix-tokenizers"
+SURFACE_ARMS = {
+    # name -> the registry row: convention (the spelling family of geolip.bytelex.extract), the reference tokenizer, the member,
+    # the group it was trained over (run, close; None = the bare trunk), the anchor file on SURFACE_REPO, the seed label
+    "qwen3": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": ("gXA", 8),
+              "file": "surface/qwen3/mse_gXA_o0/s10_qwen.safetensors", "seed": "A"},
+    "qwen3-B": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": ("gXB", 8),
+                "file": "surface/qwen3/mse_gXB_o1/s10_qwen.safetensors", "seed": "B"},
+    "qwen3-solo": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": None,
+                   "file": "surface/qwen3/mse_solo_o0/s10_qwen.safetensors", "seed": "A"},
+}
+
+
+def surface_files(name: str, local_dir: str | None = None, repo: str = SURFACE_REPO) -> dict:
+    """member -> local path for a surface arm and, when it was trained over a group, that group's anchors first (in training
+    order), downloaded unless present. The registry row is SURFACE_ARMS[name]."""
+    from huggingface_hub import hf_hub_download
+    row = SURFACE_ARMS[name]
+    files = {}
+    if row["base"] is not None:
+        run, close = row["base"]
+        files.update(anchor_files(run, close, GROUPS[run][1] if run in GROUPS else STAGE_ARMS, local_dir))
+    files[row["member"]] = hf_hub_download(repo, row["file"], local_dir=local_dir, token=False)
+    return files
+
+
+def mount_surface(model, name: str = "qwen3", *, local_dir: str | None = None, repo: str = SURFACE_REPO, device=None,
+                  compile_chain: bool = False, recompute: bool = False, require_step: int | None = STEP, files: dict | None = None):
+    """Mount a published surface arm by name: its group (if any) then the member, by the training route (mount_anchors). Returns
+    the arm program; prog.surface carries the registry row. The arm serves the tokenizer's spelling: read text through it with
+    train.surface.read_spelled(model, tok, texts); mask it with masked(prog, [row['member']]) for the plain reading."""
+    row = SURFACE_ARMS[name]
+    files = files or surface_files(name, local_dir, repo)
+    order = ([m for m in (GROUPS[row["base"][0]][1] if row["base"] and row["base"][0] in GROUPS else STAGE_ARMS)] if row["base"] else []) + [row["member"]]
+    phases = dict(PHASES)
+    phases[row["member"]] = f"surface:{row['convention']}"
+    prog = mount_anchors(model, {m: files[m] for m in order}, device=device, compile_chain=compile_chain, recompute=recompute,
+                         require_step=require_step, phases=phases)
+    prog.surface = dict(row, name=name)
+    return prog

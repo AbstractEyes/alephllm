@@ -31,6 +31,7 @@ paired_alignment() is the read's own gauge (whitened Procrustes alignment on hel
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from itertools import accumulate
 
@@ -321,3 +322,54 @@ def stats_from_tensor(t: dict, device=None) -> dict:
 
 def doc_count(xs) -> int:
     return int(np.sum(np.asarray(xs) == DOC))
+
+
+# ------------------------------------------------------------------------------------------------------ the reader
+@torch.no_grad()
+def read_spelled(model, tok, texts, blocks, *, surface: str = "B", device=None, batch: int = 64, amp: bool = True,
+                 ln_states: bool = True, ctx: int | None = None):
+    """Read texts through the model on one surface and return the states at every token's closing byte.
+    surface 'B' = the tokenizer's spelling (what a surface arm serves), 'A' = the texts' own bytes; both use the same sites, so
+    the two readings of one text line up token by token. Returns {'states': {block: (n_sites, d) fp32, LayerNorm'd without affine
+    unless ln_states=False}, 'sites': (n_sites, 3) long = (text index, token position, token id), 'spelled': [Spelled]}.
+    The sites of a text are every token but its first and last (the read's convention: the closing byte is the byte after the
+    token's expansion, where the state has read the whole token; a phrase's full stop is the closing byte of the token before it).
+    Texts the tokenizer cannot spell exactly are skipped (their index absent from 'sites'). One document a row, right-padded;
+    a causal model's states at a document's own positions do not see the pad."""
+    device = device or next(model.parameters()).device
+    ctx = int(ctx or model.cfg.context)
+    sp, keep = [], []
+    for i, t in enumerate(texts):
+        try:
+            s = spell(tok, t)
+        except ValueError:
+            continue
+        if len(s.raw) + 1 > ctx or len(s.spelled) + 1 > ctx or len(s.ids) < 3:
+            continue
+        sp.append(s)
+        keep.append(i)
+    xa, xb, S, ids = single_rows(sp, ctx)
+    x = xb if surface == "B" else xa
+    where = S[:, [0, 2 if surface == "B" else 1]]
+    blocks = sorted(int(b) for b in blocks)
+    d = model.nf.weight.numel()
+    out = {b: torch.empty(len(S), d, dtype=torch.float32) for b in blocks}
+    was_training = model.training
+    model.eval()
+    for r0 in range(0, x.shape[0], batch):
+        r1 = min(r0 + batch, x.shape[0])
+        m = (where[:, 0] >= r0) & (where[:, 0] < r1)
+        w = where[m].clone()
+        w[:, 0] -= r0
+        ac = torch.autocast(device.type if hasattr(device, "type") else str(device).split(":")[0], dtype=torch.bfloat16) if amp else contextlib.nullcontext()
+        with ac:
+            st, _ = block_states(model, x[r0:r1].to(device), blocks, where=w.to(device))
+        for b in blocks:
+            v = st[b].float()
+            out[b][m] = (ln(v) if ln_states else v).cpu()
+    if was_training:
+        model.train()
+    # (text index, token position, token id) per site, in the order single_rows laid the sites out (text by text, token by token)
+    table = [(keep[i], t, s.ids[t]) for i, s in enumerate(sp) for t, _, _ in sites(s)]
+    assert len(table) == len(S)
+    return {"states": out, "sites": torch.tensor(table, dtype=torch.long).reshape(-1, 3), "spelled": sp}
