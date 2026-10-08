@@ -206,3 +206,14 @@ canon/covariant_codebook_prior_art.md, plan 2026-08-26_mini_beatrix_v2_shape.md.
 - **Binding rider**: the additive hub write saturates at high demand
   (R=64: .84 vs .99) — the delta-on-S-and-z write is the queued repair; no
   "guaranteed" claim covers retrieval until its screen passes.
+
+## Surface arms (feat/qwen-surface-arm, 2026-10-08) - reading a tokenizer's spelling as the plain bytes
+
+A surface arm is a detachable adapter (13.7M parameters, one module after each block) trained so that the model reads a
+tokenizer's spelling (its vocabulary strings in order, e.g. Qwen3's 'Ġtaco' for ' taco') the way it reads the plain bytes:
+per token, at the closing byte, the armed reading of the spelling is pulled toward the model's own plain-byte reading
+(standardized LayerNorm'd block outputs, per-site MSE over the served blocks), under quiet terms on the plain rows and on
+web and partner text. Conventions: gpt2 (exact), sentencepiece, wordpiece, clip (through the tokenizer's offset mapping);
+an every-byte site set beside the token closings. Code: `train/surface.py` (spell, sites, PairedRows, the losses,
+read_spelled, the alignment gauge), `arm_mount.py` (SURFACE_ARMS, mount_surface, reader_kwargs). The full page:
+[docs/surface_arms.md](docs/surface_arms.md). The arms, their readouts and results: AbstractPhil/beatrix-tokenizers.
