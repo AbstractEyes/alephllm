@@ -148,6 +148,7 @@ captions of each of two draws; the readouts and results files on `AbstractPhil/b
 | seed B (mse_gXB_o1) | .909 at block 31 / .953-.964 at blocks 8-28 | .994-.997 at most blocks, .981 at 31 | +.0003, +.0003 |
 | MSE + InfoNCE form (mse_nce_gXA_o0) | .884 at block 31; behind the MSE form at every block | .977 at 31 | +.0002 |
 | the shuffled-pairing control (mse_gXA_o0_shuf) | .201 at block 31; BELOW the untrained reading at every block (.484 at block 12 against .640 before) | .969 at 31 | +.0003 |
+| the solo (mse_solo_o0; the arm alone on the bare trunk, no stage arms underneath) | 0.956 at block 31 / 0.953-0.977 at blocks 8-28; leads the seed-A arm over the eight at 28 of 32 blocks | lowest 0.9880 (at 31) | +0.0003 |
 
 The gap bar (.85 at every served block) is met on both seeds and both draws; the bits bar (+.012) by a wide margin; the strict
 silence bar (.995 at every block) is missed at the last block on both seeds (.98) and, on seed B, by one to two thousandths at a
@@ -155,4 +156,4 @@ few middle blocks. The control trained against the wrong pairings makes the mode
 so the closure is not an artifact of the alignment map. An independent read on the mounted seed-A arm found that the spelling
 read through the arm reaches the tokenizer's own model's final states as far as the plain bytes do (.546 against .562 at block
 24 before any arm) and carries the same mood axis at blocks 12-20. The MSE form is the one carried forward; the InfoNCE term
-bought nothing on this bed. The family (T5, CLIP and BERT spellings; an every-byte Qwen arm) trains on the same recipe.
+bought nothing on this bed. The arm trained alone on the bare trunk reads as well as the arm over the eight (lowest served 0.956 against 0.892; silence 0.9880 against 0.9822) at two-thirds of the time a step and mounts with nothing underneath, so the family (T5, CLIP and BERT spellings; an every-byte Qwen arm) trains alone on the trunk on the same recipe; the T5 seed-A arm over the eight is that convention's placement datum.

@@ -264,22 +264,27 @@ SURFACE_ARMS = {
     "qwen3-untrained": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s10_qwen", "base": None,
                         "file": "surface/qwen3/mse_untrained_o0/s10_qwen.safetensors", "seed": "A", "control": "untrained copy (seed 0)",
                         "trunk": "untrained copy (seed 0)"},   # its anchor names step 0: the mount skips the step check for this row
-    # the family (the same recipe over the frozen eight; the lossy conventions read A as the text as written; sites = the token
-    # closings unless noted). Populated as the arms land.
-    "qwen3-bytes": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s14_qwen_bytes", "base": ("gXA", 8),
-                    "file": "surface/qwen3/mse_gXA_o0_bytes/s14_qwen_bytes.safetensors", "seed": "A", "sites": "bytes"},
+    # the family (the same recipe; the lossy conventions read A as the text as written; sites = the token closings unless noted).
+    # Placement: the solo read settled it (the Qwen arm alone on the bare trunk reads at least as well as the arm over the eight on
+    # both bars, at two-thirds of the time a step, with nothing to mount underneath), so the family trains ALONE on the trunk
+    # (base None) except the T5 seed-A arm, which had started over the eight before the read and stays as that convention's
+    # placement datum. Populated as the arms land.
+    "qwen3-bytes": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s14_qwen_bytes", "base": None,
+                    "file": "surface/qwen3/mse_solo_o0_bytes/s14_qwen_bytes.safetensors", "seed": "A", "sites": "bytes"},
     "t5": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": ("gXA", 8),
            "file": "surface/t5/mse_gXA_o0/s11_t5.safetensors", "seed": "A"},
-    "t5-B": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": ("gXB", 8),
-             "file": "surface/t5/mse_gXB_o1/s11_t5.safetensors", "seed": "B"},
-    "clip": {"convention": "clip", "tokenizer": "openai/clip-vit-large-patch14", "member": "s12_clip", "base": ("gXA", 8),
-             "file": "surface/clip/mse_gXA_o0/s12_clip.safetensors", "seed": "A"},
-    "clip-B": {"convention": "clip", "tokenizer": "openai/clip-vit-large-patch14", "member": "s12_clip", "base": ("gXB", 8),
-               "file": "surface/clip/mse_gXB_o1/s12_clip.safetensors", "seed": "B"},
-    "bert": {"convention": "wordpiece", "tokenizer": "bert-base-uncased", "member": "s13_bert", "base": ("gXA", 8),
-             "file": "surface/bert/mse_gXA_o0/s13_bert.safetensors", "seed": "A"},
-    "bert-B": {"convention": "wordpiece", "tokenizer": "bert-base-uncased", "member": "s13_bert", "base": ("gXB", 8),
-               "file": "surface/bert/mse_gXB_o1/s13_bert.safetensors", "seed": "B"},
+    "t5-solo": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": None,
+                "file": "surface/t5/mse_solo_o0/s11_t5.safetensors", "seed": "A"},
+    "t5-B": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": None,
+             "file": "surface/t5/mse_solo_o1/s11_t5.safetensors", "seed": "B"},
+    "clip": {"convention": "clip", "tokenizer": "openai/clip-vit-large-patch14", "member": "s12_clip", "base": None,
+             "file": "surface/clip/mse_solo_o0/s12_clip.safetensors", "seed": "A"},
+    "clip-B": {"convention": "clip", "tokenizer": "openai/clip-vit-large-patch14", "member": "s12_clip", "base": None,
+               "file": "surface/clip/mse_solo_o1/s12_clip.safetensors", "seed": "B"},
+    "bert": {"convention": "wordpiece", "tokenizer": "bert-base-uncased", "member": "s13_bert", "base": None,
+             "file": "surface/bert/mse_solo_o0/s13_bert.safetensors", "seed": "A"},
+    "bert-B": {"convention": "wordpiece", "tokenizer": "bert-base-uncased", "member": "s13_bert", "base": None,
+               "file": "surface/bert/mse_solo_o1/s13_bert.safetensors", "seed": "B"},
 }
 
 
