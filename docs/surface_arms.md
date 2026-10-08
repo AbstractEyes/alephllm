@@ -139,5 +139,20 @@ model can be compared site by site.
 
 ## Results
 
-Filled from the readouts on `AbstractPhil/beatrix-tokenizers` as the runs land (the Qwen arm's seed A: the gap bar met at
-every block; the family after its gate).
+The Qwen arm (convention `gpt2`, `Qwen/Qwen3-0.6B`), two seeds over the frozen eight, 4,000 steps each, read on 512 held-out
+captions of each of two draws; the readouts and results files on `AbstractPhil/beatrix-tokenizers` carry every block.
+
+| run | the gap (armed spelling vs plain bytes), lowest served block / the plateau | silence on plain bytes | bits per byte |
+|---|---|---|---|
+| seed A (mse_gXA_o0) | .895 at block 31 / .962-.971 at blocks 16-27 (before training .32 / .45-.53) | .995-.998 at most blocks, .984 at 31 | +.0003 web, +.0005 worst partner |
+| seed B (mse_gXB_o1) | .909 at block 31 / .953-.964 at blocks 8-28 | .994-.997 at most blocks, .981 at 31 | +.0003, +.0003 |
+| MSE + InfoNCE form (mse_nce_gXA_o0) | .884 at block 31; behind the MSE form at every block | .977 at 31 | +.0002 |
+| the shuffled-pairing control (mse_gXA_o0_shuf) | .201 at block 31; BELOW the untrained reading at every block (.484 at block 12 against .640 before) | .969 at 31 | +.0003 |
+
+The gap bar (.85 at every served block) is met on both seeds and both draws; the bits bar (+.012) by a wide margin; the strict
+silence bar (.995 at every block) is missed at the last block on both seeds (.98) and, on seed B, by one to two thousandths at a
+few middle blocks. The control trained against the wrong pairings makes the model read the spelling worse than with no arm,
+so the closure is not an artifact of the alignment map. An independent read on the mounted seed-A arm found that the spelling
+read through the arm reaches the tokenizer's own model's final states as far as the plain bytes do (.546 against .562 at block
+24 before any arm) and carries the same mood axis at blocks 12-20. The MSE form is the one carried forward; the InfoNCE term
+bought nothing on this bed. The family (T5, CLIP and BERT spellings; an every-byte Qwen arm) trains on the same recipe.
