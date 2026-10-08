@@ -150,6 +150,7 @@ captions of each of two draws; the readouts and results files on `AbstractPhil/b
 | the shuffled-pairing control (mse_gXA_o0_shuf) | .201 at block 31; BELOW the untrained reading at every block (.484 at block 12 against .640 before) | .969 at 31 | +.0003 |
 | the solo (mse_solo_o0; the arm alone on the bare trunk, no stage arms underneath) | 0.956 at block 31 / 0.953-0.977 at blocks 8-28; leads the seed-A arm over the eight at 28 of 32 blocks | lowest 0.9880 (at 31) | +0.0003 |
 | t5 seed A (t5/mse_gXA_o0; T5's sentence-piece spelling, over the frozen eight) | 0.857 at block 31 / 0.932-0.958 at blocks 8-28 (before training 0.32 / 0.64-0.73) | lowest 0.9756 (block 31) | +0.0005 |
+| the dose arm (qwen3/mse_gXA_o0_lamA8; lambda 8 on the plain rows, over the frozen eight) | 0.881 at block 31 / 0.949-0.966 at blocks 8-28 (the lambda-2 arm over the eight: 0.892 / mean served 0.958 against 0.954) | lowest 0.9899 (block 31; the lambda-2 arm 0.9822); leads it at 30 of 32 blocks | -0.0000 |
 
 The gap bar (.85 at every served block) is met on both seeds and both draws; the bits bar (+.012) by a wide margin; the strict
 silence bar (.995 at every block) is missed at the last block on both seeds (.98) and, on seed B, by one to two thousandths at a
