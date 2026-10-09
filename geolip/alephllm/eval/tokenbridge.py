@@ -15,20 +15,21 @@ surprisal segmentation both close a unit. Per-tokenizer compatibility:
   expansion    bytes/token vs her bytes/unit at the same text
 
 Vocab tables come from the extraction fleet:
-E:\\mirel\\data\\tokenbridge\\vocab_<name>.jsonl
+$ALEPHLLM_TOKENBRIDGE_DIR/vocab_<name>.jsonl (default: ./data/tokenbridge)
 {"id", "hex", "text", "n_bytes", "is_special", "continuation"}.
 Specials are OUT-OF-ALPHABET: never byte-expanded into text scoring.
 """
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import torch
 
 from .lexicon import capture, surprisal_boundaries, theta_matching_rate
 
-BRIDGE_DIR = Path(r"E:\mirel\data\tokenbridge")
+BRIDGE_DIR = Path(os.environ.get("ALEPHLLM_TOKENBRIDGE_DIR", "data/tokenbridge"))
 
 
 def load_table(name: str) -> dict:
