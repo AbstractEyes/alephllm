@@ -1044,9 +1044,10 @@ def rollback_to(run, step: int, first_stage: str, repo: str | None = None):
             ph["status"] = "planned"
             ph["tokens_done"] = 0
     run.stream = None                          # force a fresh stream open
+    restore = ("exact resume archive" if exact
+               else "weights only — FRESH OPTIMIZER (law exception)")
     man.note(f"ROLLBACK to step {step:,}; re-planning from {first_stage} "
-             f"({'exact resume archive' if exact else 'weights only — '
-                 'FRESH OPTIMIZER (law exception)'})")
+             f"({restore})")
     print(f"[rollback] step {step:,} · {man.tokens_seen/1e9:.3f}B · "
           f"re-planning from {first_stage} · "
           f"{'EXACT (optimizer+stream restored)' if exact else 'FRESH OPTIMIZER — flag any arm trained after this'}",
