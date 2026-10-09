@@ -10,7 +10,8 @@ Cases:
   6 the registered arms: the four presets and their switches, the craft and recipe verbatim otherwise, chronological phases,
     a 14,000 build, no cross-mutation of the twin
   7 the weights-only start on a tiny craft (CPU, tokenless): the cursor, the weights, the installed gains, the restarted
-    phase's seed, fresh optimizers, two steps, the final checkpoint, the hand-off to the normal resume, one more step
+    phase's seed, fresh optimizers, two steps, the final checkpoint, the hand-off to the normal resume, one more step, a
+    kernel change on a later resume recorded in the manifest
   8 attn_fp32 on a card (skipped without one): the fp32-attention output under autocast is fp32 and sits closer to the
     plain fp32 pass than the bf16 pass does
   9 attn_kernel: the default is sdpa, an unknown kernel is refused, the config's kernel reaches every block and survives the
@@ -271,6 +272,12 @@ def case_7():
           and len(t2.optimizers[1].state) > 0)
     t2.train(max_steps=1)
     check("7 the resumed run steps on", t2.step == 19 and t2.manifest.tokens_seen == 19 * tps)
+    cfg.attn_kernel = "flex"            # a kernel change on a resume: recorded, never refused (0.10.11)
+    t3 = Trainer(p, hf_token=None, out_dir=tmp, device="cpu")
+    check("7 a kernel change on resume is recorded (model config + note)",
+          t3.manifest.model_config.get("attn_kernel") == "flex" and t3.step == 19
+          and any("attention kernel AMENDED on resume at step 19" in n["msg"] for n in t3.manifest.notes))
+    cfg.attn_kernel = "sdpa"
 
 
 def case_8():

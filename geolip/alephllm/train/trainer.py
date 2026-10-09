@@ -211,7 +211,25 @@ class Trainer:
             return False
         self._payload = payload           # kept for the multi-card sync
         self._apply_payload(payload, man)
+        self._check_attn_kernel()
         return True
+
+    def _check_attn_kernel(self):
+        """The attention kernel (0.10.11) is a kernel choice, not a recipe
+        term: a run resumed under a different kernel than its record
+        continues, and the record says when it changed (the steps before
+        that session ran the former; the kernels' measured deviation is in
+        docs/control_resume.md)."""
+        mc = self.manifest.model_config
+        if mc is None:
+            mc = self.manifest.model_config = {}
+        rec, live = mc.get("attn_kernel", "sdpa"), getattr(self.cfg, "attn_kernel", "sdpa")
+        if rec == live:
+            return
+        mc["attn_kernel"] = live
+        self.manifest.note(f"attention kernel AMENDED on resume at step {self.step:,}: {rec!r} -> {live!r} "
+                           "(the steps before this session ran the former)")
+        print(f"[attn] kernel amended on resume at step {self.step:,}: {rec!r} -> {live!r}", flush=True)
 
     def _apply_payload(self, payload: dict, man=None):
         """Take a resume payload's state: weights, optimizer states, step,

@@ -118,7 +118,8 @@ two settings never share one. The first call prints the kernel's deviation from 
 (`[attn] flex kernel (... products) vs sdpa on the first batch: max rel deviation ...`). When the kernel cannot be built on a
 stack (no Triton, a compile error) the module prints one line and every block falls back to fp32 sdpa for the rest of the
 process: the run continues at the old pace with the old numbers. Eval, the census and decode never use it, so held-out
-losses are computed by the same kernel in every arm.
+losses are computed by the same kernel in every arm. A run resumed under a different kernel than its record continues; the
+manifest gets the updated model config and a note naming the step (the steps before that session ran the former).
 
 Measured on a 4090 (torch 2.11; one row of ctx 4096, 16 heads, head 64; forward + backward through `CausalSDPA` with
 `attn_fp32=True`, the same weights, against fp32 sdpa):
