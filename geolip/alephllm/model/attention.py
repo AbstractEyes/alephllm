@@ -129,16 +129,20 @@ class CausalSDPA(nn.Module):
         typical logit 1.3-4.5x on the twin (the loss 0.77 -> 2.11 on one
         batch). Returns the provenance: the gains' means, the mean
         |logit| (with the 1/sqrt(head_dim) scale) before and after on a
-        64-position block, and the median over that block's entries of
-        |logit after| / |logit before| (the typical entry's ratio)."""
+        block of 64 positions spread over the sequence, and the median over
+        that block's entries of |logit after| / |logit before| (the typical
+        entry's ratio)."""
         assert self.qk_norm, "install_gains needs qk_norm"
         n = x.shape[1]
         q, k, _ = self._split(x.float(), n)
         hd = q.shape[-1]
         m = min(64, n)
+        # the gauge's positions spread over the sequence: the sequence start
+        # alone is not typical (the sinks and the early-context regime live there)
+        idx = torch.linspace(0, n - 1, m, device=q.device).round().long()
 
         def logits(a, b):
-            return (a[..., :m, :] @ b[..., :m, :].transpose(-1, -2)) / math.sqrt(hd)
+            return (a[..., idx, :] @ b[..., idx, :].transpose(-1, -2)) / math.sqrt(hd)
 
         L0 = logits(q, k)
 

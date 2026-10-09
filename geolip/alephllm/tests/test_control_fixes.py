@@ -189,9 +189,21 @@ def case_6():
                 "tokenizer", "vocab_size")) and fx.model.hub_layers == ()
     check("6 the twin's craft otherwise verbatim (hub layers empty)", same)
     recipe = all(getattr(fx.train, k) == getattr(base.train, k) for k in
-                 ("muon_lr", "adam_lr", "muon_momentum", "warmup_steps", "grad_clip", "micro_batch", "grad_accum",
+                 ("muon_lr", "adam_lr", "muon_momentum", "warmup_steps", "grad_clip",
                   "seed", "head_addr_frozen", "governor", "governor_theta", "ckpt_every", "phase_seed_offset"))
     check("6 the twin's recipe verbatim (born-null head unfrozen)", recipe and fx.train.head_addr_frozen is False)
+    steps = {n: PRESETS[n].train.micro_batch * PRESETS[n].train.grad_accum * PRESETS[n].model.context for n in CONTROL_RESUME_ARMS}
+    mbs = {n: (PRESETS[n].train.micro_batch, PRESETS[n].train.grad_accum) for n in CONTROL_RESUME_ARMS}
+    check("6 every arm trains the recipe's 262,144-token step at its own micro-batch",
+          all(v == 262_144 for v in steps.values()) and mbs["mini-beatrix-2s-control-bf16"] == (16, 4)
+          and mbs["mini-beatrix-2s-control-attn"] == (8, 8) and mbs["mini-beatrix-2s-control-fix"] == (8, 8)
+          and mbs["mini-beatrix-2s-control-fp32"] == (4, 16) and mbs["mini-beatrix-2s-control-fp32-fix"] == (4, 16), f"{mbs}")
+    bad = False
+    try:
+        make_control_resume_preset("x-bad-step", micro_batch=8)      # 8 x 4 x 4096 != 262,144
+    except AssertionError:
+        bad = True
+    check("6 a micro-batch that breaks the step is refused", bad)
     names = [ph["name"] for ph in fx.curriculum]
     check("6 chronological phases, all planned",
           names[:2] == ["warmup_wikitext", "fineweb_main"] and names[2] == "curriculum_s0" and names[10] == "curriculum_s8"

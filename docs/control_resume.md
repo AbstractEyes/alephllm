@@ -29,16 +29,27 @@ empty, the born-null head unfrozen, Muon 2e-2 / Adam 3e-4, clip 1.0, micro-batch
 step) under a new name and a chronological phase list (warmup, fineweb_main, S0-S8, anneal_nochat, anneal_mix), starting from
 `mini-beatrix-2s-control/checkpoints/step_00016000.safetensors`:
 
-| preset | precision | attn_fp32 | qk_norm | role |
-|---|---|---|---|---|
-| `mini-beatrix-2s-control-bf16` | bf16 | off | off | the control: the restart alone must be able to fail as the first run did |
-| `mini-beatrix-2s-control-fp32` | fp32 | (everything fp32) | off | precision as the single variable |
-| `mini-beatrix-2s-control-attn` | bf16 | on | off | fp32 attention alone: no insertion cost, the first run's precision elsewhere |
-| `mini-beatrix-2s-control-fix` | bf16 | on | rms | the guards under the first run's precision elsewhere |
-| `mini-beatrix-2s-control-fp32-fix` | fp32 | (everything fp32) | rms | both |
+| preset | precision | attn_fp32 | qk_norm | micro-batch × accumulation | role |
+|---|---|---|---|---|---|
+| `mini-beatrix-2s-control-bf16` | bf16 | off | off | 16 × 4 | the control: the restart alone must be able to fail as the first run did |
+| `mini-beatrix-2s-control-fp32` | fp32 | (everything fp32) | off | 4 × 16 | precision as the single variable |
+| `mini-beatrix-2s-control-attn` | bf16 | on | off | 8 × 8 | fp32 attention alone: no insertion cost, the first run's precision elsewhere |
+| `mini-beatrix-2s-control-fix` | bf16 | on | rms | 8 × 8 | the guards under the first run's precision elsewhere |
+| `mini-beatrix-2s-control-fp32-fix` | fp32 | (everything fp32) | rms | 4 × 16 | both |
 
-`make_control_resume_preset(name, start_step, precision, qk_norm, attn_fp32, source, seed_offset)` builds any other
-combination (for instance a start from `step_00014000`, the other intact checkpoint).
+Every arm trains the recipe's 262,144-token step; the factory refuses a micro-batch that breaks it. The fp32 forms hold more
+activation memory at the same tokens (the fp32 attention tensors, or everything under full fp32), so they run smaller
+micro-batches: the 95 GB card ran out of memory at 16 × 4 with fp32 attention (2026-10-09). The micro-batch changes only the
+accumulation order, not the step.
+
+`make_control_resume_preset(name, start_step, precision, qk_norm, attn_fp32, source, seed_offset, micro_batch, grad_accum)`
+builds any other combination (for instance a start from `step_00014000`, the other intact checkpoint).
+
+Measured on the twin at step 16,000, one real fineweb batch, the same weights: bf16 costs +0.0018 in loss over fp32 and fp32
+attention under bf16 recovers about 60% of that; the QK-norm insertion costs +0.91 (the 95 GB card) and +0.95 (a 4090) even
+with the exact scalar install, because the trained model relies on its sink positions and the norm removes their scale. The
+QK-norm arms therefore start from a perturbed function whose recovery confounds their early gradient norms; the arms without
+QK-norm start from the checkpoint's exact function.
 
 ## The weights-only start
 

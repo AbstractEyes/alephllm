@@ -372,7 +372,8 @@ PRESETS["mini-beatrix-2s-control"].train.head_addr_frozen = False
 def make_control_resume_preset(name: str, start_step: int = 16000, precision: str = "bf16",
                                qk_norm: str = "", attn_fp32: bool = False,
                                source: str = "mini-beatrix-2s-control",
-                               seed_offset: int = 7919) -> Preset:
+                               seed_offset: int = 7919, micro_batch: int | None = None,
+                               grad_accum: int | None = None) -> Preset:
     """The 2s softmax twin CONTINUED from its last clean weights: the twin's
     craft and recipe verbatim under a NEW name (its own hub prefix — the
     original run's record stays untouched); a weights-only start from
@@ -387,18 +388,27 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
       attn_fp32          the attention blocks in fp32, bf16 elsewhere
       qk_norm 'rms'      QK-norm; its gains installed at the start from the
                          trained q/k scales (a boundary write, logged)
+    micro_batch x grad_accum stays the recipe's 262,144-token step; the fp32
+    forms carry more activation memory at the same tokens (the fp32 attention
+    tensors; everything under full fp32), so the arms run 16 x 4 (bf16), 8 x 8
+    (fp32 attention) and 4 x 16 (full fp32) — the 95 GB card ran out of memory
+    at 16 x 4 with fp32 attention (2026-10-09).
     The registered arms (CONTROL_RESUME_ARMS):
-      mini-beatrix-2s-control-bf16       the restart alone (the control)
-      mini-beatrix-2s-control-fp32       arm A: full fp32
-      mini-beatrix-2s-control-attn       fp32 attention alone, bf16 elsewhere (no insertion cost)
-      mini-beatrix-2s-control-fix        fp32 attention + QK-norm, bf16 elsewhere
-      mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm"""
+      mini-beatrix-2s-control-bf16       the restart alone (the control)        16 x 4
+      mini-beatrix-2s-control-fp32       arm A: full fp32                        4 x 16
+      mini-beatrix-2s-control-attn       fp32 attention alone, bf16 elsewhere    8 x 8
+      mini-beatrix-2s-control-fix        fp32 attention + QK-norm, bf16 elsewhere 8 x 8
+      mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm                     4 x 16"""
     from .data.curriculum import curriculum_phases
     base = PRESETS[source]
     m = AlephLMConfig.from_dict(base.model.to_dict())
     m.name, m.qk_norm, m.attn_fp32 = name, qk_norm, bool(attn_fp32)
     t = _copy_train(base.train)
     t.precision = precision
+    if micro_batch is not None:
+        t.micro_batch = int(micro_batch)
+    if grad_accum is not None:
+        t.grad_accum = int(grad_accum)
     phases = [
         dict(name="warmup_wikitext", dataset="wikitext-103",
              planned_tokens=300_000_000, status="planned"),
@@ -412,6 +422,9 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
     ]
     # the cursor is set at the RECIPE's step (262,144 tokens), whatever micro-batch a card runs
     tps = base.train.micro_batch * base.train.grad_accum * base.model.context
+    assert t.micro_batch * t.grad_accum * m.context == tps, (
+        f"micro_batch x grad_accum x context must stay the recipe's {tps:,}-token step "
+        f"(got {t.micro_batch} x {t.grad_accum} x {m.context})")
     return Preset(model=m, train=t, curriculum=phases,
                   init_from={"repo": base.hf_repo, "prefix": source,
                              "path": f"checkpoints/step_{int(start_step):08d}.safetensors",
@@ -421,10 +434,10 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
 
 CONTROL_RESUME_ARMS = {
     "mini-beatrix-2s-control-bf16": dict(precision="bf16"),
-    "mini-beatrix-2s-control-fp32": dict(precision="fp32"),
-    "mini-beatrix-2s-control-attn": dict(precision="bf16", attn_fp32=True),
-    "mini-beatrix-2s-control-fix": dict(precision="bf16", qk_norm="rms", attn_fp32=True),
-    "mini-beatrix-2s-control-fp32-fix": dict(precision="fp32", qk_norm="rms"),
+    "mini-beatrix-2s-control-fp32": dict(precision="fp32", micro_batch=4, grad_accum=16),
+    "mini-beatrix-2s-control-attn": dict(precision="bf16", attn_fp32=True, micro_batch=8, grad_accum=8),
+    "mini-beatrix-2s-control-fix": dict(precision="bf16", qk_norm="rms", attn_fp32=True, micro_batch=8, grad_accum=8),
+    "mini-beatrix-2s-control-fp32-fix": dict(precision="fp32", qk_norm="rms", micro_batch=4, grad_accum=16),
 }
 try:
     for _n, _kw in CONTROL_RESUME_ARMS.items():
