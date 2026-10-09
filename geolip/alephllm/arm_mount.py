@@ -271,6 +271,10 @@ SURFACE_ARMS = {
     # placement datum. Populated as the arms land.
     "qwen3-bytes": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s14_qwen_bytes", "base": None,
                     "file": "surface/qwen3/mse_solo_o0_bytes/s14_qwen_bytes.safetensors", "seed": "A", "sites": "bytes"},
+    # the every-byte form's second seed (2026-10-09): the first arm of the family to meet every bar including the whitened
+    # silence clause at every block (lowest .9955; seed A .9947 at block 1 only)
+    "qwen3-bytes-B": {"convention": "gpt2", "tokenizer": "Qwen/Qwen3-0.6B", "member": "s14_qwen_bytes", "base": None,
+                      "file": "surface/qwen3/mse_solo_o1_bytes/s14_qwen_bytes.safetensors", "seed": "B", "sites": "bytes"},
     "t5": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": ("gXA", 8),
            "file": "surface/t5/mse_gXA_o0/s11_t5.safetensors", "seed": "A"},
     "t5-solo": {"convention": "sentencepiece", "tokenizer": "google/t5-v1_1-xxl", "member": "s11_t5", "base": None,
