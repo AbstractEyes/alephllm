@@ -149,6 +149,7 @@ captions of each of two draws; the readouts and results files on `AbstractPhil/b
 | MSE + InfoNCE form (mse_nce_gXA_o0) | .884 at block 31; behind the MSE form at every block | .977 at 31 | +.0002 |
 | the shuffled-pairing control (mse_gXA_o0_shuf) | .201 at block 31; BELOW the untrained reading at every block (.484 at block 12 against .640 before) | .969 at 31 | +.0003 |
 | the solo (mse_solo_o0; the arm alone on the bare trunk, no stage arms underneath) | 0.956 at block 31 / 0.953-0.977 at blocks 8-28; leads the seed-A arm over the eight at 28 of 32 blocks | lowest 0.9880 (at 31) | +0.0003 |
+| t5 seed A (t5/mse_solo_o0; T5's sentence-piece spelling, alone on the trunk) | 0.940 at block 31 / 0.932-0.964 at blocks 8-28 (before training 0.36 / 0.65-0.74) | lowest 0.9889 (block 31) | +0.0001 |
 | clip seed B (clip/mse_solo_o1; CLIP's spelling (the byte map with word-end marks, lower case), alone on the trunk) | 0.785 at block 12 / 0.681-0.912 at blocks 8-28 (before training 0.29 / 0.43-0.48) | lowest 0.9772 (block 31) | +0.0004 |
 | t5 seed B (t5/mse_solo_o1; T5's sentence-piece spelling, alone on the trunk) | 0.941 at block 31 / 0.934-0.965 at blocks 8-28 (before training 0.36 / 0.65-0.74) | lowest 0.9917 (block 31) | +0.0001 |
 | qwen3 seed A (qwen3/mse_solo_o0_bytes; Qwen3's spelling read at EVERY byte (the segmentation-free variant), alone on the trunk) | 0.963 at block 12 / 0.948-0.988 at blocks 8-28 (before training 0.50 / 0.69-0.77) | lowest 0.9947 (block 1) | +0.0001 |
