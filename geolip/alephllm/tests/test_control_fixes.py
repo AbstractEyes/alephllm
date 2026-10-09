@@ -13,6 +13,10 @@ Cases:
     phase's seed, fresh optimizers, two steps, the final checkpoint, the hand-off to the normal resume, one more step
   8 attn_fp32 on a card (skipped without one): the fp32-attention output under autocast is fp32 and sits closer to the
     plain fp32 pass than the bf16 pass does
+  9 attn_kernel: the default is sdpa, an unknown kernel is refused, the config's kernel reaches every block and survives the
+    dict round trip, the two fp32-attention arms under bf16 carry "flex" and the others "sdpa", off a card the flex block
+    IS the sdpa block, a dead kernel falls back to sdpa; on a card (skipped without one, or when the kernel will not build):
+    the fused kernel's forward and gradients agree with fp32 sdpa and the eval path stays on sdpa bit for bit
 """
 from __future__ import annotations
 
@@ -287,8 +291,66 @@ def case_8():
     check("8 fp32 attention closer to the fp32 pass than bf16", d32 < d16, f"{d32:.2e} vs {d16:.2e}")
 
 
+def case_9():
+    from ..model import attention as A
+    torch.manual_seed(9)
+    a, b = CausalSDPA(64, 4), CausalSDPA(64, 4, attn_kernel="flex")
+    _same_weights(a, b)
+    a.train(); b.train()
+    x = torch.randn(2, 64, 64)
+    check("9 the default kernel is sdpa; flex accepted", a.attn_kernel == "sdpa" and b.attn_kernel == "flex")
+    refused = False
+    try:
+        CausalSDPA(64, 4, attn_kernel="flash")
+    except AssertionError:
+        refused = True
+    check("9 an unknown kernel is refused", refused)
+    check("9 off a card the flex block is the sdpa block (train mode)", torch.equal(a(x), b(x)))
+    cfg = AlephLMConfig.from_dict({**TINY.to_dict(), "name": "tiny-flex", "attn_kernel": "flex"})
+    kinds = {m.attn_kernel for m in AlephLM(cfg).modules() if isinstance(m, CausalSDPA)}
+    kinds0 = {m.attn_kernel for m in AlephLM(TINY).modules() if isinstance(m, CausalSDPA)}
+    check("9 the config's kernel reaches every sdpa block; the default builds sdpa", kinds == {"flex"} and kinds0 == {"sdpa"})
+    check("9 the kernel survives the dict round trip", AlephLMConfig.from_dict(cfg.to_dict()).attn_kernel == "flex")
+    arms = {k: make_control_resume_preset(k, **v).model.attn_kernel for k, v in CONTROL_RESUME_ARMS.items()}
+    want = {"mini-beatrix-2s-control-bf16": "sdpa", "mini-beatrix-2s-control-fp32": "sdpa",
+            "mini-beatrix-2s-control-attn": "flex", "mini-beatrix-2s-control-fix": "flex",
+            "mini-beatrix-2s-control-fp32-fix": "sdpa"}
+    check("9 the fp32-attention arms under bf16 carry flex, the others sdpa", arms == want, str(arms))
+    q = torch.randn(1, 4, 32, 16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    saved = A._FLEX["dead"]
+    A._FLEX["dead"] = "forced by case 9"
+    try:
+        y_dead = A._flex(q, k, v)
+    finally:
+        A._FLEX["dead"] = saved
+    check("9 a dead kernel falls back to sdpa", torch.equal(y_dead, torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)))
+    if not torch.cuda.is_available():
+        print("SKIP 9 the fused kernel on a card (no CUDA here)", flush=True)
+        return
+    ref, flx = CausalSDPA(64, 4, attn_fp32=True).cuda(), CausalSDPA(64, 4, attn_fp32=True, attn_kernel="flex").cuda()
+    _same_weights(ref, flx)
+    ref.train(); flx.train()
+    xr = torch.randn(2, 256, 64, device="cuda", requires_grad=True)
+    xf = xr.detach().clone().requires_grad_(True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        y1, y2 = ref(xr), flx(xf)
+    if A._FLEX["dead"]:
+        print(f"SKIP 9 the fused kernel on a card (it would not build: {A._FLEX['dead']})", flush=True)
+        return
+    y1.square().mean().backward(); y2.square().mean().backward()
+    dy = float((y1 - y2).abs().max() / y1.abs().max())
+    dg = float((ref.qkv.weight.grad - flx.qkv.weight.grad).abs().max() / ref.qkv.weight.grad.abs().max())
+    prec = "ieee" if torch.get_float32_matmul_precision() == "highest" else "tf32"
+    check(f"9 fused kernel forward within 1e-2 of fp32 sdpa ({prec} products in this process)", dy < 1e-2, f"{dy:.2e}")
+    check(f"9 fused kernel qkv gradient within 2e-2 of fp32 sdpa ({prec} products)", dg < 2e-2, f"{dg:.2e}")
+    ref.eval(); flx.eval()
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        check("9 the eval path stays on sdpa bit for bit", torch.equal(ref(xr), flx(xr)))
+
+
 def main():
-    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8):
+    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — a case's crash is a FAIL row, the rest still run

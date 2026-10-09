@@ -51,7 +51,8 @@ class Block(nn.Module):
         else:
             self.attn = CausalSDPA(d, cfg.n_heads,
                                    qk_norm=getattr(cfg, "qk_norm", ""),
-                                   attn_fp32=getattr(cfg, "attn_fp32", False))
+                                   attn_fp32=getattr(cfg, "attn_fp32", False),
+                                   attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
         self.bank = AnchoredBank(d, cfg.bank_experts, cfg.bank_ff, cfg.tau,
                                  cfg.gate_init)
 

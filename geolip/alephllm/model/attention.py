@@ -23,6 +23,52 @@ import torch.nn.functional as F
 from .address import AlephAddress, dtype_floor
 
 
+_FLEX = {"fn": {}, "masks": {}, "dead": None, "checked": False}
+
+
+def _flex(q, k, v):
+    """The fused Triton attention (torch.nn.attention.flex_attention),
+    compiled once per process and fp32-matmul precision, for fp32 inputs:
+    the q.k and p.v products run on TF32 tensor cores when TF32 is on (the
+    bf16-precision arms; the inputs keep 10 mantissa bits against bf16's
+    7) and in ieee fp32 when it is off; the softmax and the accumulation
+    are fp32 either way; no n x n matrix is materialized. The causal block
+    mask is cached per length. The fp32 sdpa path has no fused kernel
+    (flash is bf16/fp16 only), which cost 3x on an H100 (2026-10-09). The
+    first call prints the kernel's deviation from sdpa on that batch. When
+    the kernel cannot be built on a stack the module says so once and
+    falls back to sdpa."""
+    if _FLEX["dead"]:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    try:
+        from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+        prec = torch.get_float32_matmul_precision()  # "highest" = ieee products, else tf32
+        fn = _FLEX["fn"].get(prec)
+        if fn is None:
+            fn = _FLEX["fn"][prec] = torch.compile(flex_attention, dynamic=False)
+        n = int(q.shape[2])
+        key = (n, str(q.device))
+        bm = _FLEX["masks"].get(key)
+        if bm is None:
+            bm = create_block_mask(lambda b, h, i, j: i >= j, B=None, H=None,
+                                   Q_LEN=n, KV_LEN=n, device=q.device)
+            _FLEX["masks"][key] = bm
+        out = fn(q, k, v, block_mask=bm)
+        if not _FLEX["checked"]:
+            _FLEX["checked"] = True
+            with torch.no_grad():
+                ref = F.scaled_dot_product_attention(q.detach(), k.detach(), v.detach(), is_causal=True)
+                dev = float((out.detach() - ref).abs().max() / ref.abs().max().clamp_min(1e-12))
+            print(f"[attn] flex kernel ({'ieee' if prec == 'highest' else 'tf32'} products, "
+                  f"{q.dtype}) vs sdpa on the first batch: max rel deviation {dev:.2e}", flush=True)
+        return out
+    except Exception as e:  # noqa: BLE001 — a kernel that will not build must not end a run
+        _FLEX["dead"] = repr(e)
+        print(f"[attn] flex kernel unavailable on this stack ({e!r}); the attention "
+              "falls back to sdpa", flush=True)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
 def _rms_normalize(t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """RMS-normalize the last dim; the statistic in fp32, the dtype kept."""
     inv = torch.rsqrt(t.float().pow(2).mean(dim=-1, keepdim=True) + eps)
@@ -40,15 +86,20 @@ class CausalSDPA(nn.Module):
       attn_fp32      under autocast the whole block (projections, logits,
                      softmax, PV, output) runs with autocast disabled, in
                      fp32 (TF32 per the global flag); a no-op otherwise.
-    With both off this is the 2s form bit for bit (the same code path)."""
+      attn_kernel    "sdpa" (the default) or "flex": the training forward
+                     on a card runs the fused flex kernel (_flex); eval,
+                     census and decode keep sdpa.
+    With all three at their defaults this is the 2s form bit for bit (the
+    same code path)."""
 
     def __init__(self, d: int, heads: int = 8, qk_norm: str = "",
-                 attn_fp32: bool = False):
+                 attn_fp32: bool = False, attn_kernel: str = "sdpa"):
         super().__init__()
         assert d % heads == 0
         assert qk_norm in ("", "rms"), f"qk_norm: '' or 'rms', got {qk_norm!r}"
+        assert attn_kernel in ("sdpa", "flex"), f"attn_kernel: 'sdpa' or 'flex', got {attn_kernel!r}"
         self.h = heads
-        self.qk_norm, self.attn_fp32 = qk_norm, bool(attn_fp32)
+        self.qk_norm, self.attn_fp32, self.attn_kernel = qk_norm, bool(attn_fp32), attn_kernel
         self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.o = nn.Linear(d, d, bias=False)
         nn.init.orthogonal_(self.qkv.weight)
@@ -59,7 +110,8 @@ class CausalSDPA(nn.Module):
             self.k_gain = nn.Parameter(torch.ones(heads, 1, hd))
 
     def extra_repr(self) -> str:
-        return f"heads={self.h}, qk_norm={self.qk_norm!r}, attn_fp32={self.attn_fp32}"
+        return (f"heads={self.h}, qk_norm={self.qk_norm!r}, attn_fp32={self.attn_fp32}, "
+                f"attn_kernel={self.attn_kernel!r}")
 
     # ------------------------------------------------------------ pieces
     def _split(self, x, n):
@@ -81,7 +133,11 @@ class CausalSDPA(nn.Module):
         B, d = x.shape[0], x.shape[-1]
         q, k, v = self._split(x, n)
         q, k = self._guard(q, k)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if (self.attn_kernel == "flex" and self.training and torch.is_grad_enabled()
+                and q.is_cuda):
+            y = _flex(q, k, v)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).reshape(B, n, d))
 
     def forward(self, x):
