@@ -390,6 +390,7 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
     The registered arms (CONTROL_RESUME_ARMS):
       mini-beatrix-2s-control-bf16       the restart alone (the control)
       mini-beatrix-2s-control-fp32       arm A: full fp32
+      mini-beatrix-2s-control-attn       fp32 attention alone, bf16 elsewhere (no insertion cost)
       mini-beatrix-2s-control-fix        fp32 attention + QK-norm, bf16 elsewhere
       mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm"""
     from .data.curriculum import curriculum_phases
@@ -421,6 +422,7 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
 CONTROL_RESUME_ARMS = {
     "mini-beatrix-2s-control-bf16": dict(precision="bf16"),
     "mini-beatrix-2s-control-fp32": dict(precision="fp32"),
+    "mini-beatrix-2s-control-attn": dict(precision="bf16", attn_fp32=True),
     "mini-beatrix-2s-control-fix": dict(precision="bf16", qk_norm="rms", attn_fp32=True),
     "mini-beatrix-2s-control-fp32-fix": dict(precision="fp32", qk_norm="rms"),
 }

@@ -115,39 +115,49 @@ class CausalSDPA(nn.Module):
     @torch.no_grad()
     def install_gains(self, x) -> dict:
         """Set the QK-norm gains from the RAW q and k on this batch: per
-        head, the MEAN per-position RMS times the per-channel RMS of the
-        unit-RMS directions. q_normed * gain then carries the trained
-        channel pattern at the trained mean position scale, so the mean
-        attention logit keeps its scale in expectation and the norm removes
-        only the per-position scale. (An RMS-over-all-positions gain would
-        overshoot by the position scale's spread: +9% at a CV of .23 on
-        the test bed.) Returns the provenance: the gains' means and the mean
+        head ONE scalar, the TYPICAL (median over positions) per-position
+        RMS, broadcast over the channels. q_normed * gain is then the raw
+        q with its per-position scale replaced by the typical one, so every
+        ordinary attention logit is preserved exactly and the norm changes
+        only the outlier positions (a trained attention carries a few
+        positions, the sequence start above all, whose RMS is 10-50x the
+        rest; a MEAN scale would lift every ordinary logit by that much,
+        1.3-3.3x on the 2s twin). The gains stay per-channel parameters
+        for training; they are NOT installed per channel: a per-channel
+        pattern (the RMS of the unit directions) squares the heads'
+        shared-channel anisotropy inside the dot product and lifted the
+        typical logit 1.3-4.5x on the twin (the loss 0.77 -> 2.11 on one
+        batch). Returns the provenance: the gains' means, the mean
         |logit| (with the 1/sqrt(head_dim) scale) before and after on a
-        64-position block of the batch."""
+        64-position block, and the median over that block's entries of
+        |logit after| / |logit before| (the typical entry's ratio)."""
         assert self.qk_norm, "install_gains needs qk_norm"
         n = x.shape[1]
         q, k, _ = self._split(x.float(), n)
         hd = q.shape[-1]
         m = min(64, n)
 
-        def logit_scale(a, b):
-            return float((a[..., :m, :] @ b[..., :m, :].transpose(-1, -2)).abs().mean()
-                         / math.sqrt(hd))
+        def logits(a, b):
+            return (a[..., :m, :] @ b[..., :m, :].transpose(-1, -2)) / math.sqrt(hd)
 
-        before = logit_scale(q, k)
+        L0 = logits(q, k)
 
         def gains(t):
-            rho = t.pow(2).mean(dim=-1, keepdim=True).sqrt()      # the per-position RMS (B, h, n, 1)
-            u = t / rho.clamp_min(1e-6)                            # unit-RMS directions
-            # (h, 1) * (h, hd): the mean position scale times the channel pattern
-            return rho.mean(dim=(0, 2)) * u.pow(2).mean(dim=(0, 2)).sqrt()
+            rho = t.pow(2).mean(dim=-1).sqrt()                     # the per-position RMS (B, h, n)
+            # the TYPICAL position scale per head (the median over the batch's
+            # positions), one scalar broadcast over the channels: (h, hd)
+            med = rho.transpose(0, 1).reshape(rho.shape[1], -1).median(dim=-1).values
+            return med.unsqueeze(-1).expand(-1, hd).contiguous()
 
         gq, gk = gains(q), gains(k)                    # (h, hd) each
         self.q_gain.copy_(gq.unsqueeze(1))
         self.k_gain.copy_(gk.unsqueeze(1))
         q2, k2 = self._guard(q, k)
+        L1 = logits(q2, k2)
+        ratio = (L1.abs() / L0.abs().clamp_min(1e-9)).flatten().median()
         return {"q_gain_mean": float(gq.mean()), "k_gain_mean": float(gk.mean()),
-                "logit_scale_before": before, "logit_scale_after": logit_scale(q2, k2)}
+                "logit_scale_before": float(L0.abs().mean()), "logit_scale_after": float(L1.abs().mean()),
+                "logit_ratio_median": float(ratio)}
 
 
 class _Constellation(nn.Module):

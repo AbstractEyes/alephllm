@@ -24,7 +24,7 @@ code paths, not rewrites. `CausalSDPA` with `qk_norm=""` and `attn_fp32=False` r
 
 ## The registered arms
 
-`geolip.alephllm.presets.CONTROL_RESUME_ARMS` registers four presets, each the twin's craft and recipe verbatim (hub layers
+`geolip.alephllm.presets.CONTROL_RESUME_ARMS` registers five presets, each the twin's craft and recipe verbatim (hub layers
 empty, the born-null head unfrozen, Muon 2e-2 / Adam 3e-4, clip 1.0, micro-batch 16 x accumulation 4 = 262,144 tokens a
 step) under a new name and a chronological phase list (warmup, fineweb_main, S0-S8, anneal_nochat, anneal_mix), starting from
 `mini-beatrix-2s-control/checkpoints/step_00016000.safetensors`:
@@ -33,6 +33,7 @@ step) under a new name and a chronological phase list (warmup, fineweb_main, S0-
 |---|---|---|---|---|
 | `mini-beatrix-2s-control-bf16` | bf16 | off | off | the control: the restart alone must be able to fail as the first run did |
 | `mini-beatrix-2s-control-fp32` | fp32 | (everything fp32) | off | precision as the single variable |
+| `mini-beatrix-2s-control-attn` | bf16 | on | off | fp32 attention alone: no insertion cost, the first run's precision elsewhere |
 | `mini-beatrix-2s-control-fix` | bf16 | on | rms | the guards under the first run's precision elsewhere |
 | `mini-beatrix-2s-control-fp32-fix` | fp32 | (everything fp32) | rms | both |
 
@@ -69,16 +70,24 @@ so the restarted phase keeps its seed on resume.
 ## The gain install (a boundary write)
 
 Inserting a normalization into a trained network changes the attention logits' scale at once; the gains make the insertion
-near-identity in expectation. For a head with raw queries `q_i` (position `i`, channels `c`), per-position scale
-`rho_i = sqrt(mean_c q_ic^2)` and unit-scale directions `u_i = q_i / rho_i`:
+exact for the ordinary logit. For a head with raw queries `q_i` (position `i`) and per-position scale
+`rho_i = sqrt(mean_c q_ic^2)`, the installed gain is ONE scalar per head, broadcast over the channels:
 
-    gain_c = mean_i(rho_i) * sqrt(mean_i(u_ic^2))
+    gain = median_i(rho_i)
 
-so that `q_normed_i * gain = u_i * mean(rho) * channel pattern`: the trained channel pattern at the trained mean position
-scale. The norm then removes only the per-position scale. (A root-mean-square-over-all-positions gain would overshoot the mean
-logit scale by the position scale's spread: measured +9% at a coefficient of variation of .23 on the test bed.) The same for
-k. `CausalSDPA.install_gains` returns the gains' means and the mean |logit| (with the 1/sqrt(head_dim) scale) before and after
-on a 64-position block; `AlephLM.install_qk_gains` walks the trunk.
+so that `q_normed_i * gain = q_i * median(rho) / rho_i`: the raw query with its per-position scale replaced by the typical
+one. Every logit between two ordinary positions is then preserved exactly (its scale factor is 1 at the medians), and the norm
+changes only the outlier positions: a trained attention carries a few positions (the sequence start above all) whose scale is
+10-50x the rest. Two forms that look natural are wrong, both measured on the twin at step 16,000: a MEAN position scale lifts
+every ordinary logit by the outliers' share (1.3-3.3x per block), and a per-channel gain pattern (the RMS of the unit
+directions per channel) squares the heads' shared-channel anisotropy inside the dot product (the typical logit 1.3-4.5x, the
+loss on one fineweb batch 0.77 → 2.11). The gains remain per-head per-channel parameters for training. The same for k. What
+no gain can preserve is the sink mechanism itself (a sink key's logit drops to the typical scale), so the insertion still
+costs some loss that training must recover; the notebook's preflight prints that cost on a real batch (guard off vs gains
+installed), and the arms without QK-norm start from the checkpoint's exact function. `CausalSDPA.install_gains` returns the
+gains' means, the mean |logit| (with the 1/sqrt(head_dim) scale) before and after on a 64-position block, and the median over
+the block's entries of |logit after| / |logit before| (the typical entry's ratio, 1 by construction away from the outliers);
+`AlephLM.install_qk_gains` walks the trunk.
 
 ## The tests
 

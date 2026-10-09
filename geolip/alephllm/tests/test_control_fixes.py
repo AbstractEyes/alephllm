@@ -98,13 +98,24 @@ def case_3():
         y_raw = raw(x)
         rec = g.install_gains(x)
         y_inst = g(x)
-        rho = q.pow(2).mean(-1, keepdim=True).sqrt()
-        gq = rho.mean(dim=(0, 2)) * (q / rho).pow(2).mean(dim=(0, 2)).sqrt()
-    check("3 gains == the mean position scale times the channel pattern of q",
+        rho = q.pow(2).mean(-1).sqrt()
+        med = rho.transpose(0, 1).reshape(4, -1).median(dim=-1).values.unsqueeze(-1)
+        gq = med.expand(-1, 16)
+    check("3 gains == the typical (median) position scale of q, one scalar per head",
           torch.allclose(g.q_gain.squeeze(1), gq, atol=1e-5) and float(gq.mean()) > 2.0, f"mean gain {float(gq.mean()):.3f}")
     r_inst, r_ones = rec["logit_scale_after"] / rec["logit_scale_before"], s_ones / s_raw
-    check("3 the install keeps the logit scale (within 5%) where gains 1 do not", 0.95 < r_inst < 1.05 and r_ones < 0.5,
-          f"after/before: installed {r_inst:.3f}, gains 1 {r_ones:.3f}")
+    check("3 the install keeps the logit scale (within 10%) where gains 1 do not",
+          0.9 < r_inst < 1.1 and 0.9 < rec["logit_ratio_median"] < 1.1 and r_ones < 0.5,
+          f"after/before: installed mean {r_inst:.3f}, typical entry {rec['logit_ratio_median']:.3f}, gains 1 {r_ones:.3f}")
+    xs = x.clone()
+    xs[:, 0] *= 30.0                                 # a sink: one position 30x the rest
+    g2 = CausalSDPA(64, 4, qk_norm="rms")
+    _same_weights(raw, g2)
+    with torch.no_grad():
+        rec2 = g2.install_gains(xs)
+    check("3 under a sink the typical entry keeps its scale while the mean |logit| falls (the sink normalized down)",
+          0.9 < rec2["logit_ratio_median"] < 1.1 and rec2["logit_scale_after"] / rec2["logit_scale_before"] < 0.9,
+          f"typical {rec2['logit_ratio_median']:.3f}, mean {rec2['logit_scale_after'] / rec2['logit_scale_before']:.3f}")
     check("3 the raw scale on record matches an independent read", abs(rec["logit_scale_before"] - s_raw) < 1e-5)
     check("3 the installed block runs finite and differs from the raw block only mildly",
           bool(torch.isfinite(y_inst).all()) and float((y_inst - y_raw).abs().mean()) < 0.5 * float(y_raw.abs().mean()))
@@ -161,14 +172,17 @@ def case_5():
 
 
 def case_6():
-    check("6 the four arms registered", all(n in PRESETS for n in CONTROL_RESUME_ARMS), ", ".join(CONTROL_RESUME_ARMS))
+    check("6 the five arms registered", len(CONTROL_RESUME_ARMS) == 5 and all(n in PRESETS for n in CONTROL_RESUME_ARMS),
+          ", ".join(CONTROL_RESUME_ARMS))
     fx, f32 = PRESETS["mini-beatrix-2s-control-fix"], PRESETS["mini-beatrix-2s-control-fp32"]
     b16, ff = PRESETS["mini-beatrix-2s-control-bf16"], PRESETS["mini-beatrix-2s-control-fp32-fix"]
+    at = PRESETS["mini-beatrix-2s-control-attn"]
     base = PRESETS["mini-beatrix-2s-control"]
     check("6 the switches per arm",
           fx.model.qk_norm == "rms" and fx.model.attn_fp32 and fx.train.precision == "bf16"
           and f32.train.precision == "fp32" and not f32.model.qk_norm and not f32.model.attn_fp32
           and b16.train.precision == "bf16" and not b16.model.qk_norm and not b16.model.attn_fp32
+          and at.train.precision == "bf16" and not at.model.qk_norm and at.model.attn_fp32
           and ff.train.precision == "fp32" and ff.model.qk_norm == "rms")
     same = all(getattr(fx.model, k) == getattr(base.model, k) for k in
                ("d_model", "n_layers", "n_heads", "context", "hub_layers", "bank_experts", "bank_ff", "head_K", "head_D",

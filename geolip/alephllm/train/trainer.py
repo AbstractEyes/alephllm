@@ -358,17 +358,19 @@ class Trainer:
         q = sum(r["q_gain_mean"] for r in recs) / len(recs)
         k = sum(r["k_gain_mean"] for r in recs) / len(recs)
         ratio = [r["logit_scale_after"] / max(r["logit_scale_before"], 1e-12) for r in recs]
+        med = [r["logit_ratio_median"] for r in recs]
         self.manifest.init_from["qk_gains"] = {
             "dataset": phase["dataset"], "seed": seed, "rows": int(xb.shape[0]),
             "context": int(xb.shape[1]), "blocks": recs}
         self.manifest.note(
-            f"BOUNDARY WRITE: QK-norm gains installed at step {self.step:,} from the per-head "
-            f"per-channel RMS of q and k on one {phase['dataset']} micro-batch (seed {seed}; "
-            f"{len(recs)} blocks; mean gain q {q:.3f} / k {k:.3f}; logit scale after/before "
-            f"{min(ratio):.3f}-{max(ratio):.3f})")
+            f"BOUNDARY WRITE: QK-norm gains installed at step {self.step:,} from the typical "
+            f"(median) position scale and the channel pattern of q and k on one {phase['dataset']} "
+            f"micro-batch (seed {seed}; {len(recs)} blocks; mean gain q {q:.3f} / k {k:.3f}; the "
+            f"typical logit's ratio after/before {min(med):.3f}-{max(med):.3f}; the mean |logit|'s "
+            f"{min(ratio):.3f}-{max(ratio):.3f} — under 1 where sink positions were normalized down)")
         print(f"[init] QK-norm gains installed on {len(recs)} blocks: mean gain q {q:.3f} / "
-              f"k {k:.3f}; logit scale after/before {min(ratio):.3f}-{max(ratio):.3f}",
-              flush=True)
+              f"k {k:.3f}; typical logit after/before {min(med):.3f}-{max(med):.3f}; mean |logit| "
+              f"{min(ratio):.3f}-{max(ratio):.3f}", flush=True)
 
     # ---------------------------------------------------------- multi-card
     def _sync_from_main(self):
