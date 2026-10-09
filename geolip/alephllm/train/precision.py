@@ -10,7 +10,16 @@ import contextlib
 import torch
 
 
-def autocast(device: str):
-    if str(device).startswith("cuda"):
-        return torch.autocast("cuda", dtype=torch.bfloat16)
-    return contextlib.nullcontext()
+PRECISIONS = ("bf16", "fp32")
+
+
+def autocast(device: str, precision: str = "bf16"):
+    """bf16 (every mission so far): bf16 autocast on a card, nothing off it.
+    fp32 (the fp32 twin, 2026-10-09): no autocast anywhere — the trainer
+    turns TF32 off under TrainConfig.precision 'fp32' as well, so every
+    matmul is true fp32."""
+    if precision not in PRECISIONS:
+        raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+    if precision == "fp32" or not str(device).startswith("cuda"):
+        return contextlib.nullcontext()
+    return torch.autocast("cuda", dtype=torch.bfloat16)

@@ -8,6 +8,7 @@ that are deliberately not prepped yet), and the checkpoint index.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field, asdict
 
@@ -36,6 +37,11 @@ class RunManifest:
     # rebalance_to, recipe_hash}) — asserted on resume so a session cannot
     # silently continue on a different mix (the recipe-fingerprint law)
     data_plane: dict = field(default_factory=dict)
+    # 2026-10-09: a weights-only start's record ({source, step, phase,
+    # seed_offset, weights, optimizers, guards_added, qk_gains}); None for
+    # a run born from scratch. Read by Trainer._phase_seed (the restarted
+    # phase's stream seed) and by the record.
+    init_from: dict | None = None
 
     # ------------------------------------------------------------- phases
     def current_phase(self) -> dict | None:
@@ -58,6 +64,19 @@ class RunManifest:
                       f"{ph['tokens_done']:,} tokens")
             ph = self.current_phase()
         return ph
+
+    def set_cursor(self, step: int, tokens_per_step: int) -> dict | None:
+        """A weights-only start (2026-10-09): place the run at `step` of its
+        chronological plan — the earlier phases done at their rounded-up
+        step counts, the phase holding the step active with its tokens so
+        far, the rest planned; steps and tokens_seen follow. Returns the
+        active phase. The rule reproduces the record: at 262,144 tokens a
+        step the 2s twins' boundaries fall at 1,145 / 20,219 / 22,890 /
+        25,561 / ... / 61,422 exactly (tests/test_control_fixes.py)."""
+        self.phases = cursor_at_step(self.phases, step, tokens_per_step)
+        self.steps = int(step)
+        self.tokens_seen = sum(int(p.get("tokens_done", 0)) for p in self.phases)
+        return next((p for p in self.phases if p["status"] == "active"), None)
 
     def add_tokens(self, n: int):
         self.tokens_seen += n
@@ -112,6 +131,31 @@ class RunManifest:
             if r is not None:
                 lines.append(f"  resume state: step {r['step']:,}")
         return "\n".join(lines)
+
+
+def cursor_at_step(phases: list, step: int, tokens_per_step: int) -> list:
+    """The phases as they stand after `step` steps of the plan taken in
+    order: a phase takes ceil(planned_tokens / tokens_per_step) steps (the
+    trainer runs whole steps and closes a phase once its budget is met);
+    deferred phases are skipped. Pure — returns new dicts. Raises when the
+    step lies past the plan's end."""
+    out, start, placed = [], 0, False
+    for ph in phases:
+        ph = dict(ph, tokens_done=0)
+        if ph.get("status") == "deferred" or placed:
+            out.append(ph)
+            continue
+        n = math.ceil(ph["planned_tokens"] / tokens_per_step)
+        if step >= start + n:
+            ph.update(status="done", tokens_done=n * tokens_per_step)
+            start += n
+        else:
+            ph.update(status="active", tokens_done=(step - start) * tokens_per_step)
+            placed = True
+        out.append(ph)
+    if not placed:
+        raise ValueError(f"step {step:,} lies past the plan's end ({start:,} steps)")
+    return out
 
 
 def _now() -> str:

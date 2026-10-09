@@ -66,6 +66,17 @@ class AlephLMConfig:
     #  "table": "<npz path>", "k_lo": front blocks, "k_hi": back blocks} —
     # see model/fusion.py. Old manifests load via the default.
     fusion: Optional[dict] = None
+    # The softmax guards (2026-10-09; the control twins continued from the
+    # collapse point). CausalSDPA
+    # blocks only; old manifests load via the defaults.
+    #   qk_norm   "" = the 2s form; "rms" = per-head RMSNorm over head_dim on
+    #             q and k with learned per-head per-channel gains (QK-norm:
+    #             Dehghani 2302.05442, Wortsman 2309.14322)
+    #   attn_fp32 under autocast the block runs with autocast DISABLED (fp32
+    #             projections, logits, softmax, output; TF32 as the global
+    #             flag says) — a no-op without autocast
+    qk_norm: str = ""
+    attn_fp32: bool = False
 
     def to_dict(self):
         d = asdict(self)
@@ -129,6 +140,14 @@ class TrainConfig:
     # corpus that sits at the same recipe index in several stages does not
     # replay the identical shuffle head; False = the 2s form.
     phase_seed_offset: bool = False
+    # 2026-10-09: the compute precision. "bf16" = fp32 masters under bf16
+    # autocast with TF32 on (every mission so far); "fp32" = autocast off
+    # AND TF32 off (the fp32 twin; train/precision.py).
+    precision: str = "bf16"
+
+    def __post_init__(self):
+        if self.precision not in ("bf16", "fp32"):
+            raise ValueError(f"TrainConfig.precision must be 'bf16' or 'fp32', got {self.precision!r}")
 
 
 # All missions upload to the one training repo, each under its own prefix
@@ -152,6 +171,16 @@ class Preset:
     # and the rebalance rule ('natural' | 'generators' | 'hold').
     epoch_cap: float | None = None
     rebalance_to: str | None = None
+    # 2026-10-09: a WEIGHTS-ONLY START from another run's shipped checkpoint
+    # (the control twins continued from the collapse point): {"repo",
+    # "prefix", "path", "step", "seed_offset"} on the hub, or {"file",
+    # "step", "seed_offset"} locally. Taken only when THIS craft has no hub
+    # record yet (no manifest, no resume state); the optimizers start fresh;
+    # the curriculum cursor is set from the step at "tokens_per_step" (the
+    # recipe's step; the live step when absent) (RunManifest.set_cursor);
+    # the active phase's stream opens at seed + seed_offset (a recorded
+    # data-order discontinuity instead of replaying the consumed shuffle).
+    init_from: dict | None = None
 
     @property
     def prefix(self) -> str:                       # path prefix inside hf_repo
@@ -338,6 +367,68 @@ for _name in list(PRESETS):
 # steps — measured 3/3; the +0.01 head term is immaterial at the ±3.4
 # hub scale this control exists to judge).
 PRESETS["mini-beatrix-2s-control"].train.head_addr_frozen = False
+
+
+def make_control_resume_preset(name: str, start_step: int = 16000, precision: str = "bf16",
+                               qk_norm: str = "", attn_fp32: bool = False,
+                               source: str = "mini-beatrix-2s-control",
+                               seed_offset: int = 7919) -> Preset:
+    """The 2s softmax twin CONTINUED from its last clean weights: the twin's
+    craft and recipe verbatim under a NEW name (its own hub prefix — the
+    original run's record stays untouched); a weights-only start from
+    `source`'s shipped checkpoints/step_<start_step>.safetensors (bf16 on
+    the hub, upcast to the fp32 masters; FRESH optimizer states — the run
+    stored none between its phase boundaries, and 16,000 is 1,600 steps
+    before the first clip exceedance); the phases CHRONOLOGICAL (warmup,
+    fineweb_main, S0-S8, anneal_nochat, anneal_mix — the order the twin
+    actually ran them through the notebook's deferred-anneal activation);
+    and the softmax guards as asked:
+      precision 'fp32'   the fp32 twin (autocast off, TF32 off)
+      attn_fp32          the attention blocks in fp32, bf16 elsewhere
+      qk_norm 'rms'      QK-norm; its gains installed at the start from the
+                         trained q/k scales (a boundary write, logged)
+    The registered arms (CONTROL_RESUME_ARMS):
+      mini-beatrix-2s-control-bf16       the restart alone (the control)
+      mini-beatrix-2s-control-fp32       arm A: full fp32
+      mini-beatrix-2s-control-fix        fp32 attention + QK-norm, bf16 elsewhere
+      mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm"""
+    from .data.curriculum import curriculum_phases
+    base = PRESETS[source]
+    m = AlephLMConfig.from_dict(base.model.to_dict())
+    m.name, m.qk_norm, m.attn_fp32 = name, qk_norm, bool(attn_fp32)
+    t = _copy_train(base.train)
+    t.precision = precision
+    phases = [
+        dict(name="warmup_wikitext", dataset="wikitext-103",
+             planned_tokens=300_000_000, status="planned"),
+        dict(name="fineweb_main", dataset="fineweb-edu",
+             planned_tokens=5_000_000_000, status="planned"),
+        *curriculum_phases(1.0),
+        dict(name="anneal_nochat", dataset="anneal-nochat",
+             planned_tokens=1_000_000_000, status="planned"),
+        dict(name="anneal_mix", dataset="anneal-mix",
+             planned_tokens=1_000_000_000, status="planned"),
+    ]
+    # the cursor is set at the RECIPE's step (262,144 tokens), whatever micro-batch a card runs
+    tps = base.train.micro_batch * base.train.grad_accum * base.model.context
+    return Preset(model=m, train=t, curriculum=phases,
+                  init_from={"repo": base.hf_repo, "prefix": source,
+                             "path": f"checkpoints/step_{int(start_step):08d}.safetensors",
+                             "step": int(start_step), "seed_offset": int(seed_offset),
+                             "tokens_per_step": int(tps)})
+
+
+CONTROL_RESUME_ARMS = {
+    "mini-beatrix-2s-control-bf16": dict(precision="bf16"),
+    "mini-beatrix-2s-control-fp32": dict(precision="fp32"),
+    "mini-beatrix-2s-control-fix": dict(precision="bf16", qk_norm="rms", attn_fp32=True),
+    "mini-beatrix-2s-control-fp32-fix": dict(precision="fp32", qk_norm="rms"),
+}
+try:
+    for _n, _kw in CONTROL_RESUME_ARMS.items():
+        PRESETS[_n] = make_control_resume_preset(_n, **_kw)
+except ImportError:
+    pass   # the vendored model-only copies carry no data stack
 
 
 def get_preset(name: str) -> Preset:

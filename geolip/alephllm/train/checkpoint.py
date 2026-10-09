@@ -98,6 +98,27 @@ class HubSync:
             f"could not download {self.prefix}/{repo_path} after 4 tries "
             f"(NOT treating this as 'no resume exists'): {last}")
 
+    def fetch(self, repo: str, path_in_repo: str) -> str:
+        """A file from ANOTHER run's prefix (or another repo): the weights-
+        only start's source checkpoint (2026-10-09). Tokenless works on a
+        public repo (a local "file" spec bypasses the hub). A missing file
+        raises at once; transient trouble retries, then RAISES — a missing
+        source must never turn into a fresh birth."""
+        from huggingface_hub.errors import EntryNotFoundError, \
+            RepositoryNotFoundError, RevisionNotFoundError
+        last = None
+        for i in range(4):
+            try:
+                return hf_hub_download(repo, path_in_repo, token=self.token,
+                                       local_dir=os.path.join(self.local, "_init"))
+            except (EntryNotFoundError, RepositoryNotFoundError,
+                    RevisionNotFoundError) as e:
+                raise RuntimeError(f"init_from: {repo}/{path_in_repo} does not exist") from e
+            except Exception as e:  # noqa: BLE001 — transient: retry then raise
+                last = e
+                time.sleep(5.0 * (i + 1))
+        raise RuntimeError(f"could not fetch {repo}/{path_in_repo} after 4 tries: {last}")
+
     # ----------------------------------------------------------- weights
     def save_safetensors(self, model, step: int, state_dict=None) -> str:
         """`state_dict` (v3): an explicit trunk view — with arms attached

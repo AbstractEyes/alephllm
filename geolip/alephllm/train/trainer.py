@@ -12,7 +12,10 @@ same path: save resume state, push manifest, upload TB — the next session
 picks up exactly where this one stopped.
 
 Precision: model fp32 masters, bf16 autocast (measured >= fp32; never
-train through fp8). Optimizers: Muon + pure Adam split (see optim.py).
+train through fp8); TrainConfig.precision 'fp32' (2026-10-09) turns the
+autocast and TF32 off for the fp32 twin. Optimizers: Muon + pure Adam
+split (see optim.py). A craft with Preset.init_from and no hub record
+starts WEIGHTS-ONLY from another run's checkpoint (_init_from_checkpoint).
 """
 from __future__ import annotations
 
@@ -124,8 +127,11 @@ class Trainer:
 
         torch.manual_seed(self.tc.seed)
         if self.device == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            # TF32 on under the bf16 form (every mission so far); OFF under
+            # precision 'fp32' (the fp32 twin: true fp32 matmuls everywhere)
+            tf32 = self.tc.precision != "fp32"
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+            torch.backends.cudnn.allow_tf32 = tf32
 
         self.tokenizer = build_tokenizer(self.cfg.tokenizer)
         if getattr(self.tokenizer, "name", "") == "byte-trigram":
@@ -197,6 +203,11 @@ class Trainer:
                     "resume/latest.pt (hub history keeps prior revisions) or "
                     "pass resume=False EXPLICITLY to abandon the old run.")
             self.manifest = man
+            if man is None and getattr(self.preset, "init_from", None):
+                # no record of THIS craft on the hub: the weights-only
+                # start from another run's checkpoint (2026-10-09)
+                self._init_from_checkpoint(self.preset.init_from)
+                return True
             return False
         self._payload = payload           # kept for the multi-card sync
         self._apply_payload(payload, man)
@@ -265,6 +276,99 @@ class Trainer:
                   f"{h.get('step'):,} in '{h.get('phase')}' (archive "
                   f"{h.get('archive')}) — train() refuses until "
                   "resume_after_halt=True")
+
+    # ------------------------------------------------- weights-only start
+    def _init_from_checkpoint(self, spec: dict):
+        """A WEIGHTS-ONLY START (2026-10-09; the control twins continued
+        from the collapse point): the source checkpoint's weights into the
+        fp32 masters (strict, except for the guards this craft adds — the
+        QK-norm gains), FRESH optimizer states (none are stored between the
+        source run's boundaries), the step and the curriculum cursor from
+        spec["step"], a fresh manifest that records all of it, and the
+        QK-norm gains installed from the trained q/k scales when the craft
+        carries that guard (a boundary write, logged)."""
+        from safetensors.torch import load_file
+        step = int(spec["step"])
+        if "file" in spec:
+            path, src = spec["file"], f"file {spec['file']}"
+        else:
+            repo = spec.get("repo", self.hub.repo)
+            rel = f"{spec['prefix']}/{spec['path']}"
+            path, src = self.hub.fetch(repo, rel), f"{repo}/{rel}"
+        sd = {k: v.to(torch.float32) for k, v in load_file(path).items()}
+        res = self.raw_model.load_state_dict(sd, strict=False)
+        guards = {n for n, _ in self.raw_model.named_parameters()
+                  if n.endswith((".q_gain", ".k_gain"))}
+        bad = [k for k in res.missing_keys if k not in guards]
+        if bad or res.unexpected_keys:
+            raise RuntimeError(
+                f"init_from: {src} does not fit craft '{self.cfg.name}': missing "
+                f"{bad[:5]}, unexpected {list(res.unexpected_keys)[:5]}")
+        self.step = step
+        live = self.tc.micro_batch * self.tc.grad_accum * self.cfg.context * self.world
+        # the cursor counts the SOURCE run's steps at the recipe's step size,
+        # whatever micro-batch this card runs (a smaller live step only
+        # changes how many steps this run takes per phase from here on)
+        tokens_per_step = int(spec.get("tokens_per_step", live))
+        self.manifest = RunManifest.fresh(
+            self.cfg.name, self.cfg.to_dict(),
+            [dict(ph) for ph in self.preset.curriculum])
+        self.manifest.data_plane = dict(self._data_plane)
+        phase = self.manifest.set_cursor(step, tokens_per_step)
+        pname = phase["name"] if phase else None
+        off = int(spec.get("seed_offset", 0))
+        added = sorted(res.missing_keys)
+        self.manifest.init_from = {
+            "source": src, "step": step, "phase": pname, "seed_offset": off,
+            "tokens_per_step": tokens_per_step, "live_tokens_per_step": live,
+            "weights": "the shipped bf16 checkpoint, upcast to the fp32 masters",
+            "optimizers": "fresh (Muon momentum and Adam moments start at zero)",
+            "guards_added": added[:4] + (["..."] if len(added) > 4 else []),
+            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        self.manifest.note(
+            f"WEIGHTS-ONLY START at step {step:,} from {src}: fresh optimizer states; "
+            f"the curriculum cursor set from the step (active phase '{pname}', "
+            f"{self.manifest.tokens_seen/1e9:.3f}B tokens counted); its stream opens at "
+            f"seed offset {off} (a data-order discontinuity by design: the source run "
+            "consumed the shuffle head)")
+        if tokens_per_step != live:
+            self.manifest.note(f"the live step is {live:,} tokens; the cursor counted the source run's "
+                               f"steps at the recipe's {tokens_per_step:,}")
+        print(f"[init] weights-only start: step {step:,} from {src} · phase '{pname}' · "
+              f"{self.manifest.tokens_seen/1e9:.3f}B tokens counted at {tokens_per_step:,} a step · "
+              f"{len(added)} guard params fresh", flush=True)
+        if added and getattr(self.cfg, "qk_norm", "") and phase is not None:
+            self._install_qk_gains(phase)
+
+    @torch.no_grad()
+    def _install_qk_gains(self, phase: dict):
+        """The QK-norm gains from the trained q/k scales on ONE micro-batch
+        of the active phase's TRAINING corpus, drawn from a throwaway
+        stream with its own seed (never the training stream's rows, never
+        the val gauge), block by block (AlephLM.install_qk_gains). The
+        boundary-write law: a closed-form, data-dependent install at a run
+        boundary, outside the task gradient, provenance in the manifest."""
+        seed = self.tc.seed + 4242
+        s = build_stream(phase["dataset"], self.tokenizer, self.cfg.context,
+                         self.tc.micro_batch, seed=seed)
+        xb = s.next_batch()[:, :-1].to(self.device)
+        recs = self.raw_model.install_qk_gains(xb)
+        if not recs:
+            return
+        q = sum(r["q_gain_mean"] for r in recs) / len(recs)
+        k = sum(r["k_gain_mean"] for r in recs) / len(recs)
+        ratio = [r["logit_scale_after"] / max(r["logit_scale_before"], 1e-12) for r in recs]
+        self.manifest.init_from["qk_gains"] = {
+            "dataset": phase["dataset"], "seed": seed, "rows": int(xb.shape[0]),
+            "context": int(xb.shape[1]), "blocks": recs}
+        self.manifest.note(
+            f"BOUNDARY WRITE: QK-norm gains installed at step {self.step:,} from the per-head "
+            f"per-channel RMS of q and k on one {phase['dataset']} micro-batch (seed {seed}; "
+            f"{len(recs)} blocks; mean gain q {q:.3f} / k {k:.3f}; logit scale after/before "
+            f"{min(ratio):.3f}-{max(ratio):.3f})")
+        print(f"[init] QK-norm gains installed on {len(recs)} blocks: mean gain q {q:.3f} / "
+              f"k {k:.3f}; logit scale after/before {min(ratio):.3f}-{max(ratio):.3f}",
+              flush=True)
 
     # ---------------------------------------------------------- multi-card
     def _sync_from_main(self):
@@ -397,6 +501,10 @@ class Trainer:
         """The stream seed for a phase: the run seed, offset per phase
         position when TrainConfig.phase_seed_offset (v3) so a corpus that
         recurs across stages does not replay the same shuffle head."""
+        init = getattr(self.manifest, "init_from", None) or {}
+        if init and ph["name"] == init.get("phase") and int(init.get("seed_offset", 0)):
+            # the weights-only start's phase reads a fresh shuffle (recorded)
+            return self.tc.seed + int(init["seed_offset"])
         if not getattr(self.tc, "phase_seed_offset", False):
             return self.tc.seed
         names = [p["name"] for p in self.manifest.phases]
@@ -528,7 +636,7 @@ class Trainer:
                 for _ in range(tc.grad_accum):
                     xb = self.stream.next_batch().to(self.device,
                                                      non_blocking=True)
-                    with autocast(self.device):
+                    with autocast(self.device, tc.precision):
                         _, loss = model(xb[:, :-1], targets=xb[:, 1:])
                     (loss / tc.grad_accum).backward()
                     loss_acc += float(loss.item()) / tc.grad_accum

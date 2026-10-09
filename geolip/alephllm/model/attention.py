@@ -14,6 +14,8 @@ for the test array.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,44 +23,131 @@ import torch.nn.functional as F
 from .address import AlephAddress, dtype_floor
 
 
+def _rms_normalize(t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """RMS-normalize the last dim; the statistic in fp32, the dtype kept."""
+    inv = torch.rsqrt(t.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+    return t * inv.to(t.dtype)
+
+
 class CausalSDPA(nn.Module):
-    def __init__(self, d: int, heads: int = 8):
+    """Softmax attention: fused qkv, F.scaled_dot_product_attention with
+    is_causal, the output projection. Two optional guards (2026-10-09; the
+    control twins continued from their collapse point):
+      qk_norm="rms"  per-head RMSNorm over head_dim on q and k with learned
+                     per-head per-channel gains (init 1). `install_gains`
+                     sets them from a batch's trained q/k scales so the norm
+                     enters near-identity mid-run (a boundary write).
+      attn_fp32      under autocast the whole block (projections, logits,
+                     softmax, PV, output) runs with autocast disabled, in
+                     fp32 (TF32 per the global flag); a no-op otherwise.
+    With both off this is the 2s form bit for bit (the same code path)."""
+
+    def __init__(self, d: int, heads: int = 8, qk_norm: str = "",
+                 attn_fp32: bool = False):
         super().__init__()
         assert d % heads == 0
+        assert qk_norm in ("", "rms"), f"qk_norm: '' or 'rms', got {qk_norm!r}"
         self.h = heads
+        self.qk_norm, self.attn_fp32 = qk_norm, bool(attn_fp32)
         self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.o = nn.Linear(d, d, bias=False)
         nn.init.orthogonal_(self.qkv.weight)
         nn.init.orthogonal_(self.o.weight)
+        if qk_norm:
+            hd = d // heads
+            self.q_gain = nn.Parameter(torch.ones(heads, 1, hd))
+            self.k_gain = nn.Parameter(torch.ones(heads, 1, hd))
 
-    def forward(self, x):
-        B, n, d = x.shape
+    def extra_repr(self) -> str:
+        return f"heads={self.h}, qk_norm={self.qk_norm!r}, attn_fp32={self.attn_fp32}"
+
+    # ------------------------------------------------------------ pieces
+    def _split(self, x, n):
+        B, _, d = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = (t.view(B, n, self.h, d // self.h).transpose(1, 2)
-                   for t in (q, k, v))
+        return tuple(t.view(B, n, self.h, d // self.h).transpose(1, 2)
+                     for t in (q, k, v))
+
+    def _guard(self, q, k):
+        if not self.qk_norm:
+            return q, k
+        return (_rms_normalize(q) * self.q_gain.to(q.dtype),
+                _rms_normalize(k) * self.k_gain.to(k.dtype))
+
+    def _fp32_active(self, x) -> bool:
+        return self.attn_fp32 and x.is_cuda and torch.is_autocast_enabled()
+
+    def _run(self, x, n):
+        B, d = x.shape[0], x.shape[-1]
+        q, k, v = self._split(x, n)
+        q, k = self._guard(q, k)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).reshape(B, n, d))
 
+    def forward(self, x):
+        n = x.shape[1]
+        if self._fp32_active(x):
+            with torch.autocast("cuda", enabled=False):
+                return self._run(x.float(), n)
+        return self._run(x, n)
+
     # ---------------------------------------------------- incremental decode
     def prefill(self, x):
-        """Full causal pass that also returns the decode cache (K/V)."""
+        """Full causal pass that also returns the decode cache (K/V; the
+        guarded k when qk_norm is on)."""
         B, n, d = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = (t.view(B, n, self.h, d // self.h).transpose(1, 2)
-                   for t in (q, k, v))
+        q, k, v = self._split(x, n)
+        q, k = self._guard(q, k)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).reshape(B, n, d)), {"k": k, "v": v}
 
     def step(self, x_t, cache):
         """One new position attending over everything cached (KV cache)."""
         B, _, d = x_t.shape
-        q, k, v = self.qkv(x_t).chunk(3, dim=-1)
-        q, k, v = (t.view(B, 1, self.h, d // self.h).transpose(1, 2)
-                   for t in (q, k, v))
+        q, k, v = self._split(x_t, 1)
+        q, k = self._guard(q, k)
         cache["k"] = torch.cat([cache["k"], k], dim=2)
         cache["v"] = torch.cat([cache["v"], v], dim=2)
         y = F.scaled_dot_product_attention(q, cache["k"], cache["v"])
         return self.o(y.transpose(1, 2).reshape(B, 1, d))
+
+    # ------------------------------------------------------ boundary write
+    @torch.no_grad()
+    def install_gains(self, x) -> dict:
+        """Set the QK-norm gains from the RAW q and k on this batch: per
+        head, the MEAN per-position RMS times the per-channel RMS of the
+        unit-RMS directions. q_normed * gain then carries the trained
+        channel pattern at the trained mean position scale, so the mean
+        attention logit keeps its scale in expectation and the norm removes
+        only the per-position scale. (An RMS-over-all-positions gain would
+        overshoot by the position scale's spread: +9% at a CV of .23 on
+        the test bed.) Returns the provenance: the gains' means and the mean
+        |logit| (with the 1/sqrt(head_dim) scale) before and after on a
+        64-position block of the batch."""
+        assert self.qk_norm, "install_gains needs qk_norm"
+        n = x.shape[1]
+        q, k, _ = self._split(x.float(), n)
+        hd = q.shape[-1]
+        m = min(64, n)
+
+        def logit_scale(a, b):
+            return float((a[..., :m, :] @ b[..., :m, :].transpose(-1, -2)).abs().mean()
+                         / math.sqrt(hd))
+
+        before = logit_scale(q, k)
+
+        def gains(t):
+            rho = t.pow(2).mean(dim=-1, keepdim=True).sqrt()      # the per-position RMS (B, h, n, 1)
+            u = t / rho.clamp_min(1e-6)                            # unit-RMS directions
+            # (h, 1) * (h, hd): the mean position scale times the channel pattern
+            return rho.mean(dim=(0, 2)) * u.pow(2).mean(dim=(0, 2)).sqrt()
+
+        gq, gk = gains(q), gains(k)                    # (h, hd) each
+        self.q_gain.copy_(gq.unsqueeze(1))
+        self.k_gain.copy_(gk.unsqueeze(1))
+        q2, k2 = self._guard(q, k)
+        return {"q_gain_mean": float(gq.mean()), "k_gain_mean": float(gk.mean()),
+                "logit_scale_before": before, "logit_scale_after": logit_scale(q2, k2)}
 
 
 class _Constellation(nn.Module):

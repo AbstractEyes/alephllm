@@ -49,7 +49,9 @@ class Block(nn.Module):
                                        chunk=cfg.hub_chunk,
                                        n_const=getattr(cfg, "hub_const", 1))
         else:
-            self.attn = CausalSDPA(d, cfg.n_heads)
+            self.attn = CausalSDPA(d, cfg.n_heads,
+                                   qk_norm=getattr(cfg, "qk_norm", ""),
+                                   attn_fp32=getattr(cfg, "attn_fp32", False))
         self.bank = AnchoredBank(d, cfg.bank_experts, cfg.bank_ff, cfg.tau,
                                  cfg.gate_init)
 
@@ -322,6 +324,30 @@ class AlephLM(nn.Module):
             nxt = self._sample(logits, temperature, top_p)
             idx = torch.cat([idx, nxt], dim=1)
         return idx
+
+    @torch.no_grad()
+    def install_qk_gains(self, idx) -> list:
+        """BOUNDARY WRITE (2026-10-09): walk the trunk on one batch and set
+        every sdpa block's QK-norm gains from its own trained q/k scales
+        (CausalSDPA.install_gains), each block then run WITH its gains so
+        the next block reads the guarded stream. For a craft that starts
+        mid-run with qk_norm switched on; a birth keeps the gains at 1.
+        Returns the per-block provenance. The byte trunk only (no fusion)."""
+        assert self.fusion is None, "install_qk_gains: the byte trunk only"
+        from .governor import raw_block
+        was = self.training
+        self.eval()
+        out = []
+        x = self.embed(idx)
+        for i, wrap in enumerate(self.blocks):
+            b = raw_block(wrap)
+            if getattr(b.attn, "qk_norm", ""):
+                rec = b.attn.install_gains(b.n1(x))
+                rec["block"] = i
+                out.append(rec)
+            x = wrap(x)
+        self.train(was)
+        return out
 
     def compile_hubs(self, **compile_kw):
         """Opt-in: torch.compile each hub's attention (measured 4.0x over
