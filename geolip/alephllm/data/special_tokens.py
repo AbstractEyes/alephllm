@@ -71,7 +71,7 @@ SPECIALS = frozenset(NAMES)
 assert SPECIALS <= INVALID_UTF8 and len(SPECIALS) == 13
 
 # ESC-space allocation table (ESC + payload byte). Append-only; every
-# grant is recorded here and in claude-mind. Unlisted payloads are free —
+# grant is recorded here. Unlisted payloads are free —
 # EXCEPT the special-range values (0xC0, 0xC1, 0xF5–0xFF), which are
 # permanently unallocatable: an ESC payload equal to END/USER/DOC would
 # false-fire every stateless raw-id scanner forever (esc() enforces it).

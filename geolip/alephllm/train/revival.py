@@ -1,6 +1,6 @@
 """Head revival — the BOUNDARY-WRITE op for a buried aleph head.
 
-MEASURED BASIS (claude-mind repos/alephllm.md RIDERS 11-12, 2026-08-27):
+MEASURED BASIS (2026-08-27; alephllm-mini-beatrix-training docs/technical/04_the_head.md):
 a born-null aleph head racing a strong same-target linear base self-buries
 within ~2k steps (2/2 crafts: v1 shipped with W_s == 0.0 exactly; run1's
 proj rotated to 60x-below-chance codebook orthogonality). LS-on-buried-

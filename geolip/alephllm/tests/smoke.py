@@ -740,7 +740,7 @@ def t_head_revival():
                         head_K=16, head_D=16, hub_chunk=16)
     m = AlephLM(cfg).eval()
     x = torch.randint(0, 256, (4, 64))
-    # bury the head the way the real crafts did (RIDER 12): burial needs
+    # bury the head the way the real crafts did: burial needs
     # a RANK-COLLAPSED book (a full-rank book spans everything and
     # normalize rescues any residual) — collapse the book to one line,
     # then rotate proj into its orthogonal complement

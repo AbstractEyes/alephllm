@@ -574,7 +574,7 @@ class Trainer:
                 if self.arms is not None and self.arms.active:
                     self.arms.step()
 
-                # ANCHOR GOVERNOR (ROUND 5f): post-step min-sep projection,
+                # ANCHOR GOVERNOR (model/governor.py): post-step min-sep projection,
                 # every governor_every steps. Identity when slack (one small
                 # matmul per codebook, zero writes); fires only on crowding.
                 # Outside the task gradient — the no-balance-machinery law

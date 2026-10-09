@@ -51,7 +51,7 @@ class AlephLMConfig:
     tie_embeddings: bool = False       # BPE crafts tie; byte crafts cannot (trigram)
     hub_chunk: int = 128               # chunked-scan block for the hub prefix memories
     # v2 (2026-08-26): multi-constellation hubs — the product-code form at
-    # lawful supply (K <= 2*hub_D per book; ROUND 5e). 1 = the v1 layout,
+    # lawful supply (K <= 2*hub_D per book; aleph-splat-0 TECHNICAL_ROUND5.md, round 5e). 1 = the v1 layout,
     # bit-identical state dict. Old manifests load via the default.
     hub_const: int = 1
     # Activation checkpointing (training only; inference/decode untouched).
@@ -105,14 +105,14 @@ class TrainConfig:
     # v3: a lead-ruled change of the mix (the minted lexicon) — a resume
     # whose recipe differs ONLY by it is accepted and recorded with this note
     data_plane_amendment: str | None = None
-    # The anchor governor (ROUND 5f, 2026-08-25): post-optimizer-step
+    # The anchor governor (2026-08-25; see model/governor.py): post-optimizer-step
     # min-separation projection over hub/head codebooks — preventive
     # anti-crowding, identity when slack, zero parameters, outside the
     # task gradient (the no-balance-machinery law is untouched).
     governor: str = ""                 # "" off (v1 verbatim) | "minsep"
     governor_theta: float = 45.0       # deg; scale ~ gamma*(D): 45 at D=256
     governor_every: int = 8            # steps between slack checks (~free)
-    # Post-revival address freeze (0.8.2; RIDERS 11-12): after the
+    # Post-revival address freeze (0.8.2; see train/revival.py): after the
     # BOUNDARY-WRITE head revival, proj + head codebook freeze so the
     # self-burial channel (proj rotating to codebook-orthogonality,
     # measured 2/2 crafts) is structurally closed — only W_s trains.
@@ -132,7 +132,7 @@ class TrainConfig:
 
 
 # All missions upload to the one training repo, each under its own prefix
-# (Phil's repo: checkpoints + manifests + tensorboard for every craft).
+# (checkpoints + manifests + tensorboard for every craft).
 TRAINING_REPO = "AbstractPhil/alephllm-mini-beatrix-training"
 
 
@@ -187,12 +187,12 @@ PRESETS: dict[str, Preset] = {
         train=TrainConfig(micro_batch=48, grad_accum=3),
         curriculum=_curriculum(300_000_000, 3_000_000_000, 6_000_000_000),
     ),
-    # v2 (2026-08-26, Phil's draft off the Foundry console): FULL-SPLAT —
+    # v2 (2026-08-26): FULL-SPLAT —
     # a hub in every block, multi-constellation product code at lawful
     # supply (16 books x 256 anchors in 256-dim spaces = 1.0x supply;
     # v1's single book ran 16x and crowded), governed from birth, ctx 8192
     # where the O(L) read is ~4.5x cheaper than the MHA equivalent.
-    # ~873.7M params. Plan: history/plans/2026-08-26_mini_beatrix_v2_shape.md.
+    # ~873.7M params.
     "mini-beatrix-2": Preset(
         model=AlephLMConfig(name="mini-beatrix-2", d_model=1024, n_layers=32,
                             n_heads=16, context=8192,
@@ -210,8 +210,8 @@ PRESETS: dict[str, Preset] = {
                           governor="minsep", governor_theta=45.0),
         curriculum=_curriculum(500_000_000, 8_000_000_000, 16_000_000_000),
     ),
-    # THE ACTIVE MISSION (2026-08-26, Phil: "train the next stage up from
-    # the beatrix v1; we can't train the large one currently"): the lawful
+    # THE 2s MISSION (2026-08-26): the next stage up from v1, since the
+    # large shape above could not be trained on the available card: the lawful
     # full-splat craft one rung above v1 — d1024 L20 ctx4096, governed
     # 4x64@128 books (4x supply headroom vs v1's crowded 16x). Also the
     # screen bed for every v2-era gating cell. hub_ckpt=0: at 237M the
@@ -244,7 +244,7 @@ def make_v3_preset(n_layers: int = 24, d_model: int = 1024,
                    data_scale: float = 4.0, epoch_cap: float | None = None,
                    rebalance_to: str | None = None,
                    name: str | None = None) -> Preset:
-    """The v3 craft (plan of record 2026-09-15, S2/S14; sizing 09-15):
+    """The v3 craft (the v3 plan of 2026-09-15; sizing 09-15):
     the solidified all-splat form at d1024 — a governed hub in EVERY
     block, the certified hub geometry (4 books x 64 @ D128), banks
     3 x ff1024, head 256@256, ctx 4096 — at a depth the throughput bench

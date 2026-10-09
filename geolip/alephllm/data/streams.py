@@ -69,8 +69,7 @@ ANNEAL_MIX = [("fineweb-edu", 0.45), ("cosmopedia", 0.20),
               ("tinystories", 0.15), ("soda-dialogue", 0.12),
               ("beatrix-texture-sp", 0.05), ("recall-synth", 0.03)]
 
-# 0.8.6 (Phil 2026-08-31: "run without first, then just train chat on
-# after"): the two-phase anneal — same distribution MINUS the chat-frame
+# 0.8.6: the two-phase anneal — same distribution MINUS the chat-frame
 # component first (MixStream renormalizes weights), so the nochat
 # boundary report is the exact pre-chat baseline and the chat frame's
 # effect is isolated from the anneal shift itself.

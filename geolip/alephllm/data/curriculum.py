@@ -1,6 +1,5 @@
 """Early-life curriculum — stages S0..S8 over the locked core.
 
-Plan of record: claude-mind history/plans/2026-08-15_early_life_curriculum.md
 Laws in force here:
 - NO chat template, NO identity rows, NO boilerplate headers. Dialogue
   enters only as narrative quotation. (chat-in-anneal law)
@@ -512,12 +511,12 @@ REGISTRY.update({
                            columns=["knowledge_type", "event", "relation",
                                     "relation_description", "tail"],
                            max_empties=20_000),
-    # sciq spec present but OUT of default mixes: CC-BY-NC license pending
-    # Phil's call (plan: Vetting results / FLAGS).
+    # sciq spec present but OUT of default mixes: its CC-BY-NC license keeps
+    # it out until a licensing decision is recorded.
     "sciq-prose": dict(path="allenai/sciq", split="train",
                        column="support"),
-    # WordNet-class glosses: the definitional ANSWER SHAPE (Phil ask,
-    # 2026-08-15) — "teach the model how to respond to definitions".
+    # WordNet-class glosses: the definitional ANSWER SHAPE — teaches the
+    # model how to respond to definitions.
     "definitions": dict(path="mjbommar/opengloss-v1.3-definitions",
                         split="train", column="definition",
                         render="definition",

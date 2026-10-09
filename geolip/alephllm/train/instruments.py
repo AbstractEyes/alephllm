@@ -138,8 +138,8 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
     census["head"]["addr"] = head.addr.health(ph)
     w = head.addr.signed(ph.reshape(-1, ph.shape[-1]).float())
     census["head"]["consumed_erank"] = effective_rank(w)
-    # address liveness vs a self-calibrating chance reference (RIDERS
-    # 11-12: both buried crafts sat at 0.003x-0.03x chance while every
+    # address liveness vs a self-calibrating chance reference (both buried
+    # crafts sat at 0.003x-0.03x chance while every
     # other head gauge looked healthy - the missing tripwire)
     live = float(w.float().norm(dim=1).mean())
     rnd = F.normalize(torch.randn(512, head.addr.codebook.shape[1],
@@ -361,8 +361,8 @@ def special_token_gauge(model, val_batches: list, doc_id: int | None = None,
 @torch.no_grad()
 def head_liveness(model, sample_h: torch.Tensor | None = None,
                   sample_idx: torch.Tensor | None = None) -> dict:
-    """The address-liveness gauge the dead-head era was missing (RIDERS
-    11-12): mean ||signed read|| vs a self-calibrating chance reference
+    """The address-liveness gauge the dead-head era was missing
+    (alephllm-mini-beatrix-training docs/technical/04_the_head.md): mean ||signed read|| vs a self-calibrating chance reference
     (random unit inputs through the SAME book), fp32. A toggle pinned at
     0.000 is a finding; liveness_ratio < 0.1 is the burial tripwire -
     both crafts that buried sat at 0.003x-0.03x chance."""

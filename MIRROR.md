@@ -9,7 +9,7 @@ final weights, with its stage arms since the same day) are HF remote-code packag
 that carry **vendored copies of `geolip/alephllm/model/*.py`** plus
 `presets.py`. Nothing in this repo enforces the link.
 
-**LAW (claude-mind, repos/alephllm.md): any change to `model/*.py` or
+**Rule: any change to `model/*.py` or
 `presets.py` must be mirrored to EVERY one of these HF repos in the same
 session** — the vendored copies drift silently otherwise. The machine
 HF_TOKEN can write it.

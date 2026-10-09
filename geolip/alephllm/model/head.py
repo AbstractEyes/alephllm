@@ -1,4 +1,4 @@
-"""DualHead — the standard readout plus the L-012 aleph read, born null.
+"""DualHead — the standard readout plus an aleph read, born null.
 
     logits = W_h h + W_s s(h),        W_s == 0 at init
 

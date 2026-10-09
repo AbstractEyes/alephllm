@@ -66,7 +66,7 @@ class _Constellation(nn.Module):
 
     The multi-constellation hub is the PRODUCT-CODE form (B2: independent
     frames compose, .859 -> .955 monotone in members) at lawful supply
-    (ROUND 5e: K <= 2*D per address space — v1's single 512-anchor book in
+    (aleph-splat-0 TECHNICAL_ROUND5.md, round 5e: K <= 2*D per address space — v1's single 512-anchor book in
     32 dims ran 16x and crowded into 333-646 duplicate pairs)."""
 
     def __init__(self, d: int, K: int, D: int, tau: float):

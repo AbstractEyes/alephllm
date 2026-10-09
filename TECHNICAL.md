@@ -181,10 +181,10 @@ information system is external:
 
 ## v2 mechanisms (0.7.0, 2026-08-26) — the governed full-splat era
 
-Measured provenance: claude-mind canon/splat_aleph_battery.md ROUNDs 5a-5f,
-canon/covariant_codebook_prior_art.md, plan 2026-08-26_mini_beatrix_v2_shape.md.
+Measured provenance: the round-5 battery, rounds 5a-5f, in
+[aleph-splat-0 TECHNICAL_ROUND5.md](https://huggingface.co/AbstractPhil/aleph-splat-0/blob/main/TECHNICAL_ROUND5.md).
 
-- **Supply law** (ROUND 5e): anchors crowd past ~2x supply per address space.
+- **Supply law** (round 5e): anchors crowd past ~2x supply per address space.
   `CausalSplatHUB` now WARNS at construction when K > 2*D. v1's 512@32 (16x)
   produced 333/646/181 duplicate anchor pairs and a consumed-erank-2 hub.
 - **Multi-constellation hubs** (`hub_const` > 1): H independent codebooks per
@@ -192,7 +192,7 @@ canon/covariant_codebook_prior_art.md, plan 2026-08-26_mini_beatrix_v2_shape.md.
   agreement masses sum before one divide; never softmax over books). The
   product-code form (B2) at lawful supply. `hub_const=1` is the v1 layout,
   bit-identical state dict.
-- **The anchor governor** (`TrainConfig.governor="minsep"`, ROUND 5f):
+- **The anchor governor** (`TrainConfig.governor="minsep"`, round 5f):
   post-optimizer-step projective min-separation over hub/head codebooks,
   every `governor_every` steps. Identity when slack; preventive, not curative
   (the separation lemma); outside the task gradient (no-balance-machinery law

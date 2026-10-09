@@ -1,6 +1,6 @@
-"""The anchor governor — min-separation projection (ROUND 5f, 2026-08-25).
+"""The anchor governor — min-separation projection (2026-08-25).
 
-Measured law (claude-mind, canon/splat_aleph_battery.md ROUND 5e/5f): anchors
+Measured (aleph-splat-0 TECHNICAL_ROUND5.md, rounds 5e/5f): anchors
 crowded past the separation floor flutter under the positional sweep (the
 static logit gap is quadratic in separation, the oscillation linear), and the
 crowding tail tracks seed fragility. The governor holds the space open FROM
