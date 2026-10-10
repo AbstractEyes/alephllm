@@ -51,7 +51,7 @@ class Muon(torch.optim.Optimizer):
                     p.add_(upd, alpha=-g["lr"])
 
 
-def split_params(model: nn.Module):
+def split_params(model: nn.Module, adam_prefixes: tuple = ()):
     """Muon set: 2D weights of Linear/attention/codebooks + 3D stacked
     expert matrices. Adam set: everything else + all embedding tables (2D
     but excluded — per-row geometry, not transport maps). Covers every
@@ -65,6 +65,10 @@ def split_params(model: nn.Module):
         if id(p) in seen:
             continue
         seen.add(id(p))
+        if adam_prefixes and name.startswith(tuple(adam_prefixes)):
+            # 0.10.15: a trained arm's parameters (TrainConfig.arm_params) belong to pure Adam whatever their shape
+            adam.append(p)
+            continue
         if ".adapter." in name:
             # attached arms (amoe wrappers) own their optimizer (pure Adam
             # in the arm program) — never swept into the trunk's Muon
@@ -77,10 +81,25 @@ def split_params(model: nn.Module):
 
 
 def build_optimizers(model: nn.Module, muon_lr: float = 2e-2,
-                     muon_momentum: float = 0.95, adam_lr: float = 3e-4):
-    muon_p, adam_p = split_params(model)
+                     muon_momentum: float = 0.95, adam_lr: float = 3e-4,
+                     adam_prefixes: tuple = ()):
+    muon_p, adam_p = split_params(model, adam_prefixes)
     return [Muon(muon_p, lr=muon_lr, momentum=muon_momentum),
             torch.optim.Adam(adam_p, lr=adam_lr, weight_decay=0.0)]
+
+
+def freeze_except(model: nn.Module, prefixes: tuple) -> tuple:
+    """0.10.15: only the parameters whose names start with one of `prefixes` train; every other parameter's
+    requires_grad goes False (Muon and Adam both skip grad-less parameters, so the groups stay as built).
+    Returns (trainable, total) parameter counts."""
+    pre = tuple(prefixes)
+    n_train = n_all = 0
+    for name, p in model.named_parameters():
+        on = name.startswith(pre)
+        p.requires_grad_(on)
+        n_all += p.numel()
+        n_train += p.numel() if on else 0
+    return n_train, n_all
 
 
 def lr_scale(step: int, warmup: int) -> float:

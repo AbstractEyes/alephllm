@@ -85,16 +85,21 @@ class AlephLMConfig:
     #               fp32 softmax, flash pace); eval, census and decode keep
     #               sdpa
     attn_kernel: str = "sdpa"
+    # the lookup arm (0.10.15): zero-born softmax attention added AFTER each named block, outside the hubs'
+    # address reads, read through this config's qk_norm / attn_fp32 / attn_kernel switches; () = none
+    lookup_arm_sites: tuple = ()
 
     def to_dict(self):
         d = asdict(self)
         d["hub_layers"] = list(self.hub_layers)
+        d["lookup_arm_sites"] = list(getattr(self, "lookup_arm_sites", ()) or ())
         return d
 
     @staticmethod
     def from_dict(d):
         d = dict(d)
         d["hub_layers"] = tuple(d.get("hub_layers", ()))
+        d["lookup_arm_sites"] = tuple(int(s) for s in (d.get("lookup_arm_sites", ()) or ()))
         return AlephLMConfig(**d)
 
 
@@ -161,6 +166,9 @@ class TrainConfig:
     loss_copy_beta: float = 0.0
     loss_copy_m: int = 4
     loss_copy_D: int = 256
+    # arm training (0.10.15): parameter-name prefixes that TRAIN while every other parameter is frozen, owned by
+    # pure Adam (the house rule for arms and adapters, wd 0; Muon stays the trunk's); () = the whole model trains
+    arm_params: tuple = ()
 
     def __post_init__(self):
         if self.precision not in ("bf16", "fp32"):
@@ -506,3 +514,83 @@ def get_preset(name: str) -> Preset:
     if name not in PRESETS:
         raise KeyError(f"unknown preset '{name}' — have: {sorted(PRESETS)}")
     return PRESETS[name]
+
+
+# ---------------------------------------------------------------- 0.10.15: the byte screen's arms + the v3 lookup arm
+BYTE_SCREEN_KINDS = {
+    "ctrl": dict(extra_train=None, phase_dataset_override=None),
+    "rows": dict(extra_train=None, phase_dataset_override={"fineweb_main": "fineweb-recall-far-5"}),
+    "rows-copy": dict(extra_train={"loss_form": "copy", "loss_copy_beta": 2.0, "loss_copy_m": 4, "loss_copy_D": 256},
+                      phase_dataset_override={"fineweb_main": "fineweb-recall-far-5"}),
+    "depth": dict(extra_train={"loss_form": "depth",
+                               "loss_depth_w": (0.615385, 0.615385, 0.615385, 1.230769, 1.230769, 1.230769, 1.230769, 1.230769)},
+                  phase_dataset_override=None),
+}
+BYTE_SCREEN_SIDES = {
+    "twin": dict(precision="bf16", attn_fp32=True, attn_kernel="fp16", micro_batch=8, grad_accum=8,
+                 source="mini-beatrix-2s-control-attn-fp16-r10k"),
+    "2s": dict(precision="bf16", source="mini-beatrix-2s"),
+}
+
+
+def make_byte_screen_preset(side: str, kind: str, start_step: int, seed_offset: int = 7919) -> Preset:
+    """The byte screen (2026-10-10): a 2,000-step CONTINUATION arm of the fp16 softmax twin (`side` "twin": the arm
+    from 10,000's own checkpoints, 8 x 8, fp16 flash in the fp32 attention block, no QK-norm) or of the splat 2s
+    ("2s": its own checkpoints, the 2s recipe), by `kind`: "ctrl" the bit-identical control; "rows" the far-recall
+    rows at 5% in place of fineweb_main's text (the mix fineweb-recall-far-5); "rows-copy" the rows + the copy-
+    weighted loss (beta 2 on bytes copy-right from a 4-gram match >= 256 back); "depth" the depth-weighted loss,
+    (1,1,1,2,2,2,2,2) at mean 1 (the twin side only). Every arm reads the same rows per step (one seed offset). The
+    rows kinds must start inside fineweb_main (start_step <= 18,219: 2,000 steps before the 20,219 boundary) so the
+    rows replace web text and nothing else. An arm's length is its session's hours (TrainConfig has no step cap)."""
+    if side not in BYTE_SCREEN_SIDES:
+        raise ValueError(f"side must be one of {sorted(BYTE_SCREEN_SIDES)}, got {side!r}")
+    if kind not in BYTE_SCREEN_KINDS:
+        raise ValueError(f"kind must be one of {sorted(BYTE_SCREEN_KINDS)}, got {kind!r}")
+    if side == "2s" and kind == "depth":
+        raise ValueError("the depth arm runs on the twin side only")
+    if "rows" in kind and int(start_step) > 18219:
+        raise ValueError(f"the rows kinds start inside fineweb_main (start_step <= 18219), got {start_step}")
+    stem = "mini-beatrix-2s-control-attn-fp16" if side == "twin" else "mini-beatrix-2s"
+    name = f"{stem}-c{int(start_step) // 1000}k-{kind}"
+    return make_control_resume_preset(name, start_step=int(start_step), seed_offset=int(seed_offset),
+                                      **BYTE_SCREEN_SIDES[side], **BYTE_SCREEN_KINDS[kind])
+
+
+def make_v3_lookup_arm_preset(sites=(2, 6, 12, 20), steps: int = 4000, start_step: int = 245674,
+                              source: str = "mini-beatrix-3", mix: str = "fineweb-recall-far-5",
+                              micro_batch: int = 8, grad_accum: int = 8, attn_kernel: str = "fp16",
+                              seed_offset: int = 7919, name: str | None = None, repo: str | None = None) -> Preset:
+    """THE LOOKUP ARM ON THE RELEASED v3 (2026-10-10, the retrofit route): mini-beatrix-3's 32-block all-splat trunk,
+    weights-only from its shipped checkpoint at `start_step`, with a zero-born softmax attention arm AFTER each block
+    in `sites` (QK-norm from birth, the fp32 attention block, the `attn_kernel` path: the guards that held the softmax
+    twin), trained ALONE under pure Adam (TrainConfig.arm_params: the trunk frozen, so the released weights are
+    untouched and the arm is removable: its keys are the state dict's lookup_arms.* and lookup_norms.*) on `mix`
+    for `steps` steps of the recipe's 262,144 tokens. The curriculum is two phases, the trunk's own steps (done at
+    the cursor) then the arm's phase, so the start lands on the arm's first step. The governor is off (nothing it
+    governs trains). The craft's name encodes the sites (mini-beatrix-3-la2-6-12-20) and is its own hub prefix."""
+    sites = tuple(int(s) for s in sites)
+    if sites != tuple(sorted(set(sites))) or not all(0 <= s < 32 for s in sites) or not sites:
+        raise ValueError(f"sites must be distinct ascending block indices in 0..31, got {sites}")
+    base = make_v3_preset(32, data_scale=4.0, epoch_cap=2.0, rebalance_to="generators", name="mini-beatrix-3")
+    m = AlephLMConfig.from_dict(base.model.to_dict())
+    m.name = name or ("mini-beatrix-3-la" + "-".join(str(s) for s in sites))
+    m.lookup_arm_sites = sites
+    m.qk_norm, m.attn_fp32, m.attn_kernel = "rms", True, attn_kernel   # the arm's switches: the trunk has no softmax block
+    t = _copy_train(base.train)
+    t.precision = "bf16"
+    t.micro_batch, t.grad_accum = int(micro_batch), int(grad_accum)
+    t.arm_params = ("lookup_arms.", "lookup_norms.")
+    t.governor = ""
+    t.ckpt_every = min(int(t.ckpt_every), 1000)
+    t.eval_every = min(int(t.eval_every), 1000)
+    t.__post_init__()
+    tps = base.train.micro_batch * base.train.grad_accum * base.model.context
+    if t.micro_batch * t.grad_accum * m.context != tps:
+        raise ValueError(f"micro_batch x grad_accum x context must stay the recipe's {tps:,}-token step")
+    phases = [dict(name="v3_trunk", dataset="fineweb-edu", planned_tokens=int(start_step) * tps, status="planned"),
+              dict(name="lookup_arm", dataset=mix, planned_tokens=int(steps) * tps, status="planned")]
+    return Preset(model=m, train=t, curriculum=phases, data_scale=base.data_scale, epoch_cap=base.epoch_cap,
+                  rebalance_to=base.rebalance_to,
+                  init_from={"repo": repo or base.hf_repo, "prefix": source,
+                             "path": f"checkpoints/step_{int(start_step):08d}.safetensors",
+                             "step": int(start_step), "seed_offset": int(seed_offset), "tokens_per_step": int(tps)})

@@ -153,6 +153,21 @@ class AlephLM(nn.Module):
         if self.fusion is not None:
             assert self.fusion.k_lo + self.fusion.k_hi <= cfg.n_layers, \
                 "fusion: k_lo + k_hi must not exceed n_layers"
+        # the lookup arm (0.10.15): zero-born softmax attention AFTER each named block, outside the hubs' address
+        # reads. Born null by WEIGHT (the output projection at zero), never by a gate: the trunk's function is
+        # untouched at step 0 and the arm is removable (its keys are a subset of the state dict).
+        sites = tuple(int(s) for s in (getattr(cfg, "lookup_arm_sites", ()) or ()))
+        assert all(0 <= s < cfg.n_layers for s in sites), f"lookup_arm_sites outside the stack: {sites}"
+        assert not (sites and self.fusion is not None), "lookup arms: the byte trunk only (no fusion)"
+        self.lookup_sites = sites
+        self.lookup_norms = nn.ModuleDict({str(s): nn.LayerNorm(cfg.d_model) for s in sites})
+        self.lookup_arms = nn.ModuleDict({str(s): CausalSDPA(cfg.d_model, cfg.n_heads,
+                                                             qk_norm=getattr(cfg, "qk_norm", ""),
+                                                             attn_fp32=getattr(cfg, "attn_fp32", False),
+                                                             attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
+                                          for s in sites})
+        for arm in self.lookup_arms.values():
+            nn.init.zeros_(arm.o.weight)
 
     def _ranges(self):
         L = len(self.blocks)
@@ -161,8 +176,11 @@ class AlephLM(nn.Module):
 
     def _trunk(self, x, idx, disable_bank=False, disable_hub=False):
         if self.fusion is None:
-            for b in self.blocks:
+            arms = getattr(self, "lookup_arms", None)
+            for i, b in enumerate(self.blocks):
                 x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
+                if arms and str(i) in arms:          # the lookup arm reads the block's output, writes to the stream
+                    x = x + arms[str(i)](self.lookup_norms[str(i)](x))
             return x
         front, middle, back = self._ranges()
         plan = self.fusion.plan(idx)
@@ -241,6 +259,7 @@ class AlephLM(nn.Module):
         The cache carries per-layer attention state, the trigram history
         bytes, and the absolute position cursor."""
         self.eval()
+        assert not getattr(self, "lookup_sites", ()), "decode with lookup arms: owed (0.10.15 trains and scores them; forward only)"
         if self.fusion is not None:
             return self._prefill_fused(idx)
         from .embedding import PAD_ROW

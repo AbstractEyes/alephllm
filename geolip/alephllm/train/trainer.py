@@ -35,7 +35,7 @@ from ..eval.canaries import canary_eval
 from . import instruments
 from .checkpoint import HubSync
 from .manifest import RunManifest
-from .optim import build_optimizers, apply_lr
+from .optim import build_optimizers, apply_lr, freeze_except
 from .guards import GuardConfig, GuardCore
 from .arms import trunk_state_dict
 from .precision import autocast
@@ -153,9 +153,15 @@ class Trainer:
             self.raw_model.head.proj.weight.requires_grad_(False)
             self.raw_model.head.addr.codebook.requires_grad_(False)
             print("[head] address frozen (proj + codebook) — W_s trains")
+        arm = tuple(getattr(self.tc, "arm_params", ()) or ())
+        if arm:
+            # 0.10.15: an arm trains alone (the trunk frozen, the shipped weights untouched) under pure Adam
+            n_train, n_all = freeze_except(self.raw_model, arm)
+            print(f"[arm] {n_train:,} of {n_all:,} parameters train under {list(arm)} (pure Adam, lr "
+                  f"{self.tc.adam_lr}); the rest frozen", flush=True)
         self.optimizers = build_optimizers(
             self.raw_model, self.tc.muon_lr, self.tc.muon_momentum,
-            self.tc.adam_lr)
+            self.tc.adam_lr, adam_prefixes=arm)
         self.base_lrs = [self.tc.muon_lr, self.tc.adam_lr]
         # the trunk's own parameters, fixed at birth: the clip and the
         # abstention-chunk graph boundary read this list, never the model's
@@ -322,7 +328,8 @@ class Trainer:
         sd = {k: v.to(torch.float32) for k, v in load_file(path).items()}
         res = self.raw_model.load_state_dict(sd, strict=False)
         guards = {n for n, _ in self.raw_model.named_parameters()
-                  if n.endswith((".q_gain", ".k_gain"))}
+                  if n.endswith((".q_gain", ".k_gain"))
+                  or n.startswith(("lookup_arms.", "lookup_norms."))}   # 0.10.15: a lookup arm is born here
         bad = [k for k in res.missing_keys if k not in guards]
         if bad or res.unexpected_keys:
             raise RuntimeError(
