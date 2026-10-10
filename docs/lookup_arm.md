@@ -39,3 +39,11 @@ Decode with arms is not implemented yet (`prefill` refuses); training and scorin
 "twin" (the fp16 softmax twin from its own checkpoints) or "2s" (the splat 2s); `kind` "ctrl", "rows" (the far-recall
 rows at 5% in place of fineweb text), "rows-copy" (the rows plus the copy-weighted loss) or "depth" (the
 depth-weighted loss, twin side only). The rows kinds must start inside the fineweb phase (start_step <= 18,219).
+
+## Continuing a trained arm
+
+A second run of `steps` more continues from the arm craft's own checkpoint under a new name, a weights-only start whose source
+already carries the arm (no missing keys; fresh optimizer moments): `make_v3_lookup_arm_preset(sites, steps, start_step=<the arm's
+step>, source="mini-beatrix-3-la2-6-12-20", name="mini-beatrix-3-la2-6-12-20-c<step // 1000>k")`. The notebook's `CONTINUE_FROM =
+(step, craft)` does exactly this; its preflight then expects no missing keys and reports the arm's effect on a batch instead of the
+birth identity.
