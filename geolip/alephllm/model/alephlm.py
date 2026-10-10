@@ -32,6 +32,48 @@ from .attention import CausalSDPA, CausalSplatHUB
 from .bank import AnchoredBank
 from .embedding import TrigramByteEmbedding, TokenEmbedding
 from .head import DualHead
+
+
+# ---------------------------------------------------------------- the loss forms (0.10.14; the byte levers)
+def depth_nll(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """(N, 256) logits, (N,) targets in 0..255 -> (N, 8): the conditional NLL in nats of each bit of the target byte given
+    its higher bits, most significant first. The eight sum to the byte's NLL exactly (a telescoping identity)."""
+    lp = logits.log_softmax(-1)
+    N = lp.shape[0]
+    ids = torch.arange(256, device=lp.device)
+    prev = torch.zeros(N, device=lp.device, dtype=lp.dtype)          # log mass of the true prefix at depth k-1 (log 1 = 0)
+    out = []
+    for k in range(1, 9):
+        g = (ids >> (8 - k)).expand(N, 256)
+        mass = torch.zeros(N, 2 ** k, device=lp.device, dtype=lp.dtype).scatter_add_(1, g, lp.exp())
+        cur = mass.gather(1, (targets >> (8 - k))[:, None])[:, 0].clamp_min(1e-30).log()
+        out.append(prev - cur)
+        prev = cur
+    return torch.stack(out, 1)
+
+
+def copy_mask(idx: torch.Tensor, targets: torch.Tensor, m: int = 4, D: int = 256) -> torch.Tensor:
+    """(B, L) inputs and (B, L) pre-shifted targets -> (B, L) bool: the target byte is COPY-RIGHT, i.e. the m-gram of inputs
+    ending at its position occurred at least D positions earlier in the same row followed by the same byte. Exact (a hash
+    of the m-gram, then the equality of the hash and the follower); one (L, L) comparison per row."""
+    B, L = idx.shape
+    x = idx.to(torch.int64)
+    y = targets.to(torch.int64)
+    h = torch.zeros_like(x)
+    valid = torch.ones_like(x, dtype=torch.bool)
+    for i in range(m):
+        sh = torch.zeros_like(x) if i == 0 else torch.cat([torch.zeros_like(x[:, :i]), x[:, :-i]], 1)
+        h = h * 1000003 + (x if i == 0 else sh) + 1
+        if i:
+            valid[:, :i] = False
+    valid &= (y >= 0)
+    pos = torch.arange(L, device=idx.device)
+    far = (pos[:, None] - pos[None, :]) >= D                            # (t, s): s at least D before t
+    out = torch.zeros(B, L, dtype=torch.bool, device=idx.device)
+    for b in range(B):
+        eq = (h[b][:, None] == h[b][None, :]) & (y[b][:, None] == y[b][None, :]) & far & valid[b][None, :] & valid[b][:, None]
+        out[b] = eq.any(-1)
+    return out
 # model/fusion.py is imported lazily (only when a config asks for fusion),
 # so a vendored copy of this file without it keeps loading unfused crafts.
 
@@ -153,9 +195,7 @@ class AlephLM(nn.Module):
         h = self.nf(x)
         logits = self.head(h, disable_aleph=disable_head_aleph)
         if targets is not None:                     # pre-shifted (ours)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(),
-                targets.reshape(-1), ignore_index=-100)
+            loss = self._loss(logits, targets, idx)
         elif labels is not None:                    # HF: shift internally
             loss = F.cross_entropy(
                 logits[:, :-1].reshape(-1, logits.shape[-1]).float(),
@@ -163,6 +203,36 @@ class AlephLM(nn.Module):
         else:
             return LMOutput(logits, None)
         return LMOutput(logits, loss)
+
+    # ---------------------------------------------------- the loss forms (0.10.14; the byte levers)
+    # Training settings carried on the model (the trainer sets them from TrainConfig); the defaults are the CE verbatim.
+    # In eval mode every form is the plain CE (the held-out gauge and the health reads never change).
+    loss_form: str = "ce"
+    loss_depth_w: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    loss_copy_beta: float = 0.0
+    loss_copy_m: int = 4
+    loss_copy_D: int = 256
+
+    def _loss(self, logits, targets, idx):
+        lg = logits.reshape(-1, logits.shape[-1]).float()
+        tg = targets.reshape(-1)
+        form = getattr(self, "loss_form", "ce") if self.training else "ce"
+        if form == "ce":
+            return F.cross_entropy(lg, tg, ignore_index=-100)
+        assert form in ("depth", "copy", "depth+copy"), form
+        valid = tg != -100
+        tgc = tg.clamp_min(0)
+        if form in ("depth", "depth+copy"):
+            w8 = torch.as_tensor(tuple(self.loss_depth_w), dtype=lg.dtype, device=lg.device)
+            per = (depth_nll(lg, tgc) * w8).sum(-1)
+        else:
+            per = F.cross_entropy(lg, tgc, reduction="none")
+        wt = valid.to(per.dtype)
+        if form in ("copy", "depth+copy"):
+            assert idx is not None, "the copy-weighted loss needs the input bytes"
+            cm = copy_mask(idx, targets, int(self.loss_copy_m), int(self.loss_copy_D)).reshape(-1)
+            wt = wt * (1.0 + float(self.loss_copy_beta) * cm.to(per.dtype))
+        return (per * wt).sum() / wt.sum().clamp_min(1.0)
 
     # ---------------------------------------------------- incremental decode
     @torch.no_grad()

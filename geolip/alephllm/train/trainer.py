@@ -140,6 +140,12 @@ class Trainer:
             from ..data.special_tokens import assert_unreachable
             assert_unreachable(self.tokenizer)
         self.raw_model = AlephLM(self.cfg).to(self.device)
+        # the loss form (0.10.14; the byte levers): a training setting carried on the model's forward; eval stays on the CE
+        self.raw_model.loss_form = str(getattr(self.tc, "loss_form", "ce"))
+        self.raw_model.loss_depth_w = tuple(float(v) for v in getattr(self.tc, "loss_depth_w", (1.0,) * 8))
+        self.raw_model.loss_copy_beta = float(getattr(self.tc, "loss_copy_beta", 0.0))
+        self.raw_model.loss_copy_m = int(getattr(self.tc, "loss_copy_m", 4))
+        self.raw_model.loss_copy_D = int(getattr(self.tc, "loss_copy_D", 256))
         if getattr(self.tc, "head_addr_frozen", False):
             # post-revival freeze: the burial channel closes structurally;
             # param groups unchanged (Muon skips grad-less params), so

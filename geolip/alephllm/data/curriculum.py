@@ -589,6 +589,7 @@ CORPUS_BYTES = {
     "cosmo-young": INF, "fineweb-good": INF, "fineweb-edu": INF,
     "gutenberg": INF,             # ~18GB raw, ~13GB after the cut
     "wikipedia-en": INF,          # ~19GB of article prose
+    "recall-far-fineweb": INF,    # fineweb-edu rows rendered with a far-recall record (0.10.14)
 }
 MAX_EPOCHS = 4.0                  # audit threshold
 MAX_GENERATOR_SHARE = 0.35        # cap per procedural generator
@@ -709,6 +710,9 @@ CURRICULUM_MIXES.update({
                       ("simple-wiki", 0.15), ("cosmo-young", 0.12),
                       ("wikipedia-en", 0.10), ("tinystories", 0.09),
                       ("recall-synth", 0.03), ("siqa-narrative", 0.01)],
+    # 0.10.14 (the byte levers): fineweb's remainder with one row in twenty carrying a far-recall record (the screen's
+    # data arm; the natural-language ballast rule holds trivially)
+    "fineweb-recall-far-5": [("fineweb-edu", 0.95), ("recall-far-fineweb", 0.05)],
 })
 
 # stage name -> planned tokens (bytes); plan-of-record budgets (the 1x

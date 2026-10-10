@@ -152,10 +152,23 @@ class TrainConfig:
     # autocast with TF32 on (every mission so far); "fp32" = autocast off
     # AND TF32 off (the fp32 twin; train/precision.py).
     precision: str = "bf16"
+    # 0.10.14 (the byte levers): the loss form. "ce" = the cross-entropy verbatim; "depth" = the byte's eight conditional
+    # bit NLLs (MSB first) weighted by loss_depth_w (all ones = the CE exactly); "copy" = the CE with every byte that is
+    # copy-right from an earlier loss_copy_m-gram match at distance >= loss_copy_D weighted 1 + loss_copy_beta (beta 0 =
+    # the CE exactly); "depth+copy" = both. Eval and the health reads stay on the plain CE.
+    loss_form: str = "ce"
+    loss_depth_w: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    loss_copy_beta: float = 0.0
+    loss_copy_m: int = 4
+    loss_copy_D: int = 256
 
     def __post_init__(self):
         if self.precision not in ("bf16", "fp32"):
             raise ValueError(f"TrainConfig.precision must be 'bf16' or 'fp32', got {self.precision!r}")
+        if self.loss_form not in ("ce", "depth", "copy", "depth+copy"):
+            raise ValueError(f"TrainConfig.loss_form must be 'ce', 'depth', 'copy' or 'depth+copy', got {self.loss_form!r}")
+        if len(tuple(self.loss_depth_w)) != 8:
+            raise ValueError("TrainConfig.loss_depth_w needs eight weights (one per bit, MSB first)")
 
 
 # All missions upload to the one training repo, each under its own prefix
@@ -381,7 +394,9 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
                                qk_norm: str = "", attn_fp32: bool = False,
                                source: str = "mini-beatrix-2s-control",
                                seed_offset: int = 7919, micro_batch: int | None = None,
-                               grad_accum: int | None = None, attn_kernel: str = "sdpa") -> Preset:
+                               grad_accum: int | None = None, attn_kernel: str = "sdpa",
+                               extra_train: dict | None = None,
+                               phase_dataset_override: dict | None = None) -> Preset:
     """The 2s softmax twin CONTINUED from its last clean weights: the twin's
     craft and recipe verbatim under a NEW name (its own hub prefix — the
     original run's record stays untouched); a weights-only start from
@@ -415,7 +430,12 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
                                          the -attn-fp16-r10k arm's own checkpoint
                                          at start_step (the stop rule's fallback)
     `source` is a registered craft (its hub repo and prefix) or ANY prefix on
-    the twin's training repo (an arm's own checkpoints)."""
+    the twin's training repo (an arm's own checkpoints).
+    extra_train (0.10.14) sets TrainConfig fields by name (the loss form of
+    the byte levers: {"loss_form": "copy", "loss_copy_beta": 2.0}); an
+    unknown name is refused. phase_dataset_override maps a phase name to
+    another registered dataset or mix ({"fineweb_main": "fineweb-recall-far-5"}:
+    the restarted phase reads the far-recall mix instead of fineweb alone)."""
     from .data.curriculum import curriculum_phases
     base = PRESETS[source] if source in PRESETS else PRESETS["mini-beatrix-2s-control"]
     m = AlephLMConfig.from_dict(base.model.to_dict())
@@ -426,6 +446,11 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
         t.micro_batch = int(micro_batch)
     if grad_accum is not None:
         t.grad_accum = int(grad_accum)
+    for k_, v_ in (extra_train or {}).items():
+        if k_ not in TrainConfig.__dataclass_fields__:
+            raise ValueError(f"extra_train: {k_!r} is not a TrainConfig field")
+        setattr(t, k_, v_)
+    t.__post_init__()
     phases = [
         dict(name="warmup_wikitext", dataset="wikitext-103",
              planned_tokens=300_000_000, status="planned"),
@@ -437,6 +462,12 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
         dict(name="anneal_mix", dataset="anneal-mix",
              planned_tokens=1_000_000_000, status="planned"),
     ]
+    for ph in phases:
+        if ph["name"] in (phase_dataset_override or {}):
+            ph["dataset"] = str(phase_dataset_override[ph["name"]])
+    unknown = set(phase_dataset_override or {}) - {ph["name"] for ph in phases}
+    if unknown:
+        raise ValueError(f"phase_dataset_override names no phase: {sorted(unknown)}")
     # the cursor is set at the RECIPE's step (262,144 tokens), whatever micro-batch a card runs
     tps = base.train.micro_batch * base.train.grad_accum * base.model.context
     assert t.micro_batch * t.grad_accum * m.context == tps, (

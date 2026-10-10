@@ -51,6 +51,10 @@ REGISTRY = {
     "beatrix-texture-sp": dict(path=None, generator="beatrix_sp",
                                ids_rows=True),
     "recall-synth": dict(path=None, generator="recall"),
+    # 0.10.14 (the byte levers): fineweb-edu rows rendered with a planted record and its question at a graded gap (the
+    # held-out head is reserved as for fineweb-edu itself: no val_split -> the head skip applies)
+    "recall-far-fineweb": dict(path="HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", column="text",
+                               columns=["text"], render="recall_far"),
 }
 
 RESERVED_HEAD_ROWS = 2048
@@ -173,7 +177,83 @@ _GENERATORS = {"beatrix": _beatrix_texture_rows,
 # render-fn dispatch: specs name a renderer; curriculum.py registers more.
 # A renderer returning "" REJECTS the row (row-filter); specs that filter
 # aggressively must raise max_empties above the 1000-row circuit breaker.
-_RENDERERS = {"soda": _render_soda}
+# ------------------------------------------------------------------ the far-recall renderer (0.10.14; the byte levers)
+# A fineweb-edu row becomes a document with a planted record near its start and the record's question at a gap sampled
+# log-uniformly between 64 and 2,400 bytes later (a packed stream cuts documents into context+1 blocks, so longer spans
+# would rarely land in one window). The values are high-entropy (random digits, letters or hex of 5-8 symbols: nothing the
+# language predicts), the cue noun varies, and three forms occur: a single record; four locker lines, one asked; a record
+# updated once in between, the later value asked. Deterministic per row (the seed is the row's own bytes), so every epoch,
+# shard and resume renders the same document. Rows under 400 bytes, or without sentence starts where needed, render EMPTY
+# (the stream's row filter drops them).
+_RF_CUES = (("code", "digits"), ("word", "letters"), ("key", "hex"), ("number", "digits"), ("token", "letters"))
+_RF_ALPHABETS = {"digits": "0123456789", "letters": "abcdefghijklmnopqrstuvwxyz", "hex": "0123456789abcdef"}
+RF_GAP_MIN, RF_GAP_MAX, RF_PLANT_MAX = 64, 2400, 500
+
+
+def _rf_sentence_starts(b: bytes) -> list:
+    out, i = [], b.find(b". ")
+    while i != -1:
+        out.append(i + 2)
+        i = b.find(b". ", i + 1)
+    return out
+
+
+def _rf_value(rng, kind: str) -> str:
+    n = int(rng.integers(5, 9))
+    a = _RF_ALPHABETS[kind]
+    v = "".join(a[int(i)] for i in rng.integers(0, len(a), size=n))
+    if kind == "digits" and v[0] == "0":
+        v = str(int(rng.integers(1, 10))) + v[1:]
+    return v
+
+
+def _render_recall_far(row) -> str:
+    import bisect as _bisect
+    import math as _math
+    import zlib as _zlib
+    b = str(row.get("text", "")).encode("utf-8")
+    if len(b) < 400:
+        return ""
+    rng = np.random.default_rng(_zlib.crc32(b[:4096]))
+    starts = _rf_sentence_starts(b)
+    k = _bisect.bisect_left(starts, 200)
+    if k >= len(starts) or starts[k] > RF_PLANT_MAX:
+        return ""
+    p = starts[k]
+    cap = min(RF_GAP_MAX, len(b) - p - 48)
+    if cap <= RF_GAP_MIN:
+        return ""
+    gap = int(round(_math.exp(rng.uniform(_math.log(RF_GAP_MIN), _math.log(cap)))))
+    j = _bisect.bisect_left(starts, p + gap)
+    if j >= len(starts):
+        return ""
+    q = starts[j]
+    cue, kind = _RF_CUES[int(rng.integers(len(_RF_CUES)))]
+    form = ("single", "single", "single", "single", "single", "single", "lockers", "lockers", "update", "update")[int(rng.integers(10))]
+    if form == "single":
+        v = _rf_value(rng, kind)
+        plant = f"The secret {cue} is {v}. ".encode()
+        question = f"The secret {cue} is {v}. ".encode()
+        return (b[:p] + plant + b[p:q] + question + b[q:]).decode("utf-8", errors="replace")
+    if form == "lockers":
+        lockers = [str(int(x)) for x in rng.choice(np.arange(1000, 10000), size=4, replace=False)]
+        vals = [_rf_value(rng, kind) for _ in lockers]
+        plant = "".join(f"Locker {lk} holds {cue} {v}. " for lk, v in zip(lockers, vals)).encode()
+        a = int(rng.integers(4))
+        question = f"Locker {lockers[a]} holds {cue} {vals[a]}. ".encode()
+        return (b[:p] + plant + b[p:q] + question + b[q:]).decode("utf-8", errors="replace")
+    v1, v2 = _rf_value(rng, kind), _rf_value(rng, kind)
+    mids = [s for s in starts if p + 32 <= s <= q - 32]
+    if not mids:
+        return ""
+    m = mids[int(rng.integers(len(mids)))]
+    plant = f"The secret {cue} is {v1}. ".encode()
+    update = f"The secret {cue} is now {v2}. ".encode()
+    question = f"The secret {cue} is {v2}. ".encode()
+    return (b[:p] + plant + b[p:m] + update + b[m:q] + question + b[q:]).decode("utf-8", errors="replace")
+
+
+_RENDERERS = {"soda": _render_soda, "recall_far": _render_recall_far}
 
 # stage recipes registered by curriculum.py: {"curriculum-s0": [(name, w)...]}
 CURRICULUM_MIXES: dict[str, list] = {}
