@@ -604,6 +604,11 @@ class Trainer:
         print(f"[train] phase '{phase['name']}' on {phase['dataset']} · "
               f"{tokens_per_step:,} tokens/step · device {self.device}"
               + (f" · {self.world} cards (rank {self.rank})" if self.world > 1 else ""))
+        if self.is_main:
+            from ..model.attention import attention_kernel_label
+            label = attention_kernel_label(self.raw_model, getattr(tc, "precision", "bf16"))
+            if label:
+                print(f"[attn] {label}", flush=True)
         mult = self._phase_mult(phase["name"])
         if self.arms is not None:
             self.arms.sync(phase["name"])

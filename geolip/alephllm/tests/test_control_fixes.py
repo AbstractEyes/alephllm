@@ -18,6 +18,10 @@ Cases:
     dict round trip, the two fp32-attention arms under bf16 carry "flex" and the others "sdpa", off a card the flex block
     IS the sdpa block, a dead kernel falls back to sdpa; on a card (skipped without one, or when the kernel will not build):
     the fused kernel's forward and gradients agree with fp32 sdpa and the eval path stays on sdpa bit for bit
+  10 attn_kernel "fp16": accepted, off a card the block is the sdpa block, the two fp16 arms carry it, the trainer's kernel
+    label names it; on a card: forward and gradient within 1e-2 of fp32 sdpa, a loss scaled down by 1e-6 (gradients under
+    fp16's floor) still yields gradients within 1e-2 of fp32's, a sink key attended by every query yields finite gradients
+    within 2e-2 of fp32's, and the eval path stays on sdpa bit for bit
 """
 from __future__ import annotations
 
@@ -177,7 +181,7 @@ def case_5():
 
 
 def case_6():
-    check("6 the five arms registered", len(CONTROL_RESUME_ARMS) == 5 and all(n in PRESETS for n in CONTROL_RESUME_ARMS),
+    check("6 the seven arms registered", len(CONTROL_RESUME_ARMS) == 7 and all(n in PRESETS for n in CONTROL_RESUME_ARMS),
           ", ".join(CONTROL_RESUME_ARMS))
     fx, f32 = PRESETS["mini-beatrix-2s-control-fix"], PRESETS["mini-beatrix-2s-control-fp32"]
     b16, ff = PRESETS["mini-beatrix-2s-control-bf16"], PRESETS["mini-beatrix-2s-control-fp32-fix"]
@@ -320,9 +324,10 @@ def case_9():
     check("9 the kernel survives the dict round trip", AlephLMConfig.from_dict(cfg.to_dict()).attn_kernel == "flex")
     arms = {k: make_control_resume_preset(k, **v).model.attn_kernel for k, v in CONTROL_RESUME_ARMS.items()}
     want = {"mini-beatrix-2s-control-bf16": "sdpa", "mini-beatrix-2s-control-fp32": "sdpa",
-            "mini-beatrix-2s-control-attn": "flex", "mini-beatrix-2s-control-fix": "flex",
-            "mini-beatrix-2s-control-fp32-fix": "sdpa"}
-    check("9 the fp32-attention arms under bf16 carry flex, the others sdpa", arms == want, str(arms))
+            "mini-beatrix-2s-control-attn": "sdpa", "mini-beatrix-2s-control-fix": "sdpa",
+            "mini-beatrix-2s-control-fp32-fix": "sdpa", "mini-beatrix-2s-control-attn-fp16": "fp16",
+            "mini-beatrix-2s-control-fix-fp16": "fp16"}
+    check("9 the fp16 arms carry fp16 flash, every other arm sdpa", arms == want, str(arms))
     q = torch.randn(1, 4, 32, 16)
     k, v = torch.randn_like(q), torch.randn_like(q)
     saved = A._FLEX["dead"]
@@ -356,8 +361,71 @@ def case_9():
         check("9 the eval path stays on sdpa bit for bit", torch.equal(ref(xr), flx(xr)))
 
 
+def case_10():
+    from ..model import attention as A
+    torch.manual_seed(10)
+    a, b = CausalSDPA(64, 4), CausalSDPA(64, 4, attn_kernel="fp16")
+    _same_weights(a, b)
+    a.train(); b.train()
+    x = torch.randn(2, 64, 64)
+    check("10 fp16 accepted; off a card the fp16 block is the sdpa block", b.attn_kernel == "fp16" and torch.equal(a(x), b(x)))
+    cfg = AlephLMConfig.from_dict({**TINY.to_dict(), "name": "tiny-fp16", "attn_fp32": True, "attn_kernel": "fp16"})
+    m = AlephLM(cfg)
+    lab = A.attention_kernel_label(m, "bf16")
+    check("10 the trainer's kernel label names fp16 flash", lab is not None and lab.startswith("fp16 flash"), str(lab))
+    check("10 the label for the plain twin names bf16 flash",
+          A.attention_kernel_label(AlephLM(TINY), "bf16").startswith("bf16 sdpa under autocast"))
+    if not torch.cuda.is_available():
+        print("SKIP 10 fp16 flash on a card (no CUDA here)", flush=True)
+        return
+    ref, f16 = CausalSDPA(64, 4, attn_fp32=True).cuda(), CausalSDPA(64, 4, attn_fp32=True, attn_kernel="fp16").cuda()
+    _same_weights(ref, f16)
+    ref.train(); f16.train()
+
+    def grads(blk, xin, loss_scale=1.0):
+        xx = xin.detach().clone().requires_grad_(True)
+        blk.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            y = blk(xx)
+        (y.square().mean() * loss_scale).backward()
+        return y.detach(), xx.grad.detach().clone(), blk.qkv.weight.grad.detach().clone()
+
+    def rel(u, v):
+        return float((u - v).abs().max() / v.abs().max().clamp_min(1e-30))
+
+    xr = torch.randn(2, 256, 64, device="cuda")
+    y1, gx1, gw1 = grads(ref, xr)
+    y2, gx2, gw2 = grads(f16, xr)
+    check("10 fp16 flash forward within 1e-2 of fp32 sdpa", rel(y2, y1) < 1e-2, f"{rel(y2, y1):.2e}")
+    check("10 fp16 flash gradients within 1e-2 of fp32 sdpa (input, qkv)", rel(gx2, gx1) < 1e-2 and rel(gw2, gw1) < 1e-2,
+          f"{rel(gx2, gx1):.2e} {rel(gw2, gw1):.2e}")
+    _, gx1s, gw1s = grads(ref, xr, 1e-6)
+    _, gx2s, gw2s = grads(f16, xr, 1e-6)
+    check("10 a loss scaled by 1e-6 (gradients under fp16's floor) still matches fp32 within 1e-2",
+          rel(gx2s, gx1s) < 1e-2 and rel(gw2s, gw1s) < 1e-2 and float(gx2s.abs().max()) > 0,
+          f"{rel(gx2s, gx1s):.2e} {rel(gw2s, gw1s):.2e} max {float(gx2s.abs().max()):.2e}")
+    # a sink: the first position's key aligned with every query (the first run's twin relies on such keys); every query's
+    # gradient then lands on one key's v — the overflow case for an unscaled fp16 backward
+    with torch.no_grad():
+        for blk in (ref, f16):
+            blk.qkv.weight.zero_()
+            blk.qkv.weight[:64, :64] = torch.eye(64, device="cuda") * 4.0      # q = 4 x
+            blk.qkv.weight[64:128, :64] = torch.eye(64, device="cuda") * 4.0   # k = 4 x
+            blk.qkv.weight[128:, :64] = torch.eye(64, device="cuda")           # v = x
+    xs = torch.randn(1, 256, 64, device="cuda") * 0.1
+    xs[:, 0] = 3.0                                                              # one key every query agrees with
+    y1, gx1, gw1 = grads(ref, xs)
+    y2, gx2, gw2 = grads(f16, xs)
+    check("10 the sink case: finite gradients within 2e-2 of fp32's",
+          bool(torch.isfinite(gx2).all() & torch.isfinite(gw2).all()) and rel(gx2, gx1) < 2e-2 and rel(gw2, gw1) < 2e-2,
+          f"{rel(gx2, gx1):.2e} {rel(gw2, gw1):.2e}")
+    ref.eval(); f16.eval()
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        check("10 the eval path stays on sdpa bit for bit", torch.equal(ref(xs), f16(xs)))
+
+
 def main():
-    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9):
+    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9, case_10):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — a case's crash is a FAIL row, the rest still run

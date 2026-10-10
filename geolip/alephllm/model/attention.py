@@ -69,6 +69,53 @@ def _flex(q, k, v):
         return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 
+class _Fp16Flash(torch.autograd.Function):
+    """fp16 flash attention inside the fp32 attention block (attn_kernel =
+    "fp16"). q, k, v arrive in fp32 and are cast to fp16 (10 mantissa bits,
+    against bf16's 7); the fused flash kernel forms the logits and the
+    softmax in fp32 and takes the P.V product with P in fp16; the output
+    returns in fp32. The backward is flash's fp16 backward on a SCALED
+    upstream gradient: fp16 keeps full precision only above 6e-5 and
+    nothing below 6e-8, while a mean-reduced loss sends per-element
+    gradients around 1e-5 and lower. The scale is a power of two chosen
+    per call from the gradient's own maximum (the largest element lands
+    near 2^10), undone in fp32 afterwards; a result that overflows (a sink
+    key gathers the gradient of every query) is detected and recomputed at
+    a smaller scale. Costs one extra fp16 forward (the recomputation)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v):
+        q16, k16, v16 = q.half(), k.half(), v.half()
+        y16 = F.scaled_dot_product_attention(q16, k16, v16, is_causal=True)
+        ctx.save_for_backward(q16, k16, v16)
+        return y16.float()
+
+    @staticmethod
+    def backward(ctx, dy):
+        q16, k16, v16 = ctx.saved_tensors
+        amax = dy.detach().abs().amax().float().clamp_min(1e-30)
+        scale = torch.exp2(torch.floor(torch.log2(torch.clamp(1024.0 / amax, 2.0 ** -4, 2.0 ** 24))))
+        for _ in range(8):
+            with torch.enable_grad():
+                q_, k_, v_ = (t.detach().requires_grad_(True) for t in (q16, k16, v16))
+                y16 = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
+                gq, gk, gv = torch.autograd.grad(y16, (q_, k_, v_), (dy * scale).half())
+            if bool(torch.isfinite(gq).all() & torch.isfinite(gk).all() & torch.isfinite(gv).all()):
+                break
+            scale = scale * (2.0 ** -4)
+        inv = 1.0 / scale
+        return gq.float() * inv, gk.float() * inv, gv.float() * inv
+
+
+def attention_kernel_label(model, precision: str = "bf16"):
+    """One line naming the attention kernel the first CausalSDPA block of
+    `model` runs in the training forward on a card; None without one."""
+    for m in model.modules():
+        if isinstance(m, CausalSDPA):
+            return m.kernel_label(precision)
+    return None
+
+
 def _rms_normalize(t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """RMS-normalize the last dim; the statistic in fp32, the dtype kept."""
     inv = torch.rsqrt(t.float().pow(2).mean(dim=-1, keepdim=True) + eps)
@@ -86,9 +133,10 @@ class CausalSDPA(nn.Module):
       attn_fp32      under autocast the whole block (projections, logits,
                      softmax, PV, output) runs with autocast disabled, in
                      fp32 (TF32 per the global flag); a no-op otherwise.
-      attn_kernel    "sdpa" (the default) or "flex": the training forward
-                     on a card runs the fused flex kernel (_flex); eval,
-                     census and decode keep sdpa.
+      attn_kernel    "sdpa" (the default), "flex" or "fp16": the training
+                     forward on a card runs the fused flex kernel (_flex)
+                     or fp16 flash with the scaled backward (_Fp16Flash);
+                     eval, census and decode keep sdpa.
     With all three at their defaults this is the 2s form bit for bit (the
     same code path)."""
 
@@ -97,7 +145,7 @@ class CausalSDPA(nn.Module):
         super().__init__()
         assert d % heads == 0
         assert qk_norm in ("", "rms"), f"qk_norm: '' or 'rms', got {qk_norm!r}"
-        assert attn_kernel in ("sdpa", "flex"), f"attn_kernel: 'sdpa' or 'flex', got {attn_kernel!r}"
+        assert attn_kernel in ("sdpa", "flex", "fp16"), f"attn_kernel: 'sdpa', 'flex' or 'fp16', got {attn_kernel!r}"
         self.h = heads
         self.qk_norm, self.attn_fp32, self.attn_kernel = qk_norm, bool(attn_fp32), attn_kernel
         self.qkv = nn.Linear(d, 3 * d, bias=False)
@@ -112,6 +160,24 @@ class CausalSDPA(nn.Module):
     def extra_repr(self) -> str:
         return (f"heads={self.h}, qk_norm={self.qk_norm!r}, attn_fp32={self.attn_fp32}, "
                 f"attn_kernel={self.attn_kernel!r}")
+
+    def kernel_label(self, precision: str = "bf16") -> str:
+        """The attention kernel this block runs in the training forward on
+        a card under the trainer's precision (printed at the start)."""
+        if precision == "fp32":
+            if self.attn_kernel == "flex":
+                return "fused flex attention, fp32 inputs, ieee products, fp32 softmax"
+            return "fp32 sdpa with autocast off (the memory-efficient fp32 kernel, ieee products)"
+        if not self.attn_fp32:
+            return "bf16 sdpa under autocast (flash: bf16 inputs and P, fp32 softmax inside the kernel)"
+        if self.attn_kernel == "flex":
+            return ("fused flex attention on fp32 inputs, TF32 products, fp32 softmax "
+                    "(the first batch prints its deviation from sdpa)")
+        if self.attn_kernel == "fp16":
+            return ("fp16 flash inside the fp32 block: 10-bit inputs and P, fp32 softmax inside the kernel, "
+                    "the backward on a per-call scaled gradient; projections fp32 (TF32)")
+        return ("fp32 sdpa under bf16 autocast (the memory-efficient fp32 kernel: no fused form, "
+                "TF32 per the global flag); projections fp32")
 
     # ------------------------------------------------------------ pieces
     def _split(self, x, n):
@@ -136,6 +202,9 @@ class CausalSDPA(nn.Module):
         if (self.attn_kernel == "flex" and self.training and torch.is_grad_enabled()
                 and q.is_cuda):
             y = _flex(q, k, v)
+        elif (self.attn_kernel == "fp16" and self.training and torch.is_grad_enabled()
+                and q.is_cuda and q.dtype == torch.float32):
+            y = _Fp16Flash.apply(q, k, v)
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).reshape(B, n, d))

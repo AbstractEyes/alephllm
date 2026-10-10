@@ -1,4 +1,4 @@
-# The control twin, continued: the softmax guards and the weights-only start (0.10.9; the fused fp32-attention kernel 0.10.11)
+# The control twin, continued: the softmax guards and the weights-only start (0.10.9; the fused kernel 0.10.11; fp16 flash in the fp32 block 0.10.12)
 
 `mini-beatrix-2s-control` is the pure-softmax twin of the full-splat `mini-beatrix-2s` craft (d1024, 20 blocks, 16 heads,
 ctx 4096, byte-trigram; the same anchored banks, dual head, Muon + Adam split, the same curriculum). Its first run destabilized
@@ -16,7 +16,7 @@ original run's record untouched.
 |---|---|---|
 | `AlephLMConfig.qk_norm` | `""` (default) or `"rms"` | per-head RMS normalization of q and k over the head dimension, with learned per-head per-channel gains (init 1); applies to `CausalSDPA` blocks |
 | `AlephLMConfig.attn_fp32` | `False` (default) or `True` | under bf16 autocast a `CausalSDPA` block runs with autocast disabled: fp32 projections, logits, softmax, PV product and output (TF32 as the global flag says); a no-op without autocast |
-| `AlephLMConfig.attn_kernel` | `"sdpa"` (default) or `"flex"` | the training forward of a `CausalSDPA` block on a card runs torch's fused flex attention, compiled once per process (the section below); eval, census and decode stay on sdpa; a kernel that will not build falls back to sdpa with one printed line |
+| `AlephLMConfig.attn_kernel` | `"sdpa"` (default), `"flex"` or `"fp16"` | the training forward of a `CausalSDPA` block on a card runs torch's fused flex attention (compiled once per process; measured at no gain on an H100) or fp16 flash with a scaled backward (the sections below); eval, census and decode stay on sdpa; a flex kernel that will not build falls back to sdpa with one printed line |
 | `TrainConfig.precision` | `"bf16"` (default) or `"fp32"` | `bf16` = fp32 masters under bf16 autocast with TF32 on (every mission so far); `fp32` = autocast off and TF32 off everywhere |
 | `Preset.init_from` | `None` (default) or a spec | a weights-only start from another run's shipped checkpoint (below) |
 
@@ -35,9 +35,11 @@ step) under a new name and a chronological phase list (warmup, fineweb_main, S0-
 |---|---|---|---|---|---|
 | `mini-beatrix-2s-control-bf16` | bf16 | off | off | 16 × 4 | the control: the restart alone must be able to fail as the first run did |
 | `mini-beatrix-2s-control-fp32` | fp32 | (everything fp32) | off | 4 × 16 | precision as the single variable |
-| `mini-beatrix-2s-control-attn` | bf16 | on | off | 8 × 8 | fp32 attention alone: no insertion cost, the first run's precision elsewhere; the fused kernel (0.10.11) |
-| `mini-beatrix-2s-control-fix` | bf16 | on | rms | 8 × 8 | the guards under the first run's precision elsewhere; the fused kernel (0.10.11) |
+| `mini-beatrix-2s-control-attn` | bf16 | on | off | 8 × 8 | fp32 attention alone: no insertion cost, the first run's precision elsewhere |
+| `mini-beatrix-2s-control-fix` | bf16 | on | rms | 8 × 8 | the guards under the first run's precision elsewhere |
 | `mini-beatrix-2s-control-fp32-fix` | fp32 | (everything fp32) | rms | 4 × 16 | both |
+| `mini-beatrix-2s-control-attn-fp16` | bf16 | on, fp16 flash | off | 8 × 8 | 10-bit attention inputs and P with the fp32 softmax, at flash pace (0.10.12) |
+| `mini-beatrix-2s-control-fix-fp16` | bf16 | on, fp16 flash | rms | 8 × 8 | the same with QK-norm |
 
 Every arm trains the recipe's 262,144-token step; the factory refuses a micro-batch that breaks it. The fp32 forms hold more
 activation memory at the same tokens (the fp32 attention tensors, or everything under full fp32), so they run smaller
@@ -137,6 +139,28 @@ Under the bf16-precision arms the attention products are therefore TF32, not ful
 fp32's 23, with the softmax in fp32. The `-fp32` and `-fp32-fix` arms keep ieee products throughout (TF32 off) and stay on the
 default sdpa kernel.
 
+**Measured on an H100 (2026-10-09, the `-attn` arm at 8 × 8): 7.28 s a step with the fused kernel against 7.2 s with fp32
+sdpa — no gain.** On the 4090 at 8 rows the fused kernel's default tiles gave 1.29x over fp32 sdpa (72.7 against 94.0 ms for
+one block's forward + backward) and torch's autotune of the tiles (`mode="max-autotune-no-cudagraphs"`) 1.0x (95.6 ms): the
+fp32 flex backward is tile-bound at every setting tried. The fused kernel stays available through `attn_kernel="flex"` but
+no registered arm carries it from 0.10.12 on; `-attn` and `-fix` are back on fp32 sdpa, the full-precision form at its price.
+
+## fp16 flash inside the fp32 block (0.10.12)
+
+`attn_kernel="fp16"` keeps the block's projections in fp32 (TF32 per the global flag) and runs the attention itself through
+fp16 flash: q, k and v are cast to fp16 (10 mantissa bits, against bf16's 7 and fp32's 23), the fused kernel forms the
+logits and the softmax in fp32 and takes the P·V product with P in fp16, and the output returns in fp32. The precision class
+is the fused kernel's TF32 class (10 bits in, fp32 softmax) at flash pace: the kernel the first run used, so the step costs
+about the control's plus the fp32 projections and one extra fp16 forward per block.
+
+The backward is where fp16 differs from TF32: fp16 keeps full precision only above 6e-5 and nothing below 6e-8, and a
+mean-reduced loss sends per-element gradients around 1e-5 and lower. The block therefore runs flash's fp16 backward on a
+SCALED upstream gradient: a power of two chosen per call from the gradient's own maximum (the largest element lands near
+2^10), undone in fp32 afterwards. A sink key attended by every query gathers the gradient of every query into one dv and can
+overflow fp16 even so; the result is checked and recomputed at a smaller scale when it does (eight halvings by 16 at most).
+The recomputation of the forward inside the backward costs one fp16 flash forward per block. Eval, the census and decode stay
+on fp32 sdpa, as for the fused kernel. The trainer prints the kernel it runs (`[attn] ...`) at the start of every session.
+
 ## The tests
 
 `python -m geolip.alephllm.tests.test_control_fixes` (CPU, seconds, no download): the guards-off identity; QK-norm shapes,
@@ -144,8 +168,9 @@ causality, unit RMS, decode parity; the gain install's formula and its logit-sca
 config refusals; the cursor rule against every boundary of the first run's schedule; the four arms and the twin's isolation;
 the weights-only start on a tiny craft end to end (cursor, weights, gains, seed, fresh optimizers, two steps, the final
 checkpoint, the hand-off to a normal resume); the kernel switch's plumbing (the default, the refusal, every block, the dict
-round trip, the arms, the dead-kernel fallback); and, on a card, the fp32-attention path under autocast and the fused
-kernel's forward and gradient parity with the eval path on sdpa bit for bit. The full smoke array (`tests.smoke`) passes
+round trip, the arms, the dead-kernel fallback); the fp16 form's plumbing and the trainer's kernel label; and, on a card,
+the fp32-attention path under autocast, the fused kernel's forward and gradient parity, the fp16 form's parity (plain, under
+a 1e-6 loss scale, and with a sink key) with the eval path on sdpa bit for bit. The full smoke array (`tests.smoke`) passes
 unchanged.
 
 ## The notebook

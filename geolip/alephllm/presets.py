@@ -77,11 +77,13 @@ class AlephLMConfig:
     #             flag says) — a no-op without autocast
     qk_norm: str = ""
     attn_fp32: bool = False
-    #   attn_kernel "sdpa" (the default) or "flex": the training forward of a
-    #               sdpa block runs torch's fused flex attention (compiled
-    #               once) — for fp32 attention it is the only fused kernel
-    #               (TF32 products when TF32 is on, ieee when off); eval,
-    #               census and decode keep sdpa
+    #   attn_kernel "sdpa" (the default), "flex" or "fp16": the training
+    #               forward of a sdpa block runs torch's fused flex attention
+    #               (compiled once; TF32 products when TF32 is on, ieee when
+    #               off — measured at no gain over fp32 sdpa on an H100) or
+    #               fp16 flash with a scaled backward (10-bit inputs and P,
+    #               fp32 softmax, flash pace); eval, census and decode keep
+    #               sdpa
     attn_kernel: str = "sdpa"
 
     def to_dict(self):
@@ -402,9 +404,12 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
     The registered arms (CONTROL_RESUME_ARMS):
       mini-beatrix-2s-control-bf16       the restart alone (the control)        16 x 4
       mini-beatrix-2s-control-fp32       arm A: full fp32                        4 x 16
-      mini-beatrix-2s-control-attn       fp32 attention alone, bf16 elsewhere    8 x 8  (flex kernel)
-      mini-beatrix-2s-control-fix        fp32 attention + QK-norm, bf16 elsewhere 8 x 8  (flex kernel)
-      mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm                     4 x 16"""
+      mini-beatrix-2s-control-attn       fp32 attention alone, bf16 elsewhere    8 x 8
+      mini-beatrix-2s-control-fix        fp32 attention + QK-norm, bf16 elsewhere 8 x 8
+      mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm                     4 x 16
+      mini-beatrix-2s-control-attn-fp16  fp16 flash in the fp32 block (10-bit),  8 x 8
+                                         bf16 elsewhere
+      mini-beatrix-2s-control-fix-fp16   the same + QK-norm                      8 x 8"""
     from .data.curriculum import curriculum_phases
     base = PRESETS[source]
     m = AlephLMConfig.from_dict(base.model.to_dict())
@@ -441,10 +446,13 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
 CONTROL_RESUME_ARMS = {
     "mini-beatrix-2s-control-bf16": dict(precision="bf16"),
     "mini-beatrix-2s-control-fp32": dict(precision="fp32", micro_batch=4, grad_accum=16),
-    "mini-beatrix-2s-control-attn": dict(precision="bf16", attn_fp32=True, micro_batch=8, grad_accum=8, attn_kernel="flex"),
-    "mini-beatrix-2s-control-fix": dict(precision="bf16", qk_norm="rms", attn_fp32=True, micro_batch=8, grad_accum=8,
-                                        attn_kernel="flex"),
+    "mini-beatrix-2s-control-attn": dict(precision="bf16", attn_fp32=True, micro_batch=8, grad_accum=8),
+    "mini-beatrix-2s-control-fix": dict(precision="bf16", qk_norm="rms", attn_fp32=True, micro_batch=8, grad_accum=8),
     "mini-beatrix-2s-control-fp32-fix": dict(precision="fp32", qk_norm="rms", micro_batch=4, grad_accum=16),
+    "mini-beatrix-2s-control-attn-fp16": dict(precision="bf16", attn_fp32=True, attn_kernel="fp16",
+                                              micro_batch=8, grad_accum=8),
+    "mini-beatrix-2s-control-fix-fp16": dict(precision="bf16", qk_norm="rms", attn_fp32=True, attn_kernel="fp16",
+                                             micro_batch=8, grad_accum=8),
 }
 try:
     for _n, _kw in CONTROL_RESUME_ARMS.items():
