@@ -24,6 +24,14 @@ from .address import AlephAddress, dtype_floor
 
 
 _FLEX = {"fn": {}, "masks": {}, "dead": None, "checked": False}
+_FP16 = {"calls": 0, "retries": 0, "fallbacks": 0}
+
+
+def fp16_kernel_stats() -> dict:
+    """The fp16 kernel's counters for this process: calls; backward retries
+    (the gradient scale lowered after an overflow); fp32 fallbacks (a
+    forward overflow, that call run in fp32 sdpa)."""
+    return dict(_FP16)
 
 
 def _flex(q, k, v):
@@ -85,23 +93,40 @@ class _Fp16Flash(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v):
+        _FP16["calls"] += 1
         q16, k16, v16 = q.half(), k.half(), v.half()
         y16 = F.scaled_dot_product_attention(q16, k16, v16, is_causal=True)
-        ctx.save_for_backward(q16, k16, v16)
-        return y16.float()
+        if bool(torch.isfinite(y16).all()):
+            ctx.fallback = False
+            ctx.save_for_backward(q16, k16, v16)
+            return y16.float()
+        # a forward overflow (an input past fp16's 65,504, or a non-finite
+        # input): this call runs in fp32 sdpa, forward and backward, counted
+        _FP16["fallbacks"] += 1
+        ctx.fallback = True
+        ctx.save_for_backward(q, k, v)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     @staticmethod
     def backward(ctx, dy):
+        if ctx.fallback:
+            q, k, v = ctx.saved_tensors
+            with torch.enable_grad():
+                q_, k_, v_ = (t.detach().requires_grad_(True) for t in (q, k, v))
+                y = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
+                return torch.autograd.grad(y, (q_, k_, v_), dy)
         q16, k16, v16 = ctx.saved_tensors
         amax = dy.detach().abs().amax().float().clamp_min(1e-30)
         scale = torch.exp2(torch.floor(torch.log2(torch.clamp(1024.0 / amax, 2.0 ** -4, 2.0 ** 24))))
-        for _ in range(8):
+        tries = 8 if bool(torch.isfinite(amax)) else 1   # a non-finite upstream gradient passes through, once
+        for _ in range(tries):
             with torch.enable_grad():
                 q_, k_, v_ = (t.detach().requires_grad_(True) for t in (q16, k16, v16))
                 y16 = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
                 gq, gk, gv = torch.autograd.grad(y16, (q_, k_, v_), (dy * scale).half())
             if bool(torch.isfinite(gq).all() & torch.isfinite(gk).all() & torch.isfinite(gv).all()):
                 break
+            _FP16["retries"] += 1
             scale = scale * (2.0 ** -4)
         inv = 1.0 / scale
         return gq.float() * inv, gk.float() * inv, gv.float() * inv

@@ -13,7 +13,7 @@ Notebook API:
     run.evaluate()                                  # bpb, toggles, canaries
 """
 
-__version__ = "0.10.12"
+__version__ = "0.10.13"
 
 from .presets import (PRESETS, AlephLMConfig, TrainConfig, Preset, get_preset,
                       make_control_resume_preset, CONTROL_RESUME_ARMS)

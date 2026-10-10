@@ -21,7 +21,11 @@ Cases:
   10 attn_kernel "fp16": accepted, off a card the block is the sdpa block, the two fp16 arms carry it, the trainer's kernel
     label names it; on a card: forward and gradient within 1e-2 of fp32 sdpa, a loss scaled down by 1e-6 (gradients under
     fp16's floor) still yields gradients within 1e-2 of fp32's, a sink key attended by every query yields finite gradients
-    within 2e-2 of fp32's, and the eval path stays on sdpa bit for bit
+    within 2e-2 of fp32's, and the eval path stays on sdpa bit for bit; the counters: an overflowing sink backward fires a
+    retry and stays finite, a forward overflow falls back to fp32 sdpa for that call (output and gradients the fp32 path's)
+  11 the continuation source: an arm whose source is another arm's prefix (init_from on that prefix, the twin's repo, its own
+    seed offset; the derived name at another step keeps the prefix); the bf16 + QK-norm arm; on a card QK-norm under bf16
+    autocast gives a finite bf16 output with gradients to the gains
 """
 from __future__ import annotations
 
@@ -181,7 +185,7 @@ def case_5():
 
 
 def case_6():
-    check("6 the seven arms registered", len(CONTROL_RESUME_ARMS) == 7 and all(n in PRESETS for n in CONTROL_RESUME_ARMS),
+    check("6 the nine arms registered", len(CONTROL_RESUME_ARMS) == 9 and all(n in PRESETS for n in CONTROL_RESUME_ARMS),
           ", ".join(CONTROL_RESUME_ARMS))
     fx, f32 = PRESETS["mini-beatrix-2s-control-fix"], PRESETS["mini-beatrix-2s-control-fp32"]
     b16, ff = PRESETS["mini-beatrix-2s-control-bf16"], PRESETS["mini-beatrix-2s-control-fp32-fix"]
@@ -326,7 +330,8 @@ def case_9():
     want = {"mini-beatrix-2s-control-bf16": "sdpa", "mini-beatrix-2s-control-fp32": "sdpa",
             "mini-beatrix-2s-control-attn": "sdpa", "mini-beatrix-2s-control-fix": "sdpa",
             "mini-beatrix-2s-control-fp32-fix": "sdpa", "mini-beatrix-2s-control-attn-fp16": "fp16",
-            "mini-beatrix-2s-control-fix-fp16": "fp16"}
+            "mini-beatrix-2s-control-fix-fp16": "fp16", "mini-beatrix-2s-control-bf16-qk": "sdpa",
+            "mini-beatrix-2s-control-fix-fp16-c10k": "fp16"}
     check("9 the fp16 arms carry fp16 flash, every other arm sdpa", arms == want, str(arms))
     q = torch.randn(1, 4, 32, 16)
     k, v = torch.randn_like(q), torch.randn_like(q)
@@ -422,10 +427,76 @@ def case_10():
     ref.eval(); f16.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         check("10 the eval path stays on sdpa bit for bit", torch.equal(ref(xs), f16(xs)))
+    ref.train(); f16.train()
+    # the counters. A true sink: every query carries a positive component along the sink key, so every query's gradient lands
+    # on one key's v; with identical upstream rows (a sum loss) the unscaled dv reaches 256 x 2^10 > 65,504 -> a retry
+    xt = torch.randn(1, 256, 64, device="cuda") * 0.1 + 0.5
+    xt[:, 0] = 3.0
+    st0 = dict(A._FP16)
+    xx = xt.detach().clone().requires_grad_(True)
+    f16.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        f16(xx).sum().backward()
+    st1 = dict(A._FP16)
+    xr_ = xt.detach().clone().requires_grad_(True)
+    ref.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        ref(xr_).sum().backward()
+    check("10 an overflowing sink backward fires a retry; the gradient finite and within 2e-2 of fp32's",
+          st1["retries"] > st0["retries"] and st1["calls"] == st0["calls"] + 1 and bool(torch.isfinite(xx.grad).all())
+          and rel(xx.grad, xr_.grad) < 2e-2,
+          f"retries +{st1['retries'] - st0['retries']}, dev {rel(xx.grad, xr_.grad):.2e} "
+          f"(max |x-grad| fp16 {float(xx.grad.abs().max()):.3e}, fp32 {float(xr_.grad.abs().max()):.3e})")
+    # a forward overflow: an input past fp16's range -> that call runs in fp32 sdpa, forward and backward
+    xo = xt.detach().clone()
+    xo[:, 5] = 3.0e4                                   # q = 4 x = 1.2e5 > 65,504
+    y_o, gx_o, gw_o = grads(f16, xo)
+    y_r, gx_r, gw_r = grads(ref, xo)
+    st2 = dict(A._FP16)
+
+    def same(a, b):
+        # the fp32 path's numbers, NaN in the same places counted as equal: an input this far past fp16's range sends fp32
+        # attention's own backward non-finite (the trainer's non-finite guard then refuses the step, as it should)
+        return (bool(torch.equal(torch.isnan(a), torch.isnan(b)))
+                and torch.allclose(torch.nan_to_num(a), torch.nan_to_num(b), atol=1e-4, rtol=1e-3))
+    check("10 a forward overflow falls back to fp32 sdpa for that call (counted; output and gradients the fp32 path's, NaN-aware)",
+          st2["fallbacks"] == st1["fallbacks"] + 1 and bool(torch.isfinite(y_o).all())
+          and torch.allclose(y_o, y_r, atol=1e-4, rtol=1e-4) and same(gx_o, gx_r) and same(gw_o, gw_r),
+          f"fallbacks +{st2['fallbacks'] - st1['fallbacks']}; the fp32 path's x-grad finite: {bool(torch.isfinite(gx_r).all())}")
+
+
+def case_11():
+    p = PRESETS["mini-beatrix-2s-control-fix-fp16-c10k"]
+    base = PRESETS["mini-beatrix-2s-control"]
+    check("11 a continuation arm takes another arm's prefix as its source (the twin's repo, its own seed offset)",
+          p.init_from["prefix"] == "mini-beatrix-2s-control-attn-fp16-r10k" and p.init_from["repo"] == base.hf_repo
+          and p.init_from["path"] == "checkpoints/step_00016000.safetensors" and p.init_from["seed_offset"] == 7927
+          and p.model.qk_norm == "rms" and p.model.attn_kernel == "fp16" and p.model.attn_fp32 is True
+          and p.train.micro_batch == 8 and p.train.grad_accum == 8, str(p.init_from))
+    q = make_control_resume_preset("x-c14k", start_step=14000, **CONTROL_RESUME_ARMS["mini-beatrix-2s-control-fix-fp16-c10k"])
+    check("11 the derived name at another step keeps the source prefix",
+          q.init_from["path"] == "checkpoints/step_00014000.safetensors"
+          and q.init_from["prefix"] == "mini-beatrix-2s-control-attn-fp16-r10k" and q.init_from["step"] == 14000)
+    b = PRESETS["mini-beatrix-2s-control-bf16-qk"]
+    check("11 the bf16 + QK-norm arm: bf16 autocast, plain flash, QK-norm, 16 x 4",
+          b.train.precision == "bf16" and b.model.qk_norm == "rms" and b.model.attn_fp32 is False
+          and b.model.attn_kernel == "sdpa" and b.train.micro_batch == 16 and b.train.grad_accum == 4)
+    if not torch.cuda.is_available():
+        print("SKIP 11 QK-norm under bf16 autocast on a card (no CUDA here)", flush=True)
+        return
+    blk = CausalSDPA(64, 4, qk_norm="rms").cuda()
+    blk.train()
+    x = torch.randn(2, 128, 64, device="cuda", requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        y = blk(x)
+    y.float().square().mean().backward()
+    check("11 QK-norm under bf16 autocast: a bf16 output, finite, gradients to the gains",
+          y.dtype == torch.bfloat16 and bool(torch.isfinite(y).all()) and blk.q_gain.grad is not None
+          and bool(torch.isfinite(blk.q_gain.grad).all()) and bool(torch.isfinite(x.grad).all()))
 
 
 def main():
-    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9, case_10):
+    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9, case_10, case_11):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — a case's crash is a FAIL row, the rest still run

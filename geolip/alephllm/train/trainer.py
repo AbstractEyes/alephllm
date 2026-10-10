@@ -848,6 +848,13 @@ class Trainer:
                 bar.close()
             self._bar = None
             self.manifest.wall_hours += (time.time() - t0) / 3600
+            from ..model.attention import fp16_kernel_stats
+            st = fp16_kernel_stats()
+            if st["calls"] and self.is_main:
+                line = (f"fp16 kernel this process: {st['calls']:,} calls, {st['retries']} backward retries "
+                        f"(the gradient scale lowered after an overflow), {st['fallbacks']} fp32 fallbacks (a forward overflow)")
+                print(f"[attn] {line}", flush=True)
+                self.manifest.note(line)
             if save_on_exit and self.step > start_step:
                 if self._agree(self._weights_finite(), how="all"):
                     self._checkpoint(final=True)

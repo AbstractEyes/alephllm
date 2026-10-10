@@ -409,9 +409,15 @@ def make_control_resume_preset(name: str, start_step: int = 16000, precision: st
       mini-beatrix-2s-control-fp32-fix   full fp32 + QK-norm                     4 x 16
       mini-beatrix-2s-control-attn-fp16  fp16 flash in the fp32 block (10-bit),  8 x 8
                                          bf16 elsewhere
-      mini-beatrix-2s-control-fix-fp16   the same + QK-norm                      8 x 8"""
+      mini-beatrix-2s-control-fix-fp16   the same + QK-norm                      8 x 8
+      mini-beatrix-2s-control-bf16-qk    QK-norm on plain bf16 flash             16 x 4
+      mini-beatrix-2s-control-fix-fp16-c10k  fp16 flash + QK-norm CONTINUED from  8 x 8
+                                         the -attn-fp16-r10k arm's own checkpoint
+                                         at start_step (the stop rule's fallback)
+    `source` is a registered craft (its hub repo and prefix) or ANY prefix on
+    the twin's training repo (an arm's own checkpoints)."""
     from .data.curriculum import curriculum_phases
-    base = PRESETS[source]
+    base = PRESETS[source] if source in PRESETS else PRESETS["mini-beatrix-2s-control"]
     m = AlephLMConfig.from_dict(base.model.to_dict())
     m.name, m.qk_norm, m.attn_fp32, m.attn_kernel = name, qk_norm, bool(attn_fp32), attn_kernel
     t = _copy_train(base.train)
@@ -453,6 +459,10 @@ CONTROL_RESUME_ARMS = {
                                               micro_batch=8, grad_accum=8),
     "mini-beatrix-2s-control-fix-fp16": dict(precision="bf16", qk_norm="rms", attn_fp32=True, attn_kernel="fp16",
                                              micro_batch=8, grad_accum=8),
+    "mini-beatrix-2s-control-bf16-qk": dict(precision="bf16", qk_norm="rms"),
+    "mini-beatrix-2s-control-fix-fp16-c10k": dict(precision="bf16", qk_norm="rms", attn_fp32=True, attn_kernel="fp16",
+                                                  micro_batch=8, grad_accum=8,
+                                                  source="mini-beatrix-2s-control-attn-fp16-r10k", seed_offset=7927),
 }
 try:
     for _n, _kw in CONTROL_RESUME_ARMS.items():

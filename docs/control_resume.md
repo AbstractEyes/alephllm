@@ -1,4 +1,4 @@
-# The control twin, continued: the softmax guards and the weights-only start (0.10.9; the fused kernel 0.10.11; fp16 flash in the fp32 block 0.10.12)
+# The control twin, continued: the softmax guards and the weights-only start (0.10.9; the fused kernel 0.10.11; fp16 flash in the fp32 block 0.10.12; continuation arms and the kernel's counters 0.10.13)
 
 `mini-beatrix-2s-control` is the pure-softmax twin of the full-splat `mini-beatrix-2s` craft (d1024, 20 blocks, 16 heads,
 ctx 4096, byte-trigram; the same anchored banks, dual head, Muon + Adam split, the same curriculum). Its first run destabilized
@@ -40,6 +40,8 @@ step) under a new name and a chronological phase list (warmup, fineweb_main, S0-
 | `mini-beatrix-2s-control-fp32-fix` | fp32 | (everything fp32) | rms | 4 × 16 | both |
 | `mini-beatrix-2s-control-attn-fp16` | bf16 | on, fp16 flash | off | 8 × 8 | 10-bit attention inputs and P with the fp32 softmax, at flash pace (0.10.12) |
 | `mini-beatrix-2s-control-fix-fp16` | bf16 | on, fp16 flash | rms | 8 × 8 | the same with QK-norm |
+| `mini-beatrix-2s-control-bf16-qk` | bf16 | off (bf16 flash) | rms | 16 × 4 | QK-norm on the first run's own attention, the field's guard at the control's pace (0.10.13) |
+| `mini-beatrix-2s-control-fix-fp16-c10k` | bf16 | on, fp16 flash | rms | 8 × 8 | fp16 flash + QK-norm CONTINUED from the `-attn-fp16-r10k` arm's own checkpoint at `start_step` (the stop rule's fallback, 0.10.13) |
 
 Every arm trains the recipe's 262,144-token step; the factory refuses a micro-batch that breaks it. The fp32 forms hold more
 activation memory at the same tokens (the fp32 attention tensors, or everything under full fp32), so they run smaller
@@ -47,7 +49,9 @@ micro-batches: the 95 GB card ran out of memory at 16 × 4 with fp32 attention (
 accumulation order, not the step.
 
 `make_control_resume_preset(name, start_step, precision, qk_norm, attn_fp32, source, seed_offset, micro_batch, grad_accum,
-attn_kernel)` builds any other combination (for instance a start from `step_00014000`, the other intact checkpoint).
+attn_kernel)` builds any other combination; `source` is a registered craft (its hub repo and prefix) or, from 0.10.13, ANY prefix
+on the twin's training repo, so a running arm continues from its own last clean checkpoint under a new guard (the QK-norm gains
+installed as the boundary write; a fresh seed offset so the restarted phase reads a new shuffle) (for instance a start from `step_00014000`, the other intact checkpoint).
 
 Measured on the twin at step 16,000, one real fineweb batch, the same weights: bf16 costs +0.0018 in loss over fp32 and fp32
 attention under bf16 recovers about 60% of that; the QK-norm insertion costs +0.91 (the 95 GB card) and +0.95 (a 4090) even
@@ -161,6 +165,12 @@ overflow fp16 even so; the result is checked and recomputed at a smaller scale w
 The recomputation of the forward inside the backward costs one fp16 flash forward per block. Eval, the census and decode stay
 on fp32 sdpa, as for the fused kernel. The trainer prints the kernel it runs (`[attn] ...`) at the start of every session.
 
+From 0.10.13 the kernel keeps three counters for the process (`fp16_kernel_stats()`): calls, backward retries (the scale
+lowered after an overflow) and fp32 fallbacks. A forward overflow (an input past fp16's 65,504, which the first run's
+checkpoints sit 100x under, or a non-finite input) no longer reaches the trainer's non-finite guard: that call runs in fp32
+sdpa, forward and backward, and is counted. The trainer prints the three counters at the end of every session and writes them
+into the manifest's notes.
+
 ## The tests
 
 `python -m geolip.alephllm.tests.test_control_fixes` (CPU, seconds, no download): the guards-off identity; QK-norm shapes,
@@ -170,7 +180,9 @@ the weights-only start on a tiny craft end to end (cursor, weights, gains, seed,
 checkpoint, the hand-off to a normal resume); the kernel switch's plumbing (the default, the refusal, every block, the dict
 round trip, the arms, the dead-kernel fallback); the fp16 form's plumbing and the trainer's kernel label; and, on a card,
 the fp32-attention path under autocast, the fused kernel's forward and gradient parity, the fp16 form's parity (plain, under
-a 1e-6 loss scale, and with a sink key) with the eval path on sdpa bit for bit. The full smoke array (`tests.smoke`) passes
+a 1e-6 loss scale, and with a sink key), its counters (an overflowing sink backward fires a retry; a forward overflow falls back
+to fp32 sdpa for that call) with the eval path on sdpa bit for bit; the continuation source and the bf16 + QK-norm arm, with
+QK-norm under bf16 autocast on a card. The full smoke array (`tests.smoke`) passes
 unchanged.
 
 ## The notebook
