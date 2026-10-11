@@ -166,6 +166,16 @@ class AlephLM(nn.Module):
                                                              attn_fp32=getattr(cfg, "attn_fp32", False),
                                                              attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
                                           for s in sites})
+        # 0.10.17: depth. Extra attention layers per site after the first, keyed <site>_l<k> under the SAME ModuleDicts, so the
+        # arm-key prefixes (TrainConfig.arm_params), the weights-only loader's allowance and the shipping filter hold unchanged;
+        # zero-born like the first, so a deeper craft is the shallower arm at birth.
+        self.lookup_depth = max(1, int(getattr(cfg, "lookup_arm_depth", 1) or 1))
+        for s in sites:
+            for k in range(2, self.lookup_depth + 1):
+                self.lookup_norms[f"{s}_l{k}"] = nn.LayerNorm(cfg.d_model)
+                self.lookup_arms[f"{s}_l{k}"] = CausalSDPA(cfg.d_model, cfg.n_heads, qk_norm=getattr(cfg, "qk_norm", ""),
+                                                           attn_fp32=getattr(cfg, "attn_fp32", False),
+                                                           attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
         for arm in self.lookup_arms.values():
             nn.init.zeros_(arm.o.weight)
 
@@ -181,6 +191,10 @@ class AlephLM(nn.Module):
                 x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
                 if arms and str(i) in arms:          # the lookup arm reads the block's output, writes to the stream
                     x = x + arms[str(i)](self.lookup_norms[str(i)](x))
+                    for k in range(2, getattr(self, "lookup_depth", 1) + 1):     # 0.10.17: the site's extra layers, in series
+                        key = f"{i}_l{k}"
+                        if key in arms:
+                            x = x + arms[key](self.lookup_norms[key](x))
             return x
         front, middle, back = self._ranges()
         plan = self.fusion.plan(idx)

@@ -266,7 +266,8 @@ def _render_recall_far(row) -> str:
 # document is one block long; byte crafts with a 4,096 context only, which the lookup-arm preset asserts). The distance from the
 # plant's start to the question's start is drawn half log-uniform in 64..1,024 and half uniform in 1,024..3,600 bytes. The forms:
 # the single record (50%), four lockers in two phrasings (30%: the trained "Locker 4821 holds code V." and the probes' "The secret
-# code for locker 4821 is V."), the updated record (20%). Rows shorter than the window render EMPTY (the registry entry raises
+# code for locker 4821 is V."), the updated record (20%; 0.10.17: written with and without "now", so the arm learns the later
+# value by order, not by the cue word). Rows shorter than the window render EMPTY (the registry entry raises
 # max_empties for it). Deterministic per row.
 RF_DEEP_TEXT_BYTES = 4095
 RF_DEEP_PLANT_MAX = 300
@@ -324,7 +325,8 @@ def _render_recall_far_deep(row) -> str:
         v1, v2 = _rf_value(rng, kind), _rf_value(rng, kind)
         plant = f"The secret {cue} is {v1}. ".encode()
         question = f"The secret {cue} is {v2}. ".encode()
-        inserts = [f"The secret {cue} is now {v2}. ".encode()]
+        now_ = "now " if int(rng.integers(2)) == 0 else ""      # 0.10.17: the update with and without the cue word (recency, not "now")
+        inserts = [f"The secret {cue} is {now_}{v2}. ".encode()]
     # the question starts `dist` bytes after the plant's start in the RENDERED document, so the source gap is dist less the
     # inserted bytes before the question (the plant, and the update when it sits between)
     gap = max(16, dist - len(plant) - sum(len(u) for u in inserts))

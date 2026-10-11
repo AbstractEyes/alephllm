@@ -88,6 +88,10 @@ class AlephLMConfig:
     # the lookup arm (0.10.15): zero-born softmax attention added AFTER each named block, outside the hubs'
     # address reads, read through this config's qk_norm / attn_fp32 / attn_kernel switches; () = none
     lookup_arm_sites: tuple = ()
+    # 0.10.17: attention layers per arm site (1 = the 0.10.15 arm). The extra layers are the state dict's
+    # lookup_arms.<site>_l<k> / lookup_norms.<site>_l<k> for k >= 2, zero-born, so a depth-1 arm's checkpoint loads into
+    # a deeper craft with exactly the new layers' keys missing and the craft is the shallower arm at birth
+    lookup_arm_depth: int = 1
 
     def to_dict(self):
         d = asdict(self)
@@ -100,6 +104,7 @@ class AlephLMConfig:
         d = dict(d)
         d["hub_layers"] = tuple(d.get("hub_layers", ()))
         d["lookup_arm_sites"] = tuple(int(s) for s in (d.get("lookup_arm_sites", ()) or ()))
+        d["lookup_arm_depth"] = int(d.get("lookup_arm_depth", 1) or 1)
         return AlephLMConfig(**d)
 
 
@@ -560,7 +565,7 @@ def make_v3_lookup_arm_preset(sites=(2, 6, 12, 20), steps: int = 4000, start_ste
                               source: str = "mini-beatrix-3", mix: str = "fineweb-recall-far-5",
                               micro_batch: int = 8, grad_accum: int = 8, attn_kernel: str = "fp16",
                               seed_offset: int = 7919, name: str | None = None, repo: str | None = None,
-                              arm_lr: float | None = None) -> Preset:
+                              arm_lr: float | None = None, depth: int = 1) -> Preset:
     """THE LOOKUP ARM ON THE RELEASED v3 (2026-10-10, the retrofit route): mini-beatrix-3's 32-block all-splat trunk,
     weights-only from its shipped checkpoint at `start_step`, with a zero-born softmax attention arm AFTER each block
     in `sites` (QK-norm from birth, the fp32 attention block, the `attn_kernel` path: the guards that held the softmax
@@ -570,14 +575,19 @@ def make_v3_lookup_arm_preset(sites=(2, 6, 12, 20), steps: int = 4000, start_ste
     the cursor) then the arm's phase, so the start lands on the arm's first step. The governor is off (nothing it
     governs trains). The craft's name encodes the sites (mini-beatrix-3-la2-6-12-20) and is its own hub prefix.
     `arm_lr` (0.10.16) sets the arm's Adam rate (the recipe's 3e-4 when None; the second attempt trains at 1e-3); a mix
-    carrying the window-aligned deep-recall rows requires the 4,096 context they are rendered for."""
+    carrying the window-aligned deep-recall rows requires the 4,096 context they are rendered for. `depth` (0.10.17) puts
+    `depth` attention layers at each site (the extra ones zero-born, keyed <site>_l<k>); a continuation from a depth-1 arm's
+    checkpoint loads that arm as the first layer and starts the new layers null. The name gains -d<depth> past 1."""
     sites = tuple(int(s) for s in sites)
+    if int(depth) < 1:
+        raise ValueError(f"depth must be >= 1, got {depth}")
     if sites != tuple(sorted(set(sites))) or not all(0 <= s < 32 for s in sites) or not sites:
         raise ValueError(f"sites must be distinct ascending block indices in 0..31, got {sites}")
     base = make_v3_preset(32, data_scale=4.0, epoch_cap=2.0, rebalance_to="generators", name="mini-beatrix-3")
     m = AlephLMConfig.from_dict(base.model.to_dict())
-    m.name = name or ("mini-beatrix-3-la" + "-".join(str(s) for s in sites))
+    m.name = name or ("mini-beatrix-3-la" + "-".join(str(s) for s in sites) + (f"-d{int(depth)}" if int(depth) > 1 else ""))
     m.lookup_arm_sites = sites
+    m.lookup_arm_depth = int(depth)
     m.qk_norm, m.attn_fp32, m.attn_kernel = "rms", True, attn_kernel   # the arm's switches: the trunk has no softmax block
     t = _copy_train(base.train)
     t.precision = "bf16"

@@ -54,7 +54,7 @@ def _parse(text):
     first, last = ms[0], ms[-1]
     g = first.group(0)
     form = "lockers" if g.startswith("Locker") else ("lockers2" if "for locker" in g else
-                                                     ("update" if any(" is now " in m.group(0) for m in ms) else "single"))
+                                                     ("update" if (any(" is now " in m.group(0) for m in ms) or len(ms) >= 3) else "single"))
     bs = lambda i: len(text[:i].encode("utf-8"))  # noqa: E731
     vals = [next(v for v in m.groups() if v) for m in ms]
     planted = vals[1] if form == "update" else vals[0]        # the update's "now" value is the one asked

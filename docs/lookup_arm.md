@@ -65,3 +65,14 @@ and refuses the deep mix on a craft whose context is not 4,096 (the block the ro
 `ARM_LR` and `NAME` knobs expose the three. Tests: `python -m geolip.alephllm.tests.test_recall_deep` (the length invariant,
 determinism, the forms and the distance distribution, the UTF-8 fit, the registry, alignment through the real PackedStream
 with the byte tokenizer, the preset).
+
+## Depth (0.10.17)
+
+`lookup_arm_depth` puts that many attention layers at each arm site, in series, each with its own LayerNorm. The first
+layer keeps the 0.10.15 keys (`lookup_arms.<site>`, `lookup_norms.<site>`); the extra ones are `lookup_arms.<site>_l<k>` and
+`lookup_norms.<site>_l<k>` for k from 2, under the same ModuleDicts, so `TrainConfig.arm_params`, the weights-only loader's
+allowance for missing arm keys and the shipping filter all hold unchanged. The extra layers are zero-born, so a depth-1
+arm's checkpoint loads into a depth-2 craft with exactly the new keys missing and the craft is the shallower arm at birth.
+`make_v3_lookup_arm_preset(..., depth=2)` sets it and suffixes the default name with `-d2`; the notebook's `ARM` knob picks
+the control (depth 1) or the structure arm (depth 2) for the paired run that continues the deep-mix pilot's checkpoint.
+The deep renderer now writes the update with and without "now" (half each), so the later value is learned by order.
