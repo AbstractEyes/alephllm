@@ -47,3 +47,21 @@ already carries the arm (no missing keys; fresh optimizer moments): `make_v3_loo
 step>, source="mini-beatrix-3-la2-6-12-20", name="mini-beatrix-3-la2-6-12-20-c<step // 1000>k")`. The notebook's `CONTINUE_FROM =
 (step, craft)` does exactly this; its preflight then expects no missing keys and reports the arm's effect on a batch instead of the
 birth identity.
+
+## The second attempt: the deep-recall mix (0.10.16)
+
+The first attempt's far exposure was cut twice. The renderer drew the gap log-uniformly in 64..2,400 bytes, so about a quarter
+of the episodes passed 1,024 bytes and one in twenty passed 2,048; and the packed stream concatenates documents and cuts
+context+1 blocks at an arbitrary phase, so an episode spanning s bytes sits whole in one 4,097-byte block with probability
+1 - s/4,097 (the surviving share past 2,048 was about one episode in fifty). `recall_far_deep` removes both: every rendered
+document is exactly 4,095 UTF-8 bytes, so that text + newline + DOC is one block and the stream's cut always falls on a document
+boundary (the component's buffer starts empty and every document is one block long; rows shorter than the window render empty,
+and the registry entry raises `max_empties` for it). The distance from the plant's start to the question's start is drawn half
+log-uniform in 64..1,024 bytes and half uniform in 1,024..3,600; the forms are the single record (50%), four lockers in two
+phrasings (30%: "Locker 4821 holds code V." and "The secret code for locker 4821 is V.") and the updated record (20%). The
+dataset is `recall-far-deep-fineweb`; the mix `fineweb-recall-deep-25` draws it one micro-batch in four beside fineweb-edu.
+`make_v3_lookup_arm_preset(..., mix="fineweb-recall-deep-25", arm_lr=1e-3)` sets the arm's Adam rate for the second attempt
+and refuses the deep mix on a craft whose context is not 4,096 (the block the rows are rendered for). The notebook's `MIX`,
+`ARM_LR` and `NAME` knobs expose the three. Tests: `python -m geolip.alephllm.tests.test_recall_deep` (the length invariant,
+determinism, the forms and the distance distribution, the UTF-8 fit, the registry, alignment through the real PackedStream
+with the byte tokenizer, the preset).
