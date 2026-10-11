@@ -559,7 +559,8 @@ def make_byte_screen_preset(side: str, kind: str, start_step: int, seed_offset: 
 def make_v3_lookup_arm_preset(sites=(2, 6, 12, 20), steps: int = 4000, start_step: int = 245674,
                               source: str = "mini-beatrix-3", mix: str = "fineweb-recall-far-5",
                               micro_batch: int = 8, grad_accum: int = 8, attn_kernel: str = "fp16",
-                              seed_offset: int = 7919, name: str | None = None, repo: str | None = None) -> Preset:
+                              seed_offset: int = 7919, name: str | None = None, repo: str | None = None,
+                              arm_lr: float | None = None) -> Preset:
     """THE LOOKUP ARM ON THE RELEASED v3 (2026-10-10, the retrofit route): mini-beatrix-3's 32-block all-splat trunk,
     weights-only from its shipped checkpoint at `start_step`, with a zero-born softmax attention arm AFTER each block
     in `sites` (QK-norm from birth, the fp32 attention block, the `attn_kernel` path: the guards that held the softmax
@@ -567,7 +568,9 @@ def make_v3_lookup_arm_preset(sites=(2, 6, 12, 20), steps: int = 4000, start_ste
     untouched and the arm is removable: its keys are the state dict's lookup_arms.* and lookup_norms.*) on `mix`
     for `steps` steps of the recipe's 262,144 tokens. The curriculum is two phases, the trunk's own steps (done at
     the cursor) then the arm's phase, so the start lands on the arm's first step. The governor is off (nothing it
-    governs trains). The craft's name encodes the sites (mini-beatrix-3-la2-6-12-20) and is its own hub prefix."""
+    governs trains). The craft's name encodes the sites (mini-beatrix-3-la2-6-12-20) and is its own hub prefix.
+    `arm_lr` (0.10.16) sets the arm's Adam rate (the recipe's 3e-4 when None; the second attempt trains at 1e-3); a mix
+    carrying the window-aligned deep-recall rows requires the 4,096 context they are rendered for."""
     sites = tuple(int(s) for s in sites)
     if sites != tuple(sorted(set(sites))) or not all(0 <= s < 32 for s in sites) or not sites:
         raise ValueError(f"sites must be distinct ascending block indices in 0..31, got {sites}")
@@ -583,7 +586,14 @@ def make_v3_lookup_arm_preset(sites=(2, 6, 12, 20), steps: int = 4000, start_ste
     t.governor = ""
     t.ckpt_every = min(int(t.ckpt_every), 1000)
     t.eval_every = min(int(t.eval_every), 1000)
+    if arm_lr is not None:
+        t.adam_lr = float(arm_lr)
     t.__post_init__()
+    from .data.curriculum import CURRICULUM_MIXES as _MIXES
+    from .data.streams import REGISTRY as _REG, RF_DEEP_TEXT_BYTES as _DEEP
+    for ds_name, _w in _MIXES.get(mix, [(mix, 1.0)]):
+        if _REG.get(ds_name, {}).get("render") == "recall_far_deep" and int(m.context) != _DEEP + 1:
+            raise ValueError(f"the deep-recall rows are rendered as one block of context {_DEEP + 1}; the craft's context is {m.context}")
     tps = base.train.micro_batch * base.train.grad_accum * base.model.context
     if t.micro_batch * t.grad_accum * m.context != tps:
         raise ValueError(f"micro_batch x grad_accum x context must stay the recipe's {tps:,}-token step")

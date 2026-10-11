@@ -590,6 +590,7 @@ CORPUS_BYTES = {
     "gutenberg": INF,             # ~18GB raw, ~13GB after the cut
     "wikipedia-en": INF,          # ~19GB of article prose
     "recall-far-fineweb": INF,    # fineweb-edu rows rendered with a far-recall record (0.10.14)
+    "recall-far-deep-fineweb": INF,   # the same, one window-aligned block per row, distances to 3,600 (0.10.16)
 }
 MAX_EPOCHS = 4.0                  # audit threshold
 MAX_GENERATOR_SHARE = 0.35        # cap per procedural generator
@@ -713,6 +714,8 @@ CURRICULUM_MIXES.update({
     # 0.10.14 (the byte levers): fineweb's remainder with one row in twenty carrying a far-recall record (the screen's
     # data arm; the natural-language ballast rule holds trivially)
     "fineweb-recall-far-5": [("fineweb-edu", 0.95), ("recall-far-fineweb", 0.05)],
+    # 0.10.16 (the second attempt at recall at depth): one draw in four is a window-aligned deep-recall block
+    "fineweb-recall-deep-25": [("fineweb-edu", 0.75), ("recall-far-deep-fineweb", 0.25)],
 })
 
 # stage name -> planned tokens (bytes); plan-of-record budgets (the 1x

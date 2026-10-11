@@ -55,6 +55,10 @@ REGISTRY = {
     # held-out head is reserved as for fineweb-edu itself: no val_split -> the head skip applies)
     "recall-far-fineweb": dict(path="HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", column="text",
                                columns=["text"], render="recall_far"),
+    # 0.10.16 (the second attempt): the same rows rendered one 4,097-id block each (window-aligned episodes, distances to
+    # 3,600 bytes); rows shorter than the window render EMPTY, so the circuit breaker is raised
+    "recall-far-deep-fineweb": dict(path="HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", column="text",
+                                    columns=["text"], render="recall_far_deep", max_empties=20000),
 }
 
 RESERVED_HEAD_ROWS = 2048
@@ -253,7 +257,97 @@ def _render_recall_far(row) -> str:
     return (b[:p] + plant + b[p:m] + update + b[m:q] + question + b[q:]).decode("utf-8", errors="replace")
 
 
-_RENDERERS = {"soda": _render_soda, "recall_far": _render_recall_far}
+# ------------------------------------------------------------------ the deep far-recall renderer (0.10.16; the second attempt)
+# The first attempt's far exposure was cut twice (measured 2026-10-11 on 2,000 rendered rows): the gap capped at 2,400 bytes with
+# a log-uniform draw (24% of episodes past 1,024 bytes, 5% past 2,048), then the packed stream's arbitrary cut (an episode
+# spanning s bytes sits whole in one context+1 block with probability 1 - s/4,097; the surviving share past 2,048 was 2%).
+# This renderer removes both. Every document is rendered to EXACTLY RF_DEEP_TEXT_BYTES of UTF-8 text, so that text + "\n" + DOC
+# is one 4,097-id block and the stream's cut always falls on a document boundary (the component's buffer starts empty and every
+# document is one block long; byte crafts with a 4,096 context only, which the lookup-arm preset asserts). The distance from the
+# plant's start to the question's start is drawn half log-uniform in 64..1,024 and half uniform in 1,024..3,600 bytes. The forms:
+# the single record (50%), four lockers in two phrasings (30%: the trained "Locker 4821 holds code V." and the probes' "The secret
+# code for locker 4821 is V."), the updated record (20%). Rows shorter than the window render EMPTY (the registry entry raises
+# max_empties for it). Deterministic per row.
+RF_DEEP_TEXT_BYTES = 4095
+RF_DEEP_PLANT_MAX = 300
+RF_DEEP_DIST_MIN, RF_DEEP_DIST_KNEE, RF_DEEP_DIST_MAX = 64, 1024, 3600
+_RF_DEEP_FORMS = ("single",) * 5 + ("lockers", "lockers2", "lockers") + ("update",) * 2
+
+
+def _rf_fit(doc: bytes, n: int = RF_DEEP_TEXT_BYTES) -> str:
+    """The first n bytes of doc as text: cut at a character boundary, space-padded to exactly n UTF-8 bytes."""
+    cut = doc[:n]
+    while cut and (cut[-1] & 0xC0) == 0x80:        # inside a multi-byte character: back off to its lead byte
+        cut = cut[:-1]
+    if cut and cut[-1] >= 0xC0:                      # a lone lead byte
+        cut = cut[:-1]
+    text = (cut + b" " * (n - len(cut))).decode("utf-8")
+    assert len(text.encode("utf-8")) == n
+    return text
+
+
+def _render_recall_far_deep(row) -> str:
+    import bisect as _bisect
+    import math as _math
+    import zlib as _zlib
+    b = str(row.get("text", "")).encode("utf-8")
+    if len(b) < RF_DEEP_TEXT_BYTES:
+        return ""
+    rng = np.random.default_rng(_zlib.crc32(b[:4096]) ^ 0x5EED)
+    starts = _rf_sentence_starts(b)
+    k = _bisect.bisect_left(starts, 200)
+    if k >= len(starts) or starts[k] > RF_DEEP_PLANT_MAX:
+        return ""
+    p = starts[k]
+    if int(rng.integers(2)) == 0:
+        dist = int(round(_math.exp(rng.uniform(_math.log(RF_DEEP_DIST_MIN), _math.log(RF_DEEP_DIST_KNEE)))))
+    else:
+        dist = int(rng.integers(RF_DEEP_DIST_KNEE, RF_DEEP_DIST_MAX + 1))
+    cue, kind = _RF_CUES[int(rng.integers(len(_RF_CUES)))]
+    form = _RF_DEEP_FORMS[int(rng.integers(len(_RF_DEEP_FORMS)))]
+    inserts = []
+    if form == "single":
+        v = _rf_value(rng, kind)
+        plant = f"The secret {cue} is {v}. ".encode()
+        question = f"The secret {cue} is {v}. ".encode()
+    elif form in ("lockers", "lockers2"):
+        lockers = [str(int(x)) for x in rng.choice(np.arange(1000, 10000), size=4, replace=False)]
+        vals = [_rf_value(rng, kind) for _ in lockers]
+        a = int(rng.integers(4))
+        if form == "lockers":
+            plant = "".join(f"Locker {lk} holds {cue} {v}. " for lk, v in zip(lockers, vals)).encode()
+            question = f"Locker {lockers[a]} holds {cue} {vals[a]}. ".encode()
+        else:
+            plant = "".join(f"The secret {cue} for locker {lk} is {v}. " for lk, v in zip(lockers, vals)).encode()
+            question = f"The secret {cue} for locker {lockers[a]} is {vals[a]}. ".encode()
+    else:
+        v1, v2 = _rf_value(rng, kind), _rf_value(rng, kind)
+        plant = f"The secret {cue} is {v1}. ".encode()
+        question = f"The secret {cue} is {v2}. ".encode()
+        inserts = [f"The secret {cue} is now {v2}. ".encode()]
+    # the question starts `dist` bytes after the plant's start in the RENDERED document, so the source gap is dist less the
+    # inserted bytes before the question (the plant, and the update when it sits between)
+    gap = max(16, dist - len(plant) - sum(len(u) for u in inserts))
+    j = _bisect.bisect_left(starts, p + gap)
+    if j >= len(starts):
+        return ""
+    q = starts[j]
+    if form == "update":
+        mids = [s_ for s_ in starts if p + 32 <= s_ <= q - 32]
+        if not mids:
+            return ""
+        m = mids[int(rng.integers(len(mids)))]
+        doc = b[:p] + plant + b[p:m] + inserts[0] + b[m:q] + question + b[q:]
+        q_end = q + len(plant) + len(inserts[0]) + len(question)
+    else:
+        doc = b[:p] + plant + b[p:q] + question + b[q:]
+        q_end = q + len(plant) + len(question)
+    if q_end > RF_DEEP_TEXT_BYTES - 1:
+        return ""
+    return _rf_fit(doc)
+
+
+_RENDERERS = {"soda": _render_soda, "recall_far": _render_recall_far, "recall_far_deep": _render_recall_far_deep}
 
 # stage recipes registered by curriculum.py: {"curriculum-s0": [(name, w)...]}
 CURRICULUM_MIXES: dict[str, list] = {}
