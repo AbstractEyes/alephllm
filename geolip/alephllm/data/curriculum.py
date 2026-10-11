@@ -525,9 +525,12 @@ REGISTRY.update({
                                  "examples"],
                         max_empties=20_000),
     # large permissive ballast — the structural answer to the S3 crash
+    # large_text: whole books (~470 KB a row in memory) fill the shuffle
+    # buffer past 2 GiB; read as large_string (streams._load_kwargs)
     "gutenberg": dict(path="sedthh/gutenberg_english", split="train",
                       column="TEXT", render="gutenberg",
-                      columns=["TEXT"], max_empties=20_000),
+                      columns=["TEXT"], max_empties=20_000,
+                      large_text=True),
     "wikipedia-en": dict(path="wikimedia/wikipedia", name="20231101.en",
                          split="train", column="text", render="wikipedia",
                          columns=["text"], max_empties=20_000),

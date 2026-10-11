@@ -56,6 +56,23 @@ REGISTRY = {
 RESERVED_HEAD_ROWS = 2048
 
 
+def _load_kwargs(spec: dict) -> dict:
+    """Extra load_dataset arguments for a registry spec. A `large_text` spec
+    (whole books) reads its columns as large_string (64-bit offsets): from
+    datasets 5.1 the shuffle buffer is joined into one Arrow table and
+    reordered with a take, and a buffer of long documents passes the 2 GiB
+    that a 32-bit-offset string column can hold (ArrowInvalid: offset
+    overflow while concatenating arrays). The parquet reader casts each
+    batch as it reads, below the shuffle, so the values and the row order
+    are unchanged. Parquet sources only (the reader's columns / features)."""
+    if not spec.get("large_text"):
+        return {}
+    from datasets import Features, Value
+    keep = list(spec.get("columns") or [spec["column"]])
+    return dict(columns=keep,
+                features=Features({c: Value("large_string") for c in keep}))
+
+
 def _is_byte_craft(tokenizer) -> bool:
     """Specials gate: tokenizer IDENTITY, not the vocab-256 proxy."""
     return (getattr(tokenizer, "name", "") == "byte-trigram"
@@ -267,12 +284,13 @@ class PackedStream:
         from datasets import load_dataset
         print(f"[stream] opening '{self.dataset}' "
               f"({spec['path']}) …", flush=True)
+        kw = _load_kwargs(spec)
         if self.role == "val" and spec.get("val_split"):
             ds = load_dataset(spec["path"], name=spec.get("name"),
-                              split=spec["val_split"], streaming=True)
+                              split=spec["val_split"], streaming=True, **kw)
         else:
             ds = load_dataset(spec["path"], name=spec.get("name"),
-                              split=spec["split"], streaming=True)
+                              split=spec["split"], streaming=True, **kw)
         # column-prune to what is actually consumed: render datasets need
         # EVERY column their renderer reads — pruning to the single display
         # column starved _render_soda into empty rows and an invisible

@@ -1,4 +1,4 @@
-# The control twin, continued: the softmax guards and the weights-only start (0.10.9; the fused kernel 0.10.11; fp16 flash in the fp32 block 0.10.12; continuation arms and the kernel's counters 0.10.13)
+# The control twin, continued: the softmax guards and the weights-only start (0.10.9; the fused kernel 0.10.11; fp16 flash in the fp32 block 0.10.12; continuation arms and the kernel's counters 0.10.13; the book source's large_string read 0.10.13.1)
 
 `mini-beatrix-2s-control` is the pure-softmax twin of the full-splat `mini-beatrix-2s` craft (d1024, 20 blocks, 16 heads,
 ctx 4096, byte-trigram; the same anchored banks, dual head, Muon + Adam split, the same curriculum). Its first run destabilized
@@ -171,6 +171,20 @@ checkpoints sit 100x under, or a non-finite input) no longer reaches the trainer
 sdpa, forward and backward, and is counted. The trainer prints the three counters at the end of every session and writes them
 into the manifest's notes.
 
+## The book source under datasets 5.1 (0.10.13.1)
+
+From datasets 5.1 the streaming shuffle buffer is joined into one Arrow table and reordered with a take. A 32-bit-offset
+string column holds at most 2 GiB, and the book source (`gutenberg`, whole books, ~470 KB a row in memory) fills the
+default 10,000-row buffer with ~4.6 GB of text, so the first read of the stream raised `ArrowInvalid: offset overflow while
+concatenating arrays` (stage S5 is the first to draw from it). Earlier releases buffered single rows and never joined them.
+
+A registry spec may now carry `large_text=True` (the book source does): its columns are read as `large_string` (64-bit
+offsets) by the parquet reader, below the shuffle. The values and the row order are unchanged: on the real source the first
+32 books of a flagged and an unflagged stream are the same books in the same order. The cost is memory: under datasets 5.1
+the joined buffer and its reordered copy peak at about three times the buffer's text (measured at a 2.2 GB buffer: 7.0 GB of
+working set, against 2.9 GB under datasets 5.0), so the book stream's peak is near 14 GB of host memory. The `train` extra
+admits datasets 5.0 and 5.1, the releases measured with this read.
+
 ## The tests
 
 `python -m geolip.alephllm.tests.test_control_fixes` (CPU, seconds, no download): the guards-off identity; QK-norm shapes,
@@ -184,6 +198,11 @@ a 1e-6 loss scale, and with a sink key), its counters (an overflowing sink backw
 to fp32 sdpa for that call) with the eval path on sdpa bit for bit; the continuation source and the bf16 + QK-norm arm, with
 QK-norm under bf16 autocast on a card. The full smoke array (`tests.smoke`) passes
 unchanged.
+
+`python -m geolip.alephllm.tests.test_stream_large_text` (CPU, no download): the book source's flag and its load arguments;
+a local three-column parquet source of long rows read with the flag and without (the same rows in the same order for the
+training and the validation roles, the column large_string, a packed batch); with `ALEPHLLM_TEST_BIG=1`, a buffer of more
+than 2 GiB of text overflows without the flag under datasets 5.1 and yields every row once with it.
 
 ## The notebook
 
