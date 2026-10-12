@@ -142,6 +142,15 @@ def case_3():
     cfg = AlephLMConfig(**dict(TINY, hub_rotary=True))
     m = AlephLM(cfg)
     check("3f the flag reaches the hub blocks only", m.blocks[1].attn.rotary and not getattr(m.blocks[0].attn, "rotary", False))
+    half = CausalSplatHUB(64, 16, 8, 0.1, chunk=16, rotary=True, rotary_frac=0.5)
+    half.load_state_dict(hub.state_dict())
+    with torch.no_grad():
+        yh = half(x)
+        yhn = half.forward_naive(x)
+    check("3g a half-rotated address: the chunked form equals its oracle and differs from both the full and the plain read",
+          close(yh, yhn, 2e-5) and float((yh - y).abs().max()) > 1e-4 and float((yh - yp).abs().max()) > 1e-4 and half.n_rot == 8)
+    cfg2 = AlephLMConfig(**dict(TINY, hub_rotary=True, hub_rotary_frac=0.25))
+    check("3h the fraction reaches the hub and the config round trip keeps it", AlephLM(cfg2).blocks[1].attn.n_rot == 4 and cfg2.to_dict()["hub_rotary_frac"] == 0.25)
 
 
 # ------------------------------------------------------------------ 4 the position table switch

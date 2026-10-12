@@ -112,6 +112,10 @@ class AlephLMConfig:
     attn_rotary: bool = False
     hub_rotary: bool = False
     rotary_base: float = 10000.0
+    #   hub_rotary_frac  the fraction of each book's anchors that carry the position phase (the lowest-index anchors, the highest
+    #                 frequencies); the rest read distance-free as before. 1.0 = every anchor (2026-10-12: the rotary splat's copy
+    #                 held to 512 bytes and died by 896 while the plain splat's held flat; a mixed address keeps both reads)
+    hub_rotary_frac: float = 1.0
     pos_table: bool = True
     bank_byte_table: str = ""
     bank_last_fix: str = ""

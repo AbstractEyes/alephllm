@@ -91,7 +91,8 @@ class Block(nn.Module):
                                        chunk=cfg.hub_chunk,
                                        n_const=getattr(cfg, "hub_const", 1),
                                        rotary=getattr(cfg, "hub_rotary", False),
-                                       rotary_base=getattr(cfg, "rotary_base", 10000.0))
+                                       rotary_base=getattr(cfg, "rotary_base", 10000.0),
+                                       rotary_frac=getattr(cfg, "hub_rotary_frac", 1.0))
         else:
             self.attn = CausalSDPA(d, cfg.n_heads,
                                    qk_norm=getattr(cfg, "qk_norm", ""),

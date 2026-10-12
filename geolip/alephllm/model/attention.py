@@ -384,13 +384,18 @@ class _Constellation(nn.Module):
 class CausalSplatHUB(nn.Module):
     def __init__(self, d: int, K: int = 512, D: int = 32, tau: float = 0.1,
                  chunk: int = 256, n_const: int = 1,
-                 rotary: bool = False, rotary_base: float = 10000.0):
+                 rotary: bool = False, rotary_base: float = 10000.0, rotary_frac: float = 1.0):
         super().__init__()
         # 0.10.18: RoPE on the oriented codes in the NUMERATOR only (the RoFormer linear-attention form): anchor k's
-        # (pos, neg) halves are the pair, rotated by t * base^(-k/K); the agreement mass stays unrotated (positive divide)
+        # (pos, neg) halves are the pair, rotated by t * base^(-k/K); the agreement mass stays unrotated (positive divide).
+        # rotary_frac < 1: only the first round(frac * K) anchors of each book carry the phase (their frequencies are the
+        # highest), the rest read distance-free: a mixed address (near-sharp and far-flat reads in one book)
         self.rotary, self.K = bool(rotary), int(K)
+        self.rotary_frac = float(rotary_frac)
         if self.rotary:
+            assert 0.0 < self.rotary_frac <= 1.0, f"rotary_frac in (0, 1], got {rotary_frac}"
             self._rope = _Rope(K, rotary_base)
+            self.n_rot = max(1, int(round(self.rotary_frac * K)))
         if K > 2 * D:
             import warnings
             warnings.warn(
@@ -541,6 +546,11 @@ class CausalSplatHUB(nn.Module):
         B, n, W = c.shape
         H = W // (2 * self.K)
         cos, sin = self._rope.tables(n, offset, c.device, c.dtype)         # (n, K)
+        if self.n_rot < self.K:                                            # the plain anchors: angle 0
+            keep = torch.zeros(self.K, device=c.device, dtype=torch.bool)
+            keep[:self.n_rot] = True
+            cos = torch.where(keep, cos, torch.ones_like(cos))
+            sin = torch.where(keep, sin, torch.zeros_like(sin))
         v = c.view(B, n, H, 2, self.K)
         p, q = v[..., 0, :], v[..., 1, :]
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
@@ -657,6 +667,11 @@ class CausalSplatHUB(nn.Module):
         for qp, qn, kp, kn in halves:
             if self.rotary:          # 0.10.18: the numerator on rotated halves, the mass on the plain ones
                 cos, sin = self._rope.tables(x.shape[1], 0, x.device, qp.dtype)
+                if self.n_rot < self.K:
+                    keep = torch.zeros(self.K, device=x.device, dtype=torch.bool)
+                    keep[:self.n_rot] = True
+                    cos = torch.where(keep, cos, torch.ones_like(cos))
+                    sin = torch.where(keep, sin, torch.zeros_like(sin))
                 qpr, qnr = qp * cos - qn * sin, qp * sin + qn * cos
                 kpr, knr = kp * cos - kn * sin, kp * sin + kn * cos
             else:
