@@ -86,7 +86,11 @@ class Block(nn.Module):
         self.ckpt_mode = getattr(cfg, "hub_ckpt", 0)
         self.n1 = nn.LayerNorm(d)
         self.n2 = nn.LayerNorm(d)
-        if self.is_hub:
+        if self.is_hub and getattr(cfg, "hub_dual", False):
+            from .attention import DualHub
+            self.attn = DualHub(d, cfg.hub_K, cfg.hub_D, cfg.tau, chunk=cfg.hub_chunk, n_const=getattr(cfg, "hub_const", 1),
+                                rotary_base=getattr(cfg, "rotary_base", 10000.0))
+        elif self.is_hub:
             self.attn = CausalSplatHUB(d, cfg.hub_K, cfg.hub_D, cfg.tau,
                                        chunk=cfg.hub_chunk,
                                        n_const=getattr(cfg, "hub_const", 1),

@@ -116,6 +116,9 @@ class AlephLMConfig:
     #                 frequencies); the rest read distance-free as before. 1.0 = every anchor (2026-10-12: the rotary splat's copy
     #                 held to 512 bytes and died by 896 while the plain splat's held flat; a mixed address keeps both reads)
     hub_rotary_frac: float = 1.0
+    #   hub_dual      every hub block carries TWO hubs side by side (one with the address rotary, one plain), outputs summed,
+    #                 each with its own agreement mass (attention.DualHub); hub_rotary / hub_rotary_frac are not read then
+    hub_dual: bool = False
     pos_table: bool = True
     bank_byte_table: str = ""
     bank_last_fix: str = ""

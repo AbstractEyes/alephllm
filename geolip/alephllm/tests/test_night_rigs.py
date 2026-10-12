@@ -149,6 +149,16 @@ def case_3():
         yhn = half.forward_naive(x)
     check("3g a half-rotated address: the chunked form equals its oracle and differs from both the full and the plain read",
           close(yh, yhn, 2e-5) and float((yh - y).abs().max()) > 1e-4 and float((yh - yp).abs().max()) > 1e-4 and half.n_rot == 8)
+    from ..model.attention import DualHub
+    dual = DualHub(64, 16, 8, 0.1, chunk=16)
+    with torch.no_grad():
+        yd = dual(x)
+        check("3i the dual hub is the sum of a rotary hub and a plain hub", torch.equal(yd, dual.rot(x) + dual.plain(x)) and dual.rot.rotary and not dual.plain.rotary)
+    md = AlephLM(AlephLMConfig(**dict(TINY, hub_dual=True)))
+    md.train()
+    ld = md(torch.randint(0, 256, (2, 32))[:, :-1], torch.randint(0, 256, (2, 31))).loss
+    ld.backward()
+    check("3j a dual-hub craft trains (finite loss; both hubs take gradient)", bool(torch.isfinite(ld)) and md.blocks[1].attn.rot.v.weight.grad is not None and md.blocks[1].attn.plain.v.weight.grad is not None)
     cfg2 = AlephLMConfig(**dict(TINY, hub_rotary=True, hub_rotary_frac=0.25))
     check("3h the fraction reaches the hub and the config round trip keeps it", AlephLM(cfg2).blocks[1].attn.n_rot == 4 and cfg2.to_dict()["hub_rotary_frac"] == 0.25)
 

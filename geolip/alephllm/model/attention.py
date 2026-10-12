@@ -686,3 +686,32 @@ class CausalSplatHUB(nn.Module):
             num = nu if num is None else num + nu
             den = de if den is None else den + de
         return self.o(num / den.clamp_min(dtype_floor(den)))
+
+
+class DualHub(nn.Module):
+    """0.10.18: two splat hubs side by side in one block, one with the address rotary and one plain, their outputs summed,
+    EACH WITH ITS OWN AGREEMENT MASS. The half-rotated single address (hub_rotary_frac 0.5) copied best of the splat forms
+    (first byte 0.89 near, 0.69 at 896 bytes) but read text at 2.63 bits a byte against 1.92 / 2.39 for the full-rotary and
+    plain forms (2026-10-12 04:40): under one shared mass the rotated anchors' far numerators cancel while their mass still
+    counts, diluting the plain anchors' far reads. Two hubs with two masses keep the near-sharp and the far-flat reads whole;
+    the cost is a second hub's compute. Decode owed."""
+
+    def __init__(self, d: int, K: int = 512, D: int = 32, tau: float = 0.1, chunk: int = 256, n_const: int = 1,
+                 rotary_base: float = 10000.0):
+        super().__init__()
+        self.rot = CausalSplatHUB(d, K, D, tau, chunk=chunk, n_const=n_const, rotary=True, rotary_base=rotary_base)
+        self.plain = CausalSplatHUB(d, K, D, tau, chunk=chunk, n_const=n_const)
+        self.rotary, self.dual = True, True
+
+    def forward(self, x):
+        return self.rot(x) + self.plain(x)
+
+    def prefill(self, x):
+        raise AssertionError("decode with the dual hub: owed (0.10.18 trains and scores it; forward only)")
+
+    def step(self, x_t, cache):
+        raise AssertionError("decode with the dual hub: owed")
+
+    @property
+    def last_den_stats(self):
+        return self.plain.last_den_stats
