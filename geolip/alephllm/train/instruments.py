@@ -359,6 +359,35 @@ def special_token_gauge(model, val_batches: list, doc_id: int | None = None,
 
 
 @torch.no_grad()
+def position_bits_gauge(model, val_batches: list, doc_id: int | None = None, bands=None) -> dict | None:
+    """BITS BY POSITION (0.10.18, 2026-10-12; Phil: "We need a gauge that will let us see that for v4"): the val bits a byte
+    within position bands of the window, from the same fixed val batches as the ledger, in BITS (eval/position_bits.py).
+    Two frames: 'row' (distance from the row start) and, for byte crafts, 'doc' (distance since the last DOC target).
+    Returns {'row': {band: bits or None}, 'row_n': {band: n}, 'doc': ..., 'doc_n': ...} or None without batches."""
+    from ..eval import position_bits as pb
+    if not val_batches:
+        return None
+    if bands is None:
+        bands = pb.BANDS
+    byte_craft = getattr(model.cfg, "vocab_size", None) == 256
+    if byte_craft and doc_id is None:
+        from ..data.special_tokens import DOC as doc_id  # single source
+    was_training = model.training
+    model.eval()
+    acc = None
+    for xb in val_batches:
+        x, y = xb[:, :-1], xb[:, 1:]
+        logits, _ = model(x)
+        nll = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]).float(),
+            y.reshape(-1), reduction="none").view_as(y)
+        acc = pb.merge(acc, pb.bits_by_position(nll, (y == doc_id) if byte_craft else None, bands))
+    if was_training:
+        model.train()
+    return pb.finish(acc)
+
+
+@torch.no_grad()
 def head_liveness(model, sample_h: torch.Tensor | None = None,
                   sample_idx: torch.Tensor | None = None) -> dict:
     """The address-liveness gauge the dead-head era was missing

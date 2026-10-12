@@ -1021,15 +1021,23 @@ class Trainer:
         if sp is not None:
             for k, v in sp.items():
                 self.writer.add_scalar(f"special/{k}", v, self.step)
+        pbits = instruments.position_bits_gauge(self.raw_model, self._val())
+        if pbits:
+            for frame in ("row", "doc"):
+                for band, v in pbits.get(frame, {}).items():
+                    if v is not None:
+                        self.writer.add_scalar(f"position/{frame}/{band}", v, self.step)
         extra = {"canary_acc": f"{can['recall_acc']:.3f}"}
         if sp is not None:
             extra["doc"] = (f"n={sp['doc_count']} bpb={sp['doc_bpb']:.2f} "
                             f"reset={sp['reset_bpb']:.2f}")
+        if pbits and pbits.get("row"):
+            extra["bits by position (row)"] = " ".join(f"{b} {v:.2f}" for b, v in pbits["row"].items() if v is not None)
         self._say(instruments.readout(
             self.step, self.manifest.tokens_seen, census, ledger,
             extra=extra))
         self._last_eval = {"census": census, "ledger": ledger, "canary": can,
-                           "special": sp}
+                           "special": sp, "position": pbits}
         return self._last_eval
 
     # -------------------------------------------------------- checkpoints
