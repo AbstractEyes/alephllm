@@ -204,8 +204,29 @@ def case_8():
     check("8c the config round trip", cfg2.bank_last_fix == "register" and tuple(cfg2.fix_clamp) == (0.25, 4.0))
 
 
+def case_9():
+    from ..presets import PRESETS, LASTFIX_BED, LASTFIX_MODES
+    base = PRESETS["mini-beatrix-2s"]
+    ok_all = True
+    for name, kw in LASTFIX_BED.items():
+        p = PRESETS[name]
+        same_recipe = (p.train.micro_batch == base.train.micro_batch and p.train.grad_accum == base.train.grad_accum
+                       and p.train.governor == base.train.governor and p.train.head_addr_frozen == base.train.head_addr_frozen
+                       and p.curriculum == base.curriculum and p.model.d_model == base.model.d_model
+                       and p.model.hub_layers == base.model.hub_layers and p.hf_repo == base.hf_repo)
+        ok = same_recipe and p.model.name == name and p.model.bank_last_fix == kw["mode"] and p.train.seed == kw.get("seed", base.train.seed)
+        ok_all &= ok
+        check(f"9a {name}: the 2s recipe verbatim, the fix {kw['mode']!r}, seed {p.train.seed}", ok)
+    check("9b the base 2s preset is untouched", base.model.bank_last_fix == "" and base.train.seed == 1337 and base.model.name == "mini-beatrix-2s")
+    check("9c every fix mode has a preset", all(any(kw["mode"] == m for kw in LASTFIX_BED.values()) for m in LASTFIX_MODES))
+    cfg = PRESETS["mini-beatrix-2s-fix-register"].model
+    tiny = AlephLMConfig(**dict(TINY, bank_last_fix=cfg.bank_last_fix, fix_rho=cfg.fix_rho, fix_warm=cfg.fix_warm, fix_clamp=cfg.fix_clamp))
+    m = AlephLM(tiny)
+    check("9d the preset's fix fields build the module at the last block", m.last_fix is not None and m.last_fix.mode == "register" and m.blocks[0].fix is None)
+
+
 if __name__ == "__main__":
-    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8):
+    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9):
         fn()
     n_ok = sum(ok for _, ok in RESULTS)
     print(f"\n{n_ok}/{len(RESULTS)} checks pass")

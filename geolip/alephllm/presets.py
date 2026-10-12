@@ -549,6 +549,46 @@ def get_preset(name: str) -> Preset:
     return PRESETS[name]
 
 
+# ---------------------------------------------------------------- 0.10.18: the last block's write fixes at the 2s scale (experiment 2's bed)
+LASTFIX_MODES = ("register", "temperature", "gain", "normwrite")
+
+
+def make_lastfix_preset(mode: str = "register", seed: int | None = None, name: str | None = None) -> Preset:
+    """EXPERIMENT 2's BED (the pre-registered first experiment of the amplitude register, 2026-10-03; the 2s core experiments plan of
+    2026-10-11 s.4; the trajectory read of 2026-10-12: the big direction is formed by 20,219 of 61,422 steps in both 2s teachers, the
+    carrier 2.7x in size over 25,000 steps, the final LayerNorm's bias anti-aligned with it): the mini-beatrix-2s craft and recipe
+    VERBATIM from birth (the curriculum, the 262,144-token step, the governor, the frozen head address, the seed unless given) with the
+    LAST block's write under `mode` (bank_last_fix; model/lastfix.py: register / temperature / gain / normwrite). mode "" = a bare arm
+    (the second bare seed, 1338; the splat 2s ITSELF is bare seed 1, its boundaries already read). The bed's length is the first
+    boundary, 20,219 steps (the launcher's cap: TrainConfig carries no step cap); the softmax twin is the control. Gauges at every
+    boundary (tools/bigdir_2s.py): the carrier share, the per-byte size, the final norm's gains and bias, the exit's exponent and
+    octaves; the falsifier: fineweb bits a byte more than a thousandth of a bit over bare = normalizing, not bounding. NOTHING here
+    launches a run: the launch is his word. Names: mini-beatrix-2s-fix-<mode>; the bare second seed mini-beatrix-2s-bare-s2."""
+    import copy
+    assert mode in ("",) + LASTFIX_MODES, f"mode: '' or one of {LASTFIX_MODES}, got {mode!r}"
+    base = PRESETS["mini-beatrix-2s"]
+    model = copy.deepcopy(base.model)
+    train = copy.deepcopy(base.train)
+    if mode:
+        model.bank_last_fix = mode
+    if seed is not None:
+        train.seed = int(seed)
+    model.name = name or (f"mini-beatrix-2s-fix-{mode}" if mode else f"mini-beatrix-2s-bare-s{train.seed - 1336}")
+    return Preset(model=model, train=train, hf_repo=base.hf_repo, curriculum=copy.deepcopy(base.curriculum),
+                  data_scale=base.data_scale, epoch_cap=base.epoch_cap, rebalance_to=base.rebalance_to)
+
+
+LASTFIX_BED = {
+    "mini-beatrix-2s-fix-register": dict(mode="register"),
+    "mini-beatrix-2s-fix-temperature": dict(mode="temperature"),
+    "mini-beatrix-2s-fix-gain": dict(mode="gain"),
+    "mini-beatrix-2s-fix-normwrite": dict(mode="normwrite"),
+    "mini-beatrix-2s-bare-s2": dict(mode="", seed=1338),
+}
+for _n, _kw in LASTFIX_BED.items():
+    PRESETS[_n] = make_lastfix_preset(**_kw)
+
+
 # ---------------------------------------------------------------- 0.10.15: the byte screen's arms + the v3 lookup arm
 BYTE_SCREEN_KINDS = {
     "ctrl": dict(extra_train=None, phase_dataset_override=None),
