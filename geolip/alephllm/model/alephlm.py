@@ -101,6 +101,18 @@ class Block(nn.Module):
                                    rotary_base=getattr(cfg, "rotary_base", 10000.0))
         self.bank = AnchoredBank(d, cfg.bank_experts, cfg.bank_ff, cfg.tau,
                                  cfg.gate_init, byte_table=getattr(cfg, "bank_byte_table", ""))
+        # 0.10.18: the LAST block's always-on write under a bound (model/lastfix.py: the amplitude register and its
+        # comparison forms); None in every other block and with the flag off (the form above bit for bit)
+        mode = getattr(cfg, "bank_last_fix", "")
+        if mode and layer_idx == cfg.n_layers - 1:
+            from .lastfix import LastWriteFix
+            self.fix = LastWriteFix(d, cfg.vocab_size, mode, rho=getattr(cfg, "fix_rho", 1 / 16),
+                                    warm=getattr(cfg, "fix_warm", 200), clamp=tuple(getattr(cfg, "fix_clamp", (0.25, 4.0))))
+        else:
+            self.fix = None
+
+    def _fixed(self, w):
+        return self.fix(w) if self.fix is not None else w
 
     def forward(self, x, disable_bank=False, disable_hub=False, byte_cls=None):
         # hub_ckpt (2026-08-26): recompute-in-backward for the heavy
@@ -108,6 +120,7 @@ class Block(nn.Module):
         # 95GB card (measured OOM). Training-path only; eval/decode and
         # the census replay (which calls attn/bank directly) are untouched.
         # byte_cls (0.10.18): the input bytes' classes for the bank's byte-class table; None = the table off.
+        # The last block's fix runs OUTSIDE the checkpointed region (its slow statistics update once per forward).
         ckpt = self.ckpt_mode and self.training and torch.is_grad_enabled()
         if not (disable_hub and self.is_hub):
             if ckpt:
@@ -116,18 +129,18 @@ class Block(nn.Module):
             else:
                 x = x + self.attn(self.n1(x))
         if ckpt and self.ckpt_mode >= 2 and not disable_bank:
-            return x + torch.utils.checkpoint.checkpoint(
-                lambda t: self.bank(t, byte_cls=byte_cls), self.n2(x), use_reentrant=False)
-        return x + self.bank(self.n2(x), disable_dispatch=disable_bank, byte_cls=byte_cls)
+            return x + self._fixed(torch.utils.checkpoint.checkpoint(
+                lambda t: self.bank(t, byte_cls=byte_cls), self.n2(x), use_reentrant=False))
+        return x + self._fixed(self.bank(self.n2(x), disable_dispatch=disable_bank, byte_cls=byte_cls))
 
     def prefill(self, x):
         a, cache = self.attn.prefill(self.n1(x))
         x = x + a
-        return x + self.bank(self.n2(x)), cache
+        return x + self._fixed(self.bank(self.n2(x))), cache
 
     def step(self, x_t, cache):
         x_t = x_t + self.attn.step(self.n1(x_t), cache)
-        return x_t + self.bank(self.n2(x_t))
+        return x_t + self._fixed(self.bank(self.n2(x_t)))
 
 
 class AlephLM(nn.Module):
@@ -145,7 +158,6 @@ class AlephLM(nn.Module):
         self.byte_table = bool(getattr(cfg, "bank_byte_table", ""))
         if self.byte_table:
             self.register_buffer("_byte_cls_table", byte_class_table(), persistent=False)
-        assert not getattr(cfg, "bank_last_fix", ""), "bank_last_fix: built in the next commit of 0.10.18"
         self.blocks = nn.ModuleList(
             Block(cfg, i) for i in range(cfg.n_layers))
         self.nf = nn.LayerNorm(cfg.d_model)
@@ -164,6 +176,9 @@ class AlephLM(nn.Module):
             assert self.fusion.k_lo + self.fusion.k_hi <= cfg.n_layers, \
                 "fusion: k_lo + k_hi must not exceed n_layers"
             assert not self.byte_table, "the byte-class table: the byte trunk only (no fusion)"
+            assert not getattr(cfg, "bank_last_fix", ""), "the last block's fix: the byte trunk only (no fusion)"
+        # 0.10.18: the last block's fix adjusts the head (a tuple reference: the module is the block's, registered once)
+        self._fix_ref = (self.blocks[-1].fix,) if len(self.blocks) and getattr(self.blocks[-1], "fix", None) is not None else None
         # the lookup arm (0.10.15): zero-born softmax attention AFTER each named block, outside the hubs' address
         # reads. Born null by WEIGHT (the output projection at zero), never by a gate: the trunk's function is
         # untouched at step 0 and the arm is removable (its keys are a subset of the state dict).
@@ -242,6 +257,8 @@ class AlephLM(nn.Module):
         x = self._trunk(x, idx, disable_bank=disable_bank, disable_hub=disable_hub)
         h = self.nf(x)
         logits = self.head(h, disable_aleph=disable_head_aleph)
+        if self.last_fix is not None:
+            logits = self.last_fix.head_adjust(logits)
         if targets is not None:                     # pre-shifted (ours)
             loss = self._loss(logits, targets, idx)
         elif labels is not None:                    # HF: shift internally
@@ -290,6 +307,7 @@ class AlephLM(nn.Module):
         bytes, and the absolute position cursor."""
         self.eval()
         assert not getattr(self, "lookup_sites", ()), "decode with lookup arms: owed (0.10.15 trains and scores them; forward only)"
+        assert not (self.last_fix is not None and self.last_fix.mode == "normwrite"), "decode with normwrite: owed (cumulative statistics)"
         if self.fusion is not None:
             return self._prefill_fused(idx)
         from .embedding import PAD_ROW
@@ -300,6 +318,8 @@ class AlephLM(nn.Module):
             caches.append(c)
         h = self.nf(x)
         logits = self.head(h[:, -1:])
+        if self.last_fix is not None:
+            logits = self.last_fix.head_adjust(logits, self.last_fix.last_a[:, -1:])
         n = idx.shape[1]
         prev2 = idx[:, -2] if n >= 2 else torch.full_like(idx[:, -1], PAD_ROW)
         return logits, {"layers": caches, "t": n,
@@ -329,7 +349,16 @@ class AlephLM(nn.Module):
         for b, c in zip(self.blocks, cache["layers"]):
             x = b.step(x, c)
         cache["t"] = t + 1
-        return self.head(self.nf(x))
+        logits = self.head(self.nf(x))
+        if self.last_fix is not None:
+            logits = self.last_fix.head_adjust(logits)
+        return logits
+
+    @property
+    def last_fix(self):
+        """The last block's write fix (model/lastfix.py) or None."""
+        ref = getattr(self, "_fix_ref", None)
+        return ref[0] if ref else None
 
     # ------------------------------------------------- fused decode path
     @torch.no_grad()

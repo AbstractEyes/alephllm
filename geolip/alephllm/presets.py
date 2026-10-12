@@ -116,6 +116,10 @@ class AlephLMConfig:
     bank_byte_table: str = ""
     bank_last_fix: str = ""
     fix_rho: float = 0.0625
+    #   fix_warm      training forwards with the gain at exactly 1 before the reference is frozen
+    #   fix_clamp     the bound on the gain (and on the temperature)
+    fix_warm: int = 200
+    fix_clamp: tuple = (0.25, 4.0)
 
     def to_dict(self):
         d = asdict(self)
