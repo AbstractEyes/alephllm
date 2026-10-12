@@ -19,26 +19,43 @@ BYTE_VOCAB = 256
 PAD_ROW = 256  # dedicated pad index in the shift tables (size 257)
 
 
+def _freeze_pos(pos: nn.Parameter, pos_table: bool) -> bool:
+    """0.10.18: pos_table False zeroes and freezes the learned position table (positions come from the rotary); the
+    parameter stays (the state dict's keys and the init's RNG draw unchanged). Returns whether the table is used."""
+    if pos_table:
+        return True
+    with torch.no_grad():
+        pos.zero_()
+    pos.requires_grad_(False)
+    return False
+
+
 class TrigramByteEmbedding(nn.Module):
-    def __init__(self, d: int, context: int):
+    def __init__(self, d: int, context: int, pos_table: bool = True):
         super().__init__()
         self.emb0 = nn.Embedding(BYTE_VOCAB, d)
         self.emb1 = nn.Embedding(BYTE_VOCAB + 1, d)   # + pad row
         self.emb2 = nn.Embedding(BYTE_VOCAB + 1, d)
         self.pos = nn.Parameter(0.01 * torch.randn(1, context, d))
+        self.use_pos = _freeze_pos(self.pos, pos_table)
 
     def forward(self, idx):
         x = self.emb0(idx) \
             + self.emb1(F.pad(idx, (1, 0), value=PAD_ROW)[:, :-1]) \
             + self.emb2(F.pad(idx, (2, 0), value=PAD_ROW)[:, :-2])
+        if not getattr(self, "use_pos", True):
+            return x
         return x + self.pos[:, : idx.shape[1]]
 
 
 class TokenEmbedding(nn.Module):
-    def __init__(self, vocab: int, d: int, context: int):
+    def __init__(self, vocab: int, d: int, context: int, pos_table: bool = True):
         super().__init__()
         self.emb = nn.Embedding(vocab, d)
         self.pos = nn.Parameter(0.01 * torch.randn(1, context, d))
+        self.use_pos = _freeze_pos(self.pos, pos_table)
 
     def forward(self, idx):
+        if not getattr(self, "use_pos", True):
+            return self.emb(idx)
         return self.emb(idx) + self.pos[:, : idx.shape[1]]

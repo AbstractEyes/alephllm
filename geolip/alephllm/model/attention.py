@@ -147,6 +147,39 @@ def _rms_normalize(t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return t * inv.to(t.dtype)
 
 
+# ------------------------------------------------------------------ rotary (0.10.18, the night rigs)
+class _Rope:
+    """cos/sin tables for P pair frequencies base^(-j/P), j = 0..P-1, grown on demand per (device, dtype) and sliced
+    by position. Angles are formed in fp32 and cast once (a bf16 angle at position 4,000 would lose the fine
+    frequencies' phase). Not a parameter, not a buffer: nothing enters the state dict."""
+
+    def __init__(self, pairs: int, base: float = 10000.0):
+        assert pairs >= 1
+        self.P, self.base = int(pairs), float(base)
+        self._cache: dict = {}
+
+    def tables(self, n: int, offset: int, device, dtype):
+        """-> (cos, sin), each (n, P), for positions offset .. offset + n - 1."""
+        key = (device, dtype)
+        need = offset + n
+        ent = self._cache.get(key)
+        if ent is None or ent[0].shape[0] < need:
+            L = max(need, 1024, 2 * (ent[0].shape[0] if ent is not None else 0))
+            inv = self.base ** (-torch.arange(self.P, device=device, dtype=torch.float32) / self.P)
+            ang = torch.arange(L, device=device, dtype=torch.float32)[:, None] * inv[None, :]
+            ent = (ang.cos().to(dtype), ang.sin().to(dtype))
+            self._cache[key] = ent
+        return ent[0][offset:need], ent[1][offset:need]
+
+
+def rope_half(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate-half RoPE on the last dim of t (..., n, 2P): the pair (j, j + P) is rotated by the angle of frequency j;
+    cos/sin (n, P) broadcast over the leading dims."""
+    P = cos.shape[-1]
+    a, b = t[..., :P], t[..., P:]
+    return torch.cat([a * cos - b * sin, a * sin + b * cos], dim=-1)
+
+
 class CausalSDPA(nn.Module):
     """Softmax attention: fused qkv, F.scaled_dot_product_attention with
     is_causal, the output projection. Two optional guards (2026-10-09; the
@@ -166,7 +199,8 @@ class CausalSDPA(nn.Module):
     same code path)."""
 
     def __init__(self, d: int, heads: int = 8, qk_norm: str = "",
-                 attn_fp32: bool = False, attn_kernel: str = "sdpa"):
+                 attn_fp32: bool = False, attn_kernel: str = "sdpa",
+                 rotary: bool = False, rotary_base: float = 10000.0):
         super().__init__()
         assert d % heads == 0
         assert qk_norm in ("", "rms"), f"qk_norm: '' or 'rms', got {qk_norm!r}"
@@ -181,10 +215,23 @@ class CausalSDPA(nn.Module):
             hd = d // heads
             self.q_gain = nn.Parameter(torch.ones(heads, 1, hd))
             self.k_gain = nn.Parameter(torch.ones(heads, 1, hd))
+        # 0.10.18: RoPE on q and k (rotate-half over head_dim), after the guard, before the kernel; off = the form above
+        self.rotary = bool(rotary)
+        if self.rotary:
+            hd = d // heads
+            assert hd % 2 == 0, f"rotary needs an even head_dim, got {hd}"
+            self._rope = _Rope(hd // 2, rotary_base)
+
+    def _rotate(self, q, k, offset: int = 0):
+        if not self.rotary:
+            return q, k
+        n = q.shape[-2]
+        cos, sin = self._rope.tables(n, offset, q.device, q.dtype)
+        return rope_half(q, cos, sin), rope_half(k, cos, sin)
 
     def extra_repr(self) -> str:
         return (f"heads={self.h}, qk_norm={self.qk_norm!r}, attn_fp32={self.attn_fp32}, "
-                f"attn_kernel={self.attn_kernel!r}")
+                f"attn_kernel={self.attn_kernel!r}" + (", rotary=True" if self.rotary else ""))
 
     def kernel_label(self, precision: str = "bf16") -> str:
         """The attention kernel this block runs in the training forward on
@@ -224,6 +271,7 @@ class CausalSDPA(nn.Module):
         B, d = x.shape[0], x.shape[-1]
         q, k, v = self._split(x, n)
         q, k = self._guard(q, k)
+        q, k = self._rotate(q, k)
         if (self.attn_kernel == "flex" and self.training and torch.is_grad_enabled()
                 and q.is_cuda):
             y = _flex(q, k, v)
@@ -248,6 +296,7 @@ class CausalSDPA(nn.Module):
         B, n, d = x.shape
         q, k, v = self._split(x, n)
         q, k = self._guard(q, k)
+        q, k = self._rotate(q, k)                      # the cache keeps ROTATED keys (their own positions)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).reshape(B, n, d)), {"k": k, "v": v}
 
@@ -256,6 +305,7 @@ class CausalSDPA(nn.Module):
         B, _, d = x_t.shape
         q, k, v = self._split(x_t, 1)
         q, k = self._guard(q, k)
+        q, k = self._rotate(q, k, offset=cache["k"].shape[2])     # this token's position = the cached length
         cache["k"] = torch.cat([cache["k"], k], dim=2)
         cache["v"] = torch.cat([cache["v"], v], dim=2)
         y = F.scaled_dot_product_attention(q, cache["k"], cache["v"])
@@ -333,8 +383,14 @@ class _Constellation(nn.Module):
 
 class CausalSplatHUB(nn.Module):
     def __init__(self, d: int, K: int = 512, D: int = 32, tau: float = 0.1,
-                 chunk: int = 256, n_const: int = 1):
+                 chunk: int = 256, n_const: int = 1,
+                 rotary: bool = False, rotary_base: float = 10000.0):
         super().__init__()
+        # 0.10.18: RoPE on the oriented codes in the NUMERATOR only (the RoFormer linear-attention form): anchor k's
+        # (pos, neg) halves are the pair, rotated by t * base^(-k/K); the agreement mass stays unrotated (positive divide)
+        self.rotary, self.K = bool(rotary), int(K)
+        if self.rotary:
+            self._rope = _Rope(K, rotary_base)
         if K > 2 * D:
             import warnings
             warnings.warn(
@@ -479,20 +535,35 @@ class CausalSplatHUB(nn.Module):
             outs.append((qp, qn, kp, kn))
         return outs, self.v(x)
 
-    def _scan_cat(self, qc, kc, v, mask, B, n, nc, C, d):
-        """The exact chunked scan for one 2K-wide constellation."""
+    def _rotate_codes(self, c, offset: int = 0):
+        """c (B, n, H*2K) in the per-book layout [K pos | K neg] -> the same layout with anchor k's two halves rotated
+        by the angle (offset + t) * base^(-k/K) (0.10.18)."""
+        B, n, W = c.shape
+        H = W // (2 * self.K)
+        cos, sin = self._rope.tables(n, offset, c.device, c.dtype)         # (n, K)
+        v = c.view(B, n, H, 2, self.K)
+        p, q = v[..., 0, :], v[..., 1, :]
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return torch.stack([p * cos - q * sin, p * sin + q * cos], dim=-2).reshape(B, n, W)
+
+    def _scan_cat(self, qc, kc, v, mask, B, n, nc, C, d, qr=None, kr=None):
+        """The exact chunked scan for one 2K-wide constellation. qr/kr (0.10.18): the ROTATED codes for the numerator;
+        the agreement mass (den) always reads the unrotated qc/kc. None = the form before, op for op."""
         K2 = qc.shape[-1]
         qc = qc.view(B, nc, C, K2)
         kc = kc.view(B, nc, C, K2)
-        S = torch.einsum("bick,bicd->bikd", kc, v)     # per-chunk 2KxD sums
         L = self._prefix(nc, qc.device, qc.dtype)
-        P = torch.matmul(L, S.reshape(B, nc, -1)).view_as(S)  # excl. prefix
         zS = kc.sum(dim=2)                              # (B, nc, 2K)
         zP = torch.matmul(L, zS)
         att = torch.einsum("bick,bijk->bicj", qc, kc) * mask    # (B,nc,C,C)
-        num = torch.einsum("bick,bikd->bicd", qc, P) + att @ v
         den = torch.einsum("bick,bik->bic", qc, zP).unsqueeze(-1) \
             + att.sum(dim=-1, keepdim=True)
+        if qr is not None:
+            qc, kc = qr.view(B, nc, C, K2), kr.view(B, nc, C, K2)
+            att = torch.einsum("bick,bijk->bicj", qc, kc) * mask
+        S = torch.einsum("bick,bicd->bikd", kc, v)     # per-chunk 2KxD sums
+        P = torch.matmul(L, S.reshape(B, nc, -1)).view_as(S)  # excl. prefix
+        num = torch.einsum("bick,bikd->bicd", qc, P) + att @ v
         return num.reshape(B, nc * C, d)[:, :n], den.reshape(B, nc * C, 1)[:, :n]
 
     def forward(self, x):
@@ -524,10 +595,16 @@ class CausalSplatHUB(nn.Module):
         if qc.dtype != v.dtype:      # einsum-promote guard (belt-and-braces;
             qc = qc.to(v.dtype)      # _code_cat_qk already returns the
             kc = kc.to(v.dtype)      # compute dtype)
+        qr = kr = None
+        if self.rotary:              # 0.10.18: the numerator's codes carry the position phase
+            qr, kr = self._rotate_codes(qc), self._rotate_codes(kc)
+            if pad:
+                qr = F.pad(qr, (0, 0, 0, pad))
+                kr = F.pad(kr, (0, 0, 0, pad))
         if pad:
             qc = F.pad(qc, (0, 0, 0, pad))
             kc = F.pad(kc, (0, 0, 0, pad))
-        num, den = self._scan_cat(qc, kc, vc, mask, B, n, nc, C, d)
+        num, den = self._scan_cat(qc, kc, vc, mask, B, n, nc, C, d, qr, kr)
         cl = dtype_floor(den)
         self._den_raw = (den.detach(), cl)
         self._den_stats = None
@@ -540,6 +617,7 @@ class CausalSplatHUB(nn.Module):
         O(n_const·K·d) regardless of sequence length; this is the
         linear-attention decode advantage. n_const == 1 keeps the exact
         v1 cache shape (arms and the Space depend on it)."""
+        assert not self.rotary, "decode with the address rotary: owed (0.10.18 trains and scores it; forward only)"
         out = self.forward(x)
         halves, v = self._halves(x)
         caches = [{"Sp": torch.einsum("bnk,bnd->bkd", kp, v),
@@ -577,12 +655,18 @@ class CausalSplatHUB(nn.Module):
         halves, v = self._halves(x)
         num = den = None
         for qp, qn, kp, kn in halves:
-            Sp = torch.cumsum(torch.einsum("bnk,bnd->bnkd", kp, v), dim=1)
-            Sn = torch.cumsum(torch.einsum("bnk,bnd->bnkd", kn, v), dim=1)
+            if self.rotary:          # 0.10.18: the numerator on rotated halves, the mass on the plain ones
+                cos, sin = self._rope.tables(x.shape[1], 0, x.device, qp.dtype)
+                qpr, qnr = qp * cos - qn * sin, qp * sin + qn * cos
+                kpr, knr = kp * cos - kn * sin, kp * sin + kn * cos
+            else:
+                qpr, qnr, kpr, knr = qp, qn, kp, kn
+            Sp = torch.cumsum(torch.einsum("bnk,bnd->bnkd", kpr, v), dim=1)
+            Sn = torch.cumsum(torch.einsum("bnk,bnd->bnkd", knr, v), dim=1)
             zp = torch.cumsum(kp, dim=1)
             zn = torch.cumsum(kn, dim=1)
-            nu = torch.einsum("bnk,bnkd->bnd", qp, Sp) \
-                + torch.einsum("bnk,bnkd->bnd", qn, Sn)
+            nu = torch.einsum("bnk,bnkd->bnd", qpr, Sp) \
+                + torch.einsum("bnk,bnkd->bnd", qnr, Sn)
             de = (qp * zp).sum(-1, keepdim=True) + (qn * zn).sum(-1, keepdim=True)
             num = nu if num is None else num + nu
             den = de if den is None else den + de

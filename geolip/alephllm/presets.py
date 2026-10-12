@@ -92,6 +92,30 @@ class AlephLMConfig:
     # lookup_arms.<site>_l<k> / lookup_norms.<site>_l<k> for k >= 2, zero-born, so a depth-1 arm's checkpoint loads into
     # a deeper craft with exactly the new layers' keys missing and the craft is the shallower arm at birth
     lookup_arm_depth: int = 1
+    # 0.10.18 (the night rigs, 2026-10-12: experiment 3's small bed and the last-block fixes). EVERY default = the current form
+    # bit for bit; old manifests load via the defaults; with the flags off no state-dict key changes.
+    #   attn_rotary   RoPE on q and k of every CausalSDPA block (the lookup arms included): rotate-half over head_dim, base
+    #                 rotary_base; applied after the QK-norm guard, before the kernel; the decode cache keeps rotated keys
+    #   hub_rotary    RoPE on the hub's oriented codes in the NUMERATOR only (the RoFormer linear-attention form, 2104.09864
+    #                 s.3.4.3: the agreement mass stays unrotated, so the divide stays positive); the (pos, neg) halves of an
+    #                 anchor form the pair, one frequency per anchor (base^(-k/K)): "global positioning superimposed on the
+    #                 address's anchored behavior"
+    #   rotary_base   the RoPE base for both
+    #   pos_table     False: the embedding's learned position table is zeroed and frozen (positions from the rotary alone)
+    #   bank_byte_table  "" = the aleph address alone (the current form); "fixed" = the dispatch amplitudes REPLACED by an
+    #                 installed byte-class table (7 classes x K experts, class c -> expert c mod K at amplitude 1, not
+    #                 learned: experts dedicated to the bytes); "add" = the address PLUS that installed table (learned);
+    #                 "add0" = the address plus a zero-born learned table (bit-identical to "" at birth)
+    #   bank_last_fix the LAST block's always-on write (the big final-layer direction; plans/2026-10-03 row A):
+    #                 "" | "register" | "temperature" | "gain" | "normwrite" — see model/lastfix.py
+    #   fix_rho       the slow gain's EMA rate (per optimizer step; never over positions)
+    attn_rotary: bool = False
+    hub_rotary: bool = False
+    rotary_base: float = 10000.0
+    pos_table: bool = True
+    bank_byte_table: str = ""
+    bank_last_fix: str = ""
+    fix_rho: float = 0.0625
 
     def to_dict(self):
         d = asdict(self)

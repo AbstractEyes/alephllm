@@ -29,7 +29,7 @@ class LMOutput(NamedTuple):
 
 from ..presets import AlephLMConfig
 from .attention import CausalSDPA, CausalSplatHUB
-from .bank import AnchoredBank
+from .bank import AnchoredBank, byte_class_table
 from .embedding import TrigramByteEmbedding, TokenEmbedding
 from .head import DualHead
 
@@ -89,20 +89,25 @@ class Block(nn.Module):
         if self.is_hub:
             self.attn = CausalSplatHUB(d, cfg.hub_K, cfg.hub_D, cfg.tau,
                                        chunk=cfg.hub_chunk,
-                                       n_const=getattr(cfg, "hub_const", 1))
+                                       n_const=getattr(cfg, "hub_const", 1),
+                                       rotary=getattr(cfg, "hub_rotary", False),
+                                       rotary_base=getattr(cfg, "rotary_base", 10000.0))
         else:
             self.attn = CausalSDPA(d, cfg.n_heads,
                                    qk_norm=getattr(cfg, "qk_norm", ""),
                                    attn_fp32=getattr(cfg, "attn_fp32", False),
-                                   attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
+                                   attn_kernel=getattr(cfg, "attn_kernel", "sdpa"),
+                                   rotary=getattr(cfg, "attn_rotary", False),
+                                   rotary_base=getattr(cfg, "rotary_base", 10000.0))
         self.bank = AnchoredBank(d, cfg.bank_experts, cfg.bank_ff, cfg.tau,
-                                 cfg.gate_init)
+                                 cfg.gate_init, byte_table=getattr(cfg, "bank_byte_table", ""))
 
-    def forward(self, x, disable_bank=False, disable_hub=False):
+    def forward(self, x, disable_bank=False, disable_hub=False, byte_cls=None):
         # hub_ckpt (2026-08-26): recompute-in-backward for the heavy
         # branches — at v2 scale the retained scan tensors alone exceed a
         # 95GB card (measured OOM). Training-path only; eval/decode and
         # the census replay (which calls attn/bank directly) are untouched.
+        # byte_cls (0.10.18): the input bytes' classes for the bank's byte-class table; None = the table off.
         ckpt = self.ckpt_mode and self.training and torch.is_grad_enabled()
         if not (disable_hub and self.is_hub):
             if ckpt:
@@ -112,8 +117,8 @@ class Block(nn.Module):
                 x = x + self.attn(self.n1(x))
         if ckpt and self.ckpt_mode >= 2 and not disable_bank:
             return x + torch.utils.checkpoint.checkpoint(
-                lambda t: self.bank(t), self.n2(x), use_reentrant=False)
-        return x + self.bank(self.n2(x), disable_dispatch=disable_bank)
+                lambda t: self.bank(t, byte_cls=byte_cls), self.n2(x), use_reentrant=False)
+        return x + self.bank(self.n2(x), disable_dispatch=disable_bank, byte_cls=byte_cls)
 
     def prefill(self, x):
         a, cache = self.attn.prefill(self.n1(x))
@@ -131,11 +136,16 @@ class AlephLM(nn.Module):
         self.cfg = cfg
         if cfg.tokenizer == "byte-trigram":
             assert cfg.vocab_size == 256, "byte crafts use vocab 256"
-            self.embed = TrigramByteEmbedding(cfg.d_model, cfg.context)
+            self.embed = TrigramByteEmbedding(cfg.d_model, cfg.context, pos_table=getattr(cfg, "pos_table", True))
             tied = None
         else:
-            self.embed = TokenEmbedding(cfg.vocab_size, cfg.d_model, cfg.context)
+            self.embed = TokenEmbedding(cfg.vocab_size, cfg.d_model, cfg.context, pos_table=getattr(cfg, "pos_table", True))
             tied = self.embed.emb.weight if cfg.tie_embeddings else None
+        # 0.10.18: the bank's byte-class table reads the input bytes' classes (computed once per forward in _trunk)
+        self.byte_table = bool(getattr(cfg, "bank_byte_table", ""))
+        if self.byte_table:
+            self.register_buffer("_byte_cls_table", byte_class_table(), persistent=False)
+        assert not getattr(cfg, "bank_last_fix", ""), "bank_last_fix: built in the next commit of 0.10.18"
         self.blocks = nn.ModuleList(
             Block(cfg, i) for i in range(cfg.n_layers))
         self.nf = nn.LayerNorm(cfg.d_model)
@@ -153,6 +163,7 @@ class AlephLM(nn.Module):
         if self.fusion is not None:
             assert self.fusion.k_lo + self.fusion.k_hi <= cfg.n_layers, \
                 "fusion: k_lo + k_hi must not exceed n_layers"
+            assert not self.byte_table, "the byte-class table: the byte trunk only (no fusion)"
         # the lookup arm (0.10.15): zero-born softmax attention AFTER each named block, outside the hubs' address
         # reads. Born null by WEIGHT (the output projection at zero), never by a gate: the trunk's function is
         # untouched at step 0 and the arm is removable (its keys are a subset of the state dict).
@@ -164,7 +175,9 @@ class AlephLM(nn.Module):
         self.lookup_arms = nn.ModuleDict({str(s): CausalSDPA(cfg.d_model, cfg.n_heads,
                                                              qk_norm=getattr(cfg, "qk_norm", ""),
                                                              attn_fp32=getattr(cfg, "attn_fp32", False),
-                                                             attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
+                                                             attn_kernel=getattr(cfg, "attn_kernel", "sdpa"),
+                                                             rotary=getattr(cfg, "attn_rotary", False),
+                                                             rotary_base=getattr(cfg, "rotary_base", 10000.0))
                                           for s in sites})
         # 0.10.17: depth. Extra attention layers per site after the first, keyed <site>_l<k> under the SAME ModuleDicts, so the
         # arm-key prefixes (TrainConfig.arm_params), the weights-only loader's allowance and the shipping filter hold unchanged;
@@ -175,7 +188,9 @@ class AlephLM(nn.Module):
                 self.lookup_norms[f"{s}_l{k}"] = nn.LayerNorm(cfg.d_model)
                 self.lookup_arms[f"{s}_l{k}"] = CausalSDPA(cfg.d_model, cfg.n_heads, qk_norm=getattr(cfg, "qk_norm", ""),
                                                            attn_fp32=getattr(cfg, "attn_fp32", False),
-                                                           attn_kernel=getattr(cfg, "attn_kernel", "sdpa"))
+                                                           attn_kernel=getattr(cfg, "attn_kernel", "sdpa"),
+                                                           rotary=getattr(cfg, "attn_rotary", False),
+                                                           rotary_base=getattr(cfg, "rotary_base", 10000.0))
         for arm in self.lookup_arms.values():
             nn.init.zeros_(arm.o.weight)
 
@@ -187,8 +202,9 @@ class AlephLM(nn.Module):
     def _trunk(self, x, idx, disable_bank=False, disable_hub=False):
         if self.fusion is None:
             arms = getattr(self, "lookup_arms", None)
+            cls = self._byte_cls_table[idx] if getattr(self, "byte_table", False) else None     # 0.10.18
             for i, b in enumerate(self.blocks):
-                x = b(x, disable_bank=disable_bank, disable_hub=disable_hub)
+                x = b(x, disable_bank=disable_bank, disable_hub=disable_hub, byte_cls=cls)
                 if arms and str(i) in arms:          # the lookup arm reads the block's output, writes to the stream
                     x = x + arms[str(i)](self.lookup_norms[str(i)](x))
                     for k in range(2, getattr(self, "lookup_depth", 1) + 1):     # 0.10.17: the site's extra layers, in series
