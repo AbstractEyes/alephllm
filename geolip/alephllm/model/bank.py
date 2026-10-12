@@ -81,10 +81,13 @@ class AnchoredBank(nn.Module):
         if not getattr(self, "byte_table", ""):
             return self.addr.signed(x)
         assert byte_cls is not None, "the byte-class table needs the input bytes' classes (AlephLM._trunk passes them; decode is owed)"
-        tab = self.byte_amp[byte_cls]                             # (B, n, K) fp32
         if self.byte_table == "fixed":
-            return tab
-        return self.addr.signed(x) + tab
+            return self.byte_amp[byte_cls]                        # (B, n, K) fp32; a buffer: a plain gather
+        # a learned table reads through a one-hot matmul, NOT a gather: the gather's backward scatters 32k rows into a 7 x K table
+        # with atomic adds (measured 2026-10-12: the "add" arm trained at 186k tokens/s against 311k for "fixed"); the matmul's
+        # backward is one small GEMM. The values are exact either way (products of 1 and 0).
+        oh = F.one_hot(byte_cls, self.byte_amp.shape[0]).to(self.byte_amp.dtype)     # (B, n, C)
+        return self.addr.signed(x) + oh @ self.byte_amp
 
     def forward(self, x, disable_dispatch: bool = False, byte_cls=None):
         trunk = self.t_out(F.gelu(self.t_in(x)))
