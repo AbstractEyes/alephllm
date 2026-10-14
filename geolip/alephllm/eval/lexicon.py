@@ -30,6 +30,8 @@ def capture(model, ids: torch.Tensor) -> dict:
     for i, wrap in enumerate(model.blocks):
         blk = getattr(wrap, "block", wrap)
         tap = blk.n1(x)
+        if getattr(blk, "canon_a", None) is not None:      # 0.10.18 rc8: the mixer reads the Canon layer's output
+            tap = blk.canon_a(tap)
         if blk.is_hub:
             if getattr(blk.attn, "n_const", 1) == 1:
                 w = blk.attn.addr.signed(blk.attn.q(tap))  # (B, T, K)
@@ -41,7 +43,8 @@ def capture(model, ids: torch.Tensor) -> dict:
                                for c in blk.attn.consts], dim=-1)
             tops[f"hub_L{i}"] = w.abs().argmax(-1)        # (B, T)
         x = x + blk.attn(tap)
-        x = x + blk.bank(blk.n2(x))
+        tb = blk.n2(x)
+        x = x + blk.bank(blk.canon_c(tb) if getattr(blk, "canon_c", None) is not None else tb)
         if wrap is not blk:
             if hasattr(wrap, "adapter") and getattr(wrap, "enabled", True):
                 x = wrap.adapter(x)

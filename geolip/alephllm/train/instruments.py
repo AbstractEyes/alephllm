@@ -81,6 +81,8 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
             blk = blk.block
         li = {}
         tap_attn = blk.n1(x)
+        if getattr(blk, "canon_a", None) is not None:      # 0.10.18 rc8: the mixer reads the Canon layer's output
+            tap_attn = blk.canon_a(tap_attn)
         if blk.is_hub:
             if getattr(blk.attn, "n_const", 1) == 1:
                 q = blk.attn.q(tap_attn)
@@ -117,6 +119,8 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
             dmin, dmean, dfloor = blk.attn.last_den_stats
             li["hub_den"] = {"min": dmin, "mean": dmean, "floor_frac": dfloor}
         tap_bank = blk.n2(x)
+        if getattr(blk, "canon_c", None) is not None:      # 0.10.18 rc8: the bank reads the Canon layer's output
+            tap_bank = blk.canon_c(tap_bank)
         li["bank_addr"] = blk.bank.addr.health(tap_bank)
         x = x + blk.bank(tap_bank)
         for w in reversed(chain):                 # innermost wrapper first

@@ -127,6 +127,11 @@ class AlephLMConfig:
     #   fix_clamp     the bound on the gain (and on the temperature)
     fix_warm: int = 200
     fix_clamp: tuple = (0.25, 4.0)
+    # 0.10.18 rc8 (2026-10-14): Canon layers (Allen-Zhu 2512.17351; model/canon.py). "" = off (every block as before, no new
+    # state-dict key); otherwise the sites, any of "A" (the mixer's input, after the block's first norm) and "C" (the bank's input,
+    # after the second norm): h' = h + sum_{i<4} w_i * h_(t-i), per-channel weights born zero (the craft is its Canon-free form at
+    # birth). Forward only: prefill / step refuse a craft with the layer.
+    canon: str = ""
 
     def to_dict(self):
         d = asdict(self)

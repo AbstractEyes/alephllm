@@ -115,9 +115,27 @@ class Block(nn.Module):
                                     warm=getattr(cfg, "fix_warm", 200), clamp=tuple(getattr(cfg, "fix_clamp", (0.25, 4.0))))
         else:
             self.fix = None
+        # 0.10.18 rc8: the Canon layers (model/canon.py) on the mixer's input (site A) and the bank's input (site C); None with the
+        # flag off (no state-dict key: the form above bit for bit); zero-born, so with the flag on the craft equals it at birth
+        canon = getattr(cfg, "canon", "") or ""
+        assert set(canon) <= {"A", "C"}, f"canon sites are 'A' and/or 'C', got {canon!r}"
+        if canon:
+            from .canon import CanonConv
+        self.canon_a = CanonConv(d) if "A" in canon else None
+        self.canon_c = CanonConv(d) if "C" in canon else None
 
     def _fixed(self, w):
         return self.fix(w) if self.fix is not None else w
+
+    def _ca(self, h):
+        return self.canon_a(h) if self.canon_a is not None else h
+
+    def _cc(self, h):
+        return self.canon_c(h) if self.canon_c is not None else h
+
+    def _no_canon_decode(self):
+        if self.canon_a is not None or self.canon_c is not None:
+            raise NotImplementedError("a craft with Canon layers decodes by forward only (the prefill / step cache is owed)")
 
     def forward(self, x, disable_bank=False, disable_hub=False, byte_cls=None):
         # hub_ckpt (2026-08-26): recompute-in-backward for the heavy
@@ -130,20 +148,22 @@ class Block(nn.Module):
         if not (disable_hub and self.is_hub):
             if ckpt:
                 x = x + torch.utils.checkpoint.checkpoint(
-                    lambda t: self.attn(t), self.n1(x), use_reentrant=False)
+                    lambda t: self.attn(t), self._ca(self.n1(x)), use_reentrant=False)
             else:
-                x = x + self.attn(self.n1(x))
+                x = x + self.attn(self._ca(self.n1(x)))
         if ckpt and self.ckpt_mode >= 2 and not disable_bank:
             return x + self._fixed(torch.utils.checkpoint.checkpoint(
-                lambda t: self.bank(t, byte_cls=byte_cls), self.n2(x), use_reentrant=False))
-        return x + self._fixed(self.bank(self.n2(x), disable_dispatch=disable_bank, byte_cls=byte_cls))
+                lambda t: self.bank(t, byte_cls=byte_cls), self._cc(self.n2(x)), use_reentrant=False))
+        return x + self._fixed(self.bank(self._cc(self.n2(x)), disable_dispatch=disable_bank, byte_cls=byte_cls))
 
     def prefill(self, x):
+        self._no_canon_decode()
         a, cache = self.attn.prefill(self.n1(x))
         x = x + a
         return x + self._fixed(self.bank(self.n2(x))), cache
 
     def step(self, x_t, cache):
+        self._no_canon_decode()
         x_t = x_t + self.attn.step(self.n1(x_t), cache)
         return x_t + self._fixed(self.bank(self.n2(x_t)))
 
@@ -496,7 +516,7 @@ class AlephLM(nn.Module):
         for i, wrap in enumerate(self.blocks):
             b = raw_block(wrap)
             if getattr(b.attn, "qk_norm", ""):
-                rec = b.attn.install_gains(b.n1(x))
+                rec = b.attn.install_gains(b._ca(b.n1(x)))
                 rec["block"] = i
                 out.append(rec)
             x = wrap(x)
