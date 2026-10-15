@@ -56,6 +56,13 @@ def bank_stats(bank) -> dict:
     return out
 
 
+def _hub_books(attn) -> list:
+    """The address books one hub block reads, in order: a single-book hub itself, the multi-constellation form's books, and for a
+    dual hub (0.10.18 rc9) the rotary hub's books then the plain hub's (each a CausalSplatHUB with its own codebooks)."""
+    hubs = [attn.rot, attn.plain] if getattr(attn, "dual", False) else [attn]
+    return [b for h in hubs for b in ([h] if getattr(h, "n_const", 1) == 1 else list(h.consts))]
+
+
 @torch.no_grad()
 def model_census(model, sample_idx: torch.Tensor) -> dict:
     """Full structural census on a small batch. Replays the forward pass
@@ -68,6 +75,8 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
     model.eval()
     census = {"layers": {}, "head": {}, "flags": {}}
     hidden_eranks = []
+    # rc9: a bank with the byte-class table reads the input bytes' classes (AlephLM._trunk passes them; None = the table off)
+    cls = model._byte_cls_table[sample_idx] if getattr(model, "byte_table", False) else None
     x = model.embed(sample_idx)
     for i, wrap in enumerate(model.blocks):
         # adapter wrappers (amoe-lora) hold the real block at .block — one
@@ -84,19 +93,21 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
         if getattr(blk, "canon_a", None) is not None:      # 0.10.18 rc8: the mixer reads the Canon layer's output
             tap_attn = blk.canon_a(tap_attn)
         if blk.is_hub:
-            if getattr(blk.attn, "n_const", 1) == 1:
-                q = blk.attn.q(tap_attn)
-                li["hub_addr"] = blk.attn.addr.health(q)
-                p, n = blk.attn.addr.oriented(
+            books = _hub_books(blk.attn)
+            if len(books) == 1:
+                q = books[0].q(tap_attn)
+                li["hub_addr"] = books[0].addr.health(q)
+                p, n = books[0].addr.oriented(
                     q.reshape(-1, q.shape[-1]).float())
                 li["hub_consumed_erank"] = effective_rank(
                     torch.cat([p, n], -1))
             else:
-                # v2 multi-constellation: per-book health, worst-case
-                # aggregates surfaced (the collapse flags key on these),
-                # consumed erank over the concatenated oriented reads.
+                # v2 multi-constellation (and rc9 the dual hub's two hubs,
+                # book by book): per-book health, worst-case aggregates
+                # surfaced (the collapse flags key on these), consumed erank
+                # over the concatenated oriented reads.
                 healths, cats = [], []
-                for c in blk.attn.consts:
+                for c in books:
                     q = c.q(tap_attn)
                     healths.append(c.addr.health(q))
                     p, n = c.addr.oriented(
@@ -122,7 +133,7 @@ def model_census(model, sample_idx: torch.Tensor) -> dict:
         if getattr(blk, "canon_c", None) is not None:      # 0.10.18 rc8: the bank reads the Canon layer's output
             tap_bank = blk.canon_c(tap_bank)
         li["bank_addr"] = blk.bank.addr.health(tap_bank)
-        x = x + blk.bank(tap_bank)
+        x = x + blk.bank(tap_bank, byte_cls=cls)
         for w in reversed(chain):                 # innermost wrapper first
             if hasattr(w, "adapter") and getattr(w, "enabled", True):
                 x = w.adapter(x)
