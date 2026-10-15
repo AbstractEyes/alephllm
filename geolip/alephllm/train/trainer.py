@@ -159,9 +159,15 @@ class Trainer:
             n_train, n_all = freeze_except(self.raw_model, arm)
             print(f"[arm] {n_train:,} of {n_all:,} parameters train under {list(arm)} (pure Adam, lr "
                   f"{self.tc.adam_lr}); the rest frozen", flush=True)
+        dec = tuple(getattr(self.tc, "decay_params", ()) or ())
         self.optimizers = build_optimizers(
             self.raw_model, self.tc.muon_lr, self.tc.muon_momentum,
-            self.tc.adam_lr, adam_prefixes=arm)
+            self.tc.adam_lr, adam_prefixes=arm, decay_prefixes=dec,
+            decay_wd=float(getattr(self.tc, "decay_wd", 0.0)))
+        if dec:
+            g = self.optimizers[1].param_groups[1]
+            print(f"[optim] {sum(p.numel() for p in g['params']):,} weights under {list(dec)} train with AdamW "
+                  f"(decoupled weight decay {g['weight_decay']}, lr {self.tc.adam_lr}) instead of Muon", flush=True)
         self.base_lrs = [self.tc.muon_lr, self.tc.adam_lr]
         # the trunk's own parameters, fixed at birth: the clip and the
         # abstention-chunk graph boundary read this list, never the model's

@@ -154,7 +154,7 @@ class TrainConfig:
     # the mechanism is ~20x more optimizer-sensitive than sdpa).
     muon_lr: float = 2e-2
     muon_momentum: float = 0.95
-    adam_lr: float = 3e-4              # pure Adam, wd=0 — never AdamW
+    adam_lr: float = 3e-4              # pure Adam, wd=0 (the one decayed group: decay_params below)
     warmup_steps: int = 200            # scale insurance; flat after (flat-LR law)
     grad_clip: float = 1.0
     micro_batch: int = 24
@@ -214,6 +214,11 @@ class TrainConfig:
     # arm training (0.10.15): parameter-name prefixes that TRAIN while every other parameter is frozen, owned by
     # pure Adam (the house rule for arms and adapters, wd 0; Muon stays the trunk's); () = the whole model trains
     arm_params: tuple = ()
+    # the decayed group (0.10.18 rc10): parameter-name prefixes whose weights (ndim >= 2) leave Muon for AdamW with decoupled
+    # weight decay decay_wd (decay 0 = the Adam update); their biases and every other Adam-set parameter stay at weight decay 0.
+    # () = the split above exactly. E.g. ("head.w_h.", "head.w_s.") = the output layer's two readout matrices.
+    decay_params: tuple = ()
+    decay_wd: float = 0.0
 
     def __post_init__(self):
         if self.precision not in ("bf16", "fp32"):
@@ -222,6 +227,9 @@ class TrainConfig:
             raise ValueError(f"TrainConfig.loss_form must be 'ce', 'depth', 'copy' or 'depth+copy', got {self.loss_form!r}")
         if len(tuple(self.loss_depth_w)) != 8:
             raise ValueError("TrainConfig.loss_depth_w needs eight weights (one per bit, MSB first)")
+        self.decay_params = tuple(self.decay_params or ())
+        if self.decay_wd < 0 or (self.decay_wd > 0 and not self.decay_params):
+            raise ValueError(f"TrainConfig.decay_wd {self.decay_wd} needs to be >= 0 and to name its weights in decay_params")
 
 
 # All missions upload to the one training repo, each under its own prefix

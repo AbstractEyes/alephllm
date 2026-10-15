@@ -10,6 +10,13 @@ arm's split).
 
 LR policy: optional short linear warmup, then FLAT (schedules measured
 no-op-to-harmful on the probe beds; warmup is scale insurance only).
+
+Optional decayed group (0.10.18 rc10, off by default): the weights named
+by decay_prefixes leave Muon for AdamW with decoupled weight decay; the
+rest of the Adam set rides the same AdamW at weight decay 0 (the Adam
+update exactly). Muon's reference guidance trains classifier heads with
+AdamW (github.com/KellerJordan/Muon), and Muon-trained weights without
+decay keep growing (Liu et al. 2025, arXiv 2502.16982, s.2.2).
 """
 from __future__ import annotations
 
@@ -82,10 +89,29 @@ def split_params(model: nn.Module, adam_prefixes: tuple = ()):
 
 def build_optimizers(model: nn.Module, muon_lr: float = 2e-2,
                      muon_momentum: float = 0.95, adam_lr: float = 3e-4,
-                     adam_prefixes: tuple = ()):
+                     adam_prefixes: tuple = (), decay_prefixes: tuple = (),
+                     decay_wd: float = 0.0):
+    """[Muon, Adam] — or, with decay_prefixes, [Muon, AdamW] where the
+    weights (ndim >= 2) whose names start with a decay prefix form the
+    second AdamW group at weight decay decay_wd and every other Adam-set
+    parameter (their biases included) the first group at weight decay 0."""
     muon_p, adam_p = split_params(model, adam_prefixes)
+    if not decay_prefixes:
+        return [Muon(muon_p, lr=muon_lr, momentum=muon_momentum),
+                torch.optim.Adam(adam_p, lr=adam_lr, weight_decay=0.0)]
+    pre = tuple(decay_prefixes)
+    names = {id(p): n for n, p in model.named_parameters()}
+    dec = {id(p) for p in muon_p + adam_p
+           if names[id(p)].startswith(pre) and p.ndim >= 2}
+    if not dec:
+        raise ValueError(f"decay_params {list(pre)} name no weight of the model")
+    decay_p = [p for p in muon_p + adam_p if id(p) in dec]
+    muon_p = [p for p in muon_p if id(p) not in dec]
+    adam_p = [p for p in adam_p if id(p) not in dec]
     return [Muon(muon_p, lr=muon_lr, momentum=muon_momentum),
-            torch.optim.Adam(adam_p, lr=adam_lr, weight_decay=0.0)]
+            torch.optim.AdamW([{"params": adam_p, "weight_decay": 0.0},
+                               {"params": decay_p, "weight_decay": float(decay_wd)}],
+                              lr=adam_lr)]
 
 
 def freeze_except(model: nn.Module, prefixes: tuple) -> tuple:
