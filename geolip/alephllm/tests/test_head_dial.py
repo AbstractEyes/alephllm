@@ -5,14 +5,17 @@ Cases:
     head's own birth logits too (its carrying read is zero); the state dict = the plain head's keys plus the dial's
   2 the toggle: disable_aleph returns the plain readout in every form; with the dial moved, the full forward differs from it
   3 the bound: however large the dial's weights, the per-position scale stays within [1/band, band]; the band is the config's
-  4 the centering: in training the running mean follows the forward's mean (detached, one step a forward) and in eval it is
-    frozen; dialraw keeps it at zero; pergain keeps one mean per byte
-  5 the split: w_t is one-dimensional (Adam); proj, the codebook, W_h and W_s stay Muon; the carrying read is frozen in dial /
-    dialraw / pergain and trains in dialplus; with the readout named for decay the AdamW group holds exactly the named weights
-    (pergain: G among them when named)
+  4 the centering: in a training forward that builds a graph the running mean follows the forward's mean (detached, one step a
+    forward); a no_grad forward in train mode leaves it; in eval it is frozen; dialraw keeps it at zero; pergain keeps one mean per byte
+  5 the split: the dial's weights are pure Adam (w_t one-dimensional; G routed there by name); proj, the codebook, W_h and W_s stay
+    Muon; the carrying read is frozen in dial / dialraw / pergain and trains in dialplus; with the readout named for decay the AdamW
+    group holds exactly the named weights (pergain: G among them only when named)
   6 the gradient: a cross-entropy loss reaches w_t at birth (the dial can move from zero); none reaches the frozen W_s
   7 a plain head's state loads into a dial head (the dial's keys missing, the rest strict): the logits are the plain readout
   8 dial_stats reads: a zero dial = mean 0, spread 0, nothing saturated; a huge dial saturates
+  9 the dial in fp32: under bf16 autocast the dialed logits are fp32 (as the plain path's) and equal the fp32 computation;
+    readout() = the prediction with the dial held at 1 (dialplus keeps the carrying read); dial_hold holds the log scale (0 = the
+    readout; a value v = the readout times exp(v)) and is not in the state dict
 """
 from __future__ import annotations
 
@@ -129,13 +132,15 @@ def case_4():
             a = F.linear(s.float(), w.float()) if mode == "pergain" else (s.float() @ w.float()).unsqueeze(-1)
             mean = a.reshape(-1, a.shape[-1]).mean(0) if mode == "pergain" else a.mean()
             before = m.head.a_bar.clone()
-            m.head(h)
-            after1 = m.head.a_bar.clone()
-            m.head(h)
-            after2 = m.head.a_bar.clone()
-            m.eval()
-            m.head(h)
-            frozen = m.head.a_bar.clone()
+            m.head(h)                                                    # a no_grad forward in train mode: the mean stays
+            nograd = m.head.a_bar.clone()
+        m.head(h)
+        after1 = m.head.a_bar.detach().clone()
+        m.head(h)
+        after2 = m.head.a_bar.detach().clone()
+        m.eval()
+        m.head(h)
+        frozen = m.head.a_bar.detach().clone()
         rho = m.head.rho
         if mode == "dialraw":
             check("4 dialraw: the running mean stays at zero", float(before.abs().max()) == 0 and float(after2.abs().max()) == 0)
@@ -144,6 +149,7 @@ def case_4():
                   torch.allclose(after1, rho * mean, atol=1e-6) and torch.allclose(after2, (1 - rho) * after1 + rho * mean, atol=1e-6)
                   and tuple(after1.shape) == ((256,) if mode == "pergain" else ()))
             check(f"4b {mode}: frozen in eval", torch.equal(frozen, after2))
+            check(f"4c {mode}: a no_grad forward in train mode leaves the running mean", torch.equal(nograd, before))
 
 
 def case_5():
@@ -154,10 +160,16 @@ def case_5():
         mi, ai = {id(p) for p in muon}, {id(p) for p in adam}
         on_muon = all(id(named[k]) in mi for k in ("head.proj.weight", "head.addr.codebook", "head.w_h.weight", "head.w_s.weight"))
         dial_adam = (mode == "" or mode == "pergain" or id(named["head.w_t"]) in ai)
-        g_muon = (mode != "pergain" or id(named["head.w_g.weight"]) in mi)
+        g_adam = (mode != "pergain" or id(named["head.w_g.weight"]) in ai)
         frozen = named["head.w_s.weight"].requires_grad == (mode in ("", "dialplus"))
-        check(f"5a {mode or 'plain'}: the split (proj / codebook / W_h / W_s Muon; w_t Adam; G Muon; W_s frozen in the modulating forms)",
-              on_muon and dial_adam and g_muon and frozen)
+        check(f"5a {mode or 'plain'}: the split (proj / codebook / W_h / W_s Muon; w_t and G Adam; W_s frozen in the modulating forms)",
+              on_muon and dial_adam and g_adam and frozen)
+    m = _model("pergain")
+    named = dict(m.named_parameters())
+    opts = build_optimizers(m, decay_prefixes=("head.w_h.", "head.w_s."), decay_wd=0.1)
+    check("5d pergain: with only the readout named, G sits in the decay-0 Adam group",
+          id(named["head.w_g.weight"]) in {id(p) for p in opts[1].param_groups[0]["params"]}
+          and opts[1].param_groups[0]["weight_decay"] == 0.0)
     m = _model("pergain")
     named = dict(m.named_parameters())
     opts = build_optimizers(m, decay_prefixes=("head.w_h.", "head.w_s.", "head.w_g."), decay_wd=0.1)
@@ -228,8 +240,39 @@ def case_8():
     check("8c the plain head reads no dial", _model("").head.dial_stats(torch.zeros(2, 3, TINY["d_model"])) == {})
 
 
+def case_9():
+    x = _ids()
+    for mode in ("dial", "dialraw", "dialplus", "pergain"):
+        m = _model(mode)
+        _move(m, 1.0)
+        if mode == "dialplus":
+            with torch.no_grad():
+                m.head.w_s.weight.normal_(0, 0.02, generator=torch.Generator().manual_seed(5))
+        m.eval()
+        with torch.no_grad():
+            h = m.nf(m._trunk(m.embed(x), x))
+            ref = m.head(h)
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                lo = m.head(h)
+            dl = m.head.dial_log(m.head.addr.signed(m.head.proj(h)))
+            r = m.head.readout(h)
+            want_r = m.head._base(h) + (m.head.gamma * m.head.w_s(m.head.addr.signed(m.head.proj(h))) if mode == "dialplus" else 0)
+            m.head.dial_hold = 0.0
+            held0 = m.head(h)
+            v = torch.full((256,), 0.3) if mode == "pergain" else 0.3
+            m.head.dial_hold = v
+            heldv = m.head(h)
+            m.head.dial_hold = None
+        check(f"9a {mode}: under bf16 autocast the dialed logits are fp32", lo.dtype == torch.float32 and ref.dtype == torch.float32)
+        check(f"9b {mode}: readout() is the prediction with the dial held at 1",
+              torch.allclose(r, want_r, atol=1e-6) and torch.allclose(ref, r.float() * torch.exp(dl), atol=1e-5)
+              and torch.allclose(held0, r.float(), atol=1e-6))
+        check(f"9c {mode}: dial_hold holds the log scale and is not state",
+              torch.allclose(heldv, r.float() * math.exp(0.3), atol=1e-5) and "head.dial_hold" not in m.state_dict())
+
+
 if __name__ == "__main__":
-    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8):
+    for fn in (case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9):
         fn()
     n_ok = sum(ok for _, ok in RESULTS)
     print(f"\n{n_ok}/{len(RESULTS)} checks pass")

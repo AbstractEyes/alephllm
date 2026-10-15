@@ -152,7 +152,9 @@ class Trainer:
             # resume optimizer state loads verbatim.
             self.raw_model.head.proj.weight.requires_grad_(False)
             self.raw_model.head.addr.codebook.requires_grad_(False)
-            print("[head] address frozen (proj + codebook) — W_s trains")
+            head = self.raw_model.head
+            what = "the dial's weights train" if getattr(head, "mode", "") else "W_s trains"
+            print(f"[head] address frozen (proj + codebook) — {what}")
         arm = tuple(getattr(self.tc, "arm_params", ()) or ())
         if arm:
             # 0.10.15: an arm trains alone (the trunk frozen, the shipped weights untouched) under pure Adam
@@ -166,8 +168,10 @@ class Trainer:
             decay_wd=float(getattr(self.tc, "decay_wd", 0.0)))
         if dec:
             g = self.optimizers[1].param_groups[1]
-            print(f"[optim] {sum(p.numel() for p in g['params']):,} weights under {list(dec)} train with AdamW "
-                  f"(decoupled weight decay {g['weight_decay']}, lr {self.tc.adam_lr}) instead of Muon", flush=True)
+            live = sum(p.numel() for p in g['params'] if p.requires_grad)
+            frozen = sum(p.numel() for p in g['params'] if not p.requires_grad)
+            print(f"[optim] {live:,} weights under {list(dec)} train with AdamW (decoupled weight decay {g['weight_decay']}, lr "
+                  f"{self.tc.adam_lr}) instead of Muon" + (f"; {frozen:,} more named there are frozen" if frozen else ""), flush=True)
         self.base_lrs = [self.tc.muon_lr, self.tc.adam_lr]
         # the trunk's own parameters, fixed at birth: the clip and the
         # abstention-chunk graph boundary read this list, never the model's

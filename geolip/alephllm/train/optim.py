@@ -80,6 +80,11 @@ def split_params(model: nn.Module, adam_prefixes: tuple = ()):
             # attached arms (amoe wrappers) own their optimizer (pure Adam
             # in the arm program) — never swept into the trunk's Muon
             continue
+        if name.startswith("head.w_g."):
+            # the per-byte gain's read of the address (a dial's weights, like
+            # the scalar dial's w_t): pure Adam, not a transport map
+            adam.append(p)
+            continue
         if p.ndim in (2, 3) and id(p) not in emb_ids:
             muon.append(p)
         else:

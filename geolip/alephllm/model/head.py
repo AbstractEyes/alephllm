@@ -25,10 +25,14 @@ aleph read:
     dialplus  the dial over the readout PLUS the carrying read:  (W_h h + b + W_s s(h)) * exp(beta * tanh(a - a_bar))
     pergain   a per-byte gain:  (W_h h + b) * exp(beta * tanh(G s(h) - g_bar)),  G in R^{V x K} born zero, g_bar the running mean per byte
 
-In dial / dialraw / pergain the carrying read W_s stays in the module at zero and frozen (a checkpoint of any form loads into any
-other: the read modulates, never carries). At birth every form is the plain readout bit for bit (exp(0) = 1). disable_aleph returns
-the plain readout W_h h + b in every form: for a dial form that is the dial held at 1, so the head_aleph_off toggle reads the dial's
-function in bits.
+In dial / dialraw / pergain the carrying read W_s stays in the module at zero and frozen (the read modulates, never carries). A
+plain head's state loads into any dial form with the dial's keys missing (strict=False); dial / dialraw / dialplus and pergain do not
+load into each other (the running mean's shape differs), and a trained plain head's W_s is not zero (a dial form's forward then drops
+it unless the form is dialplus). At birth every form is the plain readout bit for bit (exp(0) = 1). disable_aleph returns the plain
+readout W_h h + b in every form: for a dial form that is the dial held at 1, so the head_aleph_off toggle reads the dial's function in
+bits. readout() is the prediction with the dial held at 1 (the carrying read kept where it trains); dial_hold (a runtime attribute,
+not state) holds the dial's log scale at a given value, e.g. its own mean, so a read can separate the dial's per-byte part from an
+overall temperature. The dial is computed in fp32 outside autocast and the dialed logits are fp32, as the plain path's are.
 """
 from __future__ import annotations
 
@@ -77,6 +81,7 @@ class DualHead(nn.Module):
             self.register_buffer("a_bar", torch.zeros(vocab))
         if mode in ("dial", "dialraw", "pergain"):
             self.w_s.weight.requires_grad_(False)                # the carrying read: at zero, frozen (the read modulates)
+        self.dial_hold = None                                    # a runtime knob, not state: the dial's log scale held at this value
 
     @property
     def dial_weight(self) -> torch.Tensor | None:
@@ -90,22 +95,31 @@ class DualHead(nn.Module):
             return h @ self._tied_ref[0].T + self.bias
         return self.w_h(h)
 
+    def readout(self, h: torch.Tensor) -> torch.Tensor:
+        """The prediction with the dial held at 1: W_h h + b, plus the carrying read where it trains (the plain head, dialplus)."""
+        base = self._base(h)
+        if self.mode in ("", "dialplus"):
+            base = base + self.gamma * self.w_s(self.addr.signed(self.proj(h)))
+        return base
+
     def dial_log(self, s: torch.Tensor) -> torch.Tensor:
-        """The dial's log scale (fp32) from the signed address s: beta * tanh(a - a_bar); (..., 1) for the scalar dial, (..., V) for
-        pergain. In training the running mean a_bar takes one detached step toward this forward's mean before the read."""
-        s32 = s.float()
-        if self.mode == "pergain":
-            a = F.linear(s32, self.w_g.weight.float())                       # (..., V)
-            m = a.detach().reshape(-1, a.shape[-1]).mean(0)                   # (V,)
-        else:
-            a = (s32 @ self.w_t.float()).unsqueeze(-1)                        # (..., 1)
-            m = a.detach().mean()                                             # ()
-        if self.mode != "dialraw":
-            if self.training:
-                with torch.no_grad():
-                    self.a_bar.mul_(1.0 - self.rho).add_(self.rho * m)
-            a = a - self.a_bar
-        return self.beta * torch.tanh(a)
+        """The dial's log scale (fp32, computed outside autocast) from the signed address s: beta * tanh(a - a_bar); (..., 1) for the
+        scalar dial, (..., V) for pergain. In a training forward that builds a graph the running mean a_bar takes one detached step
+        toward this forward's mean before the read (never in eval, never under no_grad)."""
+        with torch.autocast(device_type=s.device.type, enabled=False):
+            s32 = s.float()
+            if self.mode == "pergain":
+                a = F.linear(s32, self.w_g.weight.float())                   # (..., V)
+                m = a.detach().reshape(-1, a.shape[-1]).mean(0)               # (V,)
+            else:
+                a = (s32 @ self.w_t.float()).unsqueeze(-1)                    # (..., 1)
+                m = a.detach().mean()                                         # ()
+            if self.mode != "dialraw":
+                if self.training and torch.is_grad_enabled():
+                    with torch.no_grad():
+                        self.a_bar.mul_(1.0 - self.rho).add_(self.rho * m)
+                a = a - self.a_bar.float()
+            return self.beta * torch.tanh(a)
 
     def forward(self, h, disable_aleph: bool = False):
         base = self._base(h)
@@ -116,7 +130,10 @@ class DualHead(nn.Module):
             return base + self.gamma * self.w_s(s)
         if self.mode == "dialplus":
             base = base + self.gamma * self.w_s(s)
-        return base * torch.exp(self.dial_log(s)).to(base.dtype)
+        if self.dial_hold is not None:
+            held = torch.as_tensor(self.dial_hold, dtype=torch.float32, device=base.device)
+            return base.float() * torch.exp(held)
+        return base.float() * torch.exp(self.dial_log(s))
 
     @torch.no_grad()
     def dial_stats(self, h: torch.Tensor) -> dict:
