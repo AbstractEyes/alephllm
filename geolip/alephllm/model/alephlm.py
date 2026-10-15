@@ -187,7 +187,10 @@ class AlephLM(nn.Module):
             Block(cfg, i) for i in range(cfg.n_layers))
         self.nf = nn.LayerNorm(cfg.d_model)
         self.head = DualHead(cfg.d_model, cfg.vocab_size, cfg.head_K,
-                             cfg.head_D, cfg.tau, tied_weight=tied)
+                             cfg.head_D, cfg.tau, tied_weight=tied,
+                             mode=getattr(cfg, "head_mode", "") or "",
+                             dial_band=float(getattr(cfg, "head_dial_band", 4.0)),
+                             dial_rho=float(getattr(cfg, "head_dial_rho", 1 / 64)))
         # v3: weak-token fusion (model/fusion.py). None keeps the byte-
         # resolution trunk verbatim; otherwise the middle blocks run over
         # units and the front/back blocks stay at byte resolution.

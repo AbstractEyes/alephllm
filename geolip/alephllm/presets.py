@@ -47,6 +47,16 @@ class AlephLMConfig:
     bank_ff: Optional[int] = None      # None -> d_model (E1 ratio)
     head_K: int = 512
     head_D: int = 32
+    # 0.10.18 rc11: the head's form (model/head.py). "" = the dual head (the aleph read ADDED to the readout, born at zero);
+    # "dial" = the aleph read as the readout's confidence dial, a per-position scale exp(ln(head_dial_band) * tanh(w_t . s(h) - a_bar))
+    # on the readout's logits, w_t born zero (the dial at exactly 1), a_bar its running mean over the training forwards, the carrying
+    # read frozen at zero; "dialraw" = the dial without the centering; "dialplus" = the dial over the readout plus the carrying read;
+    # "pergain" = a per-byte gain G s(h) under the same bound. Every form is the plain readout at birth, bit for bit.
+    #   head_dial_band  the bound on the dial's scale: [1/band, band]
+    #   head_dial_rho   the running mean's rate per training forward
+    head_mode: str = ""
+    head_dial_band: float = 4.0
+    head_dial_rho: float = 0.015625
     gate_init: float = -3.0
     tie_embeddings: bool = False       # BPE crafts tie; byte crafts cannot (trigram)
     hub_chunk: int = 128               # chunked-scan block for the hub prefix memories

@@ -26,6 +26,10 @@ N pre-norm layers:
 LayerNorm → DualHead:  logits = W_h h + W_s·s(h),  W_s = 0 at birth
                        (weight-zero, never gate-zero — the measured law;
                        γ survives frozen at 1 as the ablation knob)
+                       head_mode "dial": the aleph read modulates instead,
+                       logits = (W_h h + b)·exp(ln4·tanh(w_t·s(h) − ā)),
+                       w_t = 0 at birth (the dial at 1); the output
+                       layer's confidence dial, within [1/4, 4]
 ```
 
 CausalSplatHUB is causal **linear** attention through the oriented
@@ -200,7 +204,7 @@ the two-phase anneal planned from birth.
 | `address.py` | `AlephAddress` — the closed-form signed address over 2K oriented half-axes; `signed` / `oriented` reads plus a codebook health census (drift, merging, effective rank, usage) |
 | `attention.py` | `CausalSDPA`, the workhorse block, and `CausalSplatHUB` — causal linear attention through the oriented address, an exact chunked scan with a fused fast path and a naive oracle for parity |
 | `bank.py` | `AnchoredBank` — the anchored FFN: always-on trunk + 3 dispatched experts, expert outputs zero-initialized (exact null path), no balance machinery |
-| `head.py` | `DualHead` — standard readout plus an aleph read whose weights are zero at birth (weight-zero, never gate-zero) |
+| `head.py` | `DualHead` — standard readout plus an aleph read whose weights are zero at birth (weight-zero, never gate-zero); the dial forms (`head_mode` dial / dialraw / dialplus / pergain): the aleph read as a bounded per-position scale on the readout's logits, born at 1 |
 | `embedding.py` | `TrigramByteEmbedding` — composed byte embedding e_t = E0[x_t] + E1[x_{t-1}] + E2[x_{t-2}] + P[t], with a dedicated pad row; `TokenEmbedding` for BPE crafts |
 | `fusion.py` | weak-token fusion at the input plane (0.9.0, opt-in via `AlephLMConfig.fusion`): a causal unit-start rule — the atlas entropy table over the three previous bytes (`entropy`), word starts (`spacelike`), or word starts kept only at choice points (`hybrid`), with forced starts at specials and newlines — and the hourglass wiring: front blocks at byte resolution, the middle blocks over units (a position read at each unit's last byte, never a mean pool), an unpool shifted by one unit, back blocks and the head at byte resolution; cached decode keeps a unit-level cache |
 | `governor.py` | the anchor governor — a min-separation projection that relaxes crowded codebooks; exact identity when anchors have room |
